@@ -130,7 +130,8 @@ function currentBranch(cwd) {
 // same per-repo events/ dir (BOARD_DIR_OVERRIDE ?? CLAUDE_PROJECT_DIR ?? cwd).
 function eventsDir() {
   if (process.env.EVENTS_DIR_OVERRIDE) return process.env.EVENTS_DIR_OVERRIDE;
-  const root = process.env.BOARD_DIR_OVERRIDE ?? process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+  // `||` not `??`: an empty-string override must fall through, matching paths.ts.
+  const root = process.env.BOARD_DIR_OVERRIDE || process.env.CLAUDE_PROJECT_DIR || process.cwd();
   return path.join(root, 'events');
 }
 

@@ -22,7 +22,8 @@
   },
   "files": [
     "dist",
-    "hooks"
+    "hooks/guard-bash.mjs",
+    "hooks/track-steps.mjs"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

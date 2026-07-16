@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { listTickets } from '../server/tickets.js';
+import { listTickets, getTicket } from '../server/tickets.js';
 import { getTicketEvents } from '../server/events.js';
 import { isStatusId } from '../shared/constants.js';
 
@@ -28,8 +28,12 @@ async function cmdList(statusFilter: string | null): Promise<void> {
 }
 
 async function cmdShow(id: string): Promise<void> {
+  // Verify the ticket exists first — getTicket throws HttpError(404) for a missing
+  // id (caught in main → exit 1). Without this, getTicketEvents on a typo'd/deleted
+  // id returns an all-pending pipeline, indistinguishable from a real un-started one.
+  const ticket = await getTicket(id);
   const { pipeline } = await getTicketEvents(id);
-  console.log(id);
+  console.log(`${ticket.id}  ${ticket.status}  ${ticket.title}`);
   for (const step of pipeline) {
     const glyph = GLYPH[step.state] ?? '·';
     const when = step.at ? `  (${step.at})` : '';

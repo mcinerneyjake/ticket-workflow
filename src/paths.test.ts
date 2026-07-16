@@ -46,4 +46,13 @@ describe('board-root resolution', () => {
     expect(ticketsDir()).toBe('/custom-tickets');
     expect(eventsDir()).toBe(path.join('/board', 'events')); // events unaffected
   });
+
+  it('treats an empty-string override as unset (falls through, not a relative path)', () => {
+    clearEnv();
+    process.env.CLAUDE_PROJECT_DIR = '/repo';
+    process.env.BOARD_DIR_OVERRIDE = ''; // must NOT win — else board root becomes ""
+    expect(boardRoot()).toBe('/repo');
+    process.env.TICKETS_DIR_OVERRIDE = '';
+    expect(ticketsDir()).toBe(path.join('/repo', 'tickets')); // not the relative "tickets"
+  });
 });
