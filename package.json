@@ -1,0 +1,42 @@
+{
+  "name": "ticket-workflow",
+  "version": "0.1.0",
+  "description": "Local-first, per-repo ticket board + git/PR pipeline: an MCP server, guard/telemetry Bash hooks, and a pipeline CLI. Decoupled — each repo owns its own tickets/ + events/.",
+  "license": "MIT",
+  "author": "Jake McInerney",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "ticket-workflow-mcp": "dist/mcp/server.js",
+    "ticket-workflow": "dist/cli/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "hooks"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "prepare": "npm run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

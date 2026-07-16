@@ -1,0 +1,6 @@
+node_modules/
+dist/
+tickets/
+events/
+*.tsbuildinfo
+coverage/
