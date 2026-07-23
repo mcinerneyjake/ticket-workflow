@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import matter from 'gray-matter';
 import { STATUS_IDS, TYPES, PRIORITIES, BOARD_STATUSES, CREATE_STATUS_IDS, STATUS_STEP, isSource, type Ticket, type StatusId, type DashboardSummary, type Provenance } from '../shared/constants.js';
 import { ticketsDir } from '../paths.js';
@@ -30,7 +31,9 @@ function isENOENT(err: unknown): boolean {
   return err instanceof Error && 'code' in err && err.code === 'ENOENT';
 }
 
-type TicketPatch = Partial<Pick<Ticket, 'title' | 'type' | 'priority' | 'status' | 'order' | 'body' | 'project' | 'blockers' | 'parent' | 'dueDate' | 'assignee'>>
+// appendBody is a transient instruction, not a Ticket field: it appends to the
+// existing body (non-destructive) and is never persisted. Mutually exclusive with body.
+type TicketPatch = Partial<Pick<Ticket, 'title' | 'type' | 'priority' | 'status' | 'order' | 'body' | 'project' | 'blockers' | 'parent' | 'dueDate' | 'assignee'>> & { appendBody?: string }
 
 // gray-matter parse output. js-yaml auto-parses unquoted ISO dates → Date objects.
 interface RawFrontmatter {
@@ -147,7 +150,7 @@ function serialize(ticket: Ticket): string {
 async function writeTicket(ticket: Ticket) {
   await ensureDir();
   const file = ticketPath(ticket.id);
-  const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await fs.writeFile(tmp, serialize(ticket), 'utf8');
   try {
     await fs.rename(tmp, file);
@@ -171,6 +174,8 @@ function validateWritableTypes(patch: TicketPatch) {
     throw new HttpError(400, 'title must be a string');
   if (patch.body != null && typeof patch.body !== 'string')
     throw new HttpError(400, 'body must be a string');
+  if (patch.appendBody != null && typeof patch.appendBody !== 'string')
+    throw new HttpError(400, 'appendBody must be a string');
   if (patch.order != null && (typeof patch.order !== 'number' || !Number.isFinite(patch.order)))
     // Infinity/NaN pass typeof 'number' but poison ordering (maxOrder+1 = Infinity) — reject non-finite.
     throw new HttpError(400, 'order must be a finite number');
@@ -198,7 +203,7 @@ function assertDueDate(dueDate: string | null | undefined) {
 }
 
 function newId(): string {
-  return `tkt-${crypto.randomUUID().replace(/-/g, '').slice(0, 12)}`;
+  return `tkt-${randomUUID().replace(/-/g, '').slice(0, 12)}`;
 }
 
 // Passing any options object bypasses gray-matter's content cache. Without it,
@@ -252,7 +257,13 @@ export async function getTicket(id: string): Promise<Ticket> {
 
 // provenance is a TRUSTED stamp — supplied only by the agent write path, never
 // derived from `input`, so authorship can't be forged by an untrusted caller.
-export async function createTicket(input: Partial<Ticket>, provenance?: Provenance): Promise<Ticket> {
+export async function createTicket(input: Partial<Ticket> & { appendBody?: string }, provenance?: Provenance): Promise<Ticket> {
+  // appendBody is an update-only concept (there's nothing to append to yet); reject
+  // rather than silently drop it, since extractTicketFields feeds both create and update.
+  // `!= null` so an explicit null (a client sending nulls for unset fields) reads as
+  // absent rather than as a supplied append that blocks creation outright.
+  if (input.appendBody != null)
+    throw new HttpError(400, 'appendBody is only valid on update, not create');
   validateWritableTypes(input);
   assertEnum(TYPES, input.type, 'type');
   assertEnum(PRIORITIES, input.priority, 'priority');
@@ -322,11 +333,34 @@ async function emitStatusStep(id: string, status: StatusId): Promise<void> {
   }
 }
 
+// Non-destructive append vs. full replace. appendBody adds to the existing body
+// with a blank-line separator and never overwrites (the read-modify-write clobber
+// path — tkt-81b4d35e95e5); body still replaces. The two are mutually exclusive so
+// intent is never ambiguous. An empty/whitespace append is a no-op.
+// `== null` throughout, not `=== undefined`: a raw HTTP patch reaches the service
+// untyped and clients serialize unset fields as null, so null must mean ABSENT for
+// both fields. Guarding on `undefined` alone let null crash on .trim(), and made a
+// null body read as an explicit replace that 400'd a legitimate append.
+function mergeBody(existingBody: string, patch: TicketPatch): string {
+  if (patch.appendBody == null) return patch.body ?? existingBody;
+  if (patch.body != null)
+    throw new HttpError(400, 'Provide either body (replace) or appendBody (append), not both');
+  // Whitespace-only is a no-op, but the emptiness test must NOT be what gets appended:
+  // trimming the addition itself ate leading indentation, silently demoting an indented
+  // code block or list continuation to a paragraph. Strip only the surrounding blank
+  // lines — the blank-line separator is ours to add, the indentation is the caller's.
+  if (!patch.appendBody.trim()) return existingBody;
+  const addition = patch.appendBody.replace(/^\n+/, '').replace(/\s+$/, '');
+  // existingBody is invariantly end-trimmed by normalize() on every read/write.
+  return existingBody ? `${existingBody}\n\n${addition}` : addition;
+}
+
 export async function updateTicket(id: string, patch: TicketPatch, provenance?: Provenance): Promise<Ticket> {
   validateWritableTypes(patch);
   validateEnums(patch);
   assertDueDate(patch.dueDate);
   const existing = await getTicket(id);
+  const nextBody = mergeBody(existing.body, patch);
   if (typeof patch.parent === 'string') {
     if (patch.parent === id) throw new HttpError(400, 'A ticket cannot be its own parent');
     if (collectDescendants(id, await listTickets()).has(patch.parent))
@@ -341,7 +375,7 @@ export async function updateTicket(id: string, patch: TicketPatch, provenance?: 
     priority: patch.priority ?? existing.priority,
     status: patch.status ?? existing.status,
     order: patch.order ?? existing.order,
-    body: patch.body ?? existing.body,
+    body: nextBody,
     // null is a valid patch value (clears the field); undefined means no change
     project: patch.project !== undefined ? patch.project : existing.project,
     blockers: patch.blockers ?? existing.blockers,
@@ -357,6 +391,13 @@ export async function updateTicket(id: string, patch: TicketPatch, provenance?: 
     updated: new Date().toISOString(),
   };
   if (!merged.title.trim()) throw new HttpError(400, 'Title is required');
+  // A patch that changes nothing must not rewrite the file. Restamping `updated`
+  // would jump the ticket to the top of the dashboard's recently-updated panel and
+  // reset the 3-day archive clock, with no content change — reachable via the
+  // documented whitespace-only appendBody no-op (code review, 2026-07-23).
+  // Compared through serialize() so the check covers exactly what gets persisted
+  // and picks up any field added later, rather than a second hand-kept field list.
+  if (serialize({ ...merged, updated: existing.updated }) === serialize(existing)) return existing;
   await writeTicket(merged);
   // Emit only on a real status change — body/priority/reorder patches must not record a milestone.
   if (merged.status !== existing.status) await emitStatusStep(id, merged.status);
@@ -371,7 +412,7 @@ export async function archiveStaleTickets(): Promise<number> {
   const stale = tickets.filter((ticket) => {
     if (ticket.status !== 'done') return false;
     const updatedAt = new Date(ticket.updated).getTime();
-    return !isNaN(updatedAt) && now - updatedAt >= ARCHIVE_AGE_MS;
+    return !Number.isNaN(updatedAt) && now - updatedAt >= ARCHIVE_AGE_MS;
   });
   const archived = new Date().toISOString();
   await Promise.all(stale.map((ticket) => writeTicket({ ...ticket, status: 'archived', updated: archived })));

@@ -184,6 +184,21 @@ describe('createTicket validation', () => {
     expect(err.status).toBe(400);
     expect(err.message).toContain('status');
   });
+
+  // tkt-81b4d35e95e5 — appendBody is update-only; reject on create, don't silently drop
+  it('rejects appendBody on create with 400 (update-only field)', async () => {
+    const err = await httpError(createTicket({ title: 'T', appendBody: 'nope' }));
+    expect(err.status).toBe(400);
+    expect(err.message).toContain('appendBody');
+  });
+
+  // …but an explicit null is ABSENT, not a supplied append — rejecting it would
+  // block creation for any client that sends nulls for unset fields.
+  it('accepts appendBody: null on create (null means absent)', async () => {
+    // @ts-expect-error — a client spreading a draft object sends nulls for unset fields
+    const t = await createTicket({ title: 'Null append on create', appendBody: null });
+    expect(t.title).toBe('Null append on create');
+  });
 });
 
 describe('createTicket defaults', () => {
@@ -303,6 +318,86 @@ describe('updateTicket', () => {
     expect(t.parent).toBe('tkt-parent');
     const cleared = await updateTicket(t.id, { parent: null });
     expect(cleared.parent).toBeNull();
+  });
+
+  // tkt-81b4d35e95e5 — appendBody appends non-destructively, never overwrites
+  it('appendBody appends to an existing body with a blank-line separator', async () => {
+    const t = await createTicket({ title: 'Has body', body: 'Original content' });
+    const updated = await updateTicket(t.id, { appendBody: '## Note\nmore' });
+    expect(updated.body).toBe('Original content\n\n## Note\nmore');
+  });
+
+  it('appendBody onto an empty body sets it without a leading separator', async () => {
+    const t = await createTicket({ title: 'No body' });
+    const updated = await updateTicket(t.id, { appendBody: 'First section' });
+    expect(updated.body).toBe('First section');
+  });
+
+  it('appends accumulate across successive calls', async () => {
+    const t = await createTicket({ title: 'Accumulate', body: 'A' });
+    await updateTicket(t.id, { appendBody: 'B' });
+    const twice = await updateTicket(t.id, { appendBody: 'C' });
+    expect(twice.body).toBe('A\n\nB\n\nC');
+  });
+
+  it('an empty/whitespace appendBody is a no-op', async () => {
+    const t = await createTicket({ title: 'Untouched', body: 'Keep' });
+    const updated = await updateTicket(t.id, { appendBody: '   ' });
+    expect(updated.body).toBe('Keep');
+  });
+
+  it('rejects body and appendBody together with 400, leaving the body untouched', async () => {
+    const t = await createTicket({ title: 'Both', body: 'Original' });
+    const err = await httpError(updateTicket(t.id, { body: 'Replace', appendBody: 'Add' }));
+    expect(err.status).toBe(400);
+    expect((await getTicket(t.id)).body).toBe('Original');
+  });
+
+  it('appendBody does not resurrect as a persisted ticket field', async () => {
+    const t = await createTicket({ title: 'Clean', body: 'X' });
+    const updated = await updateTicket(t.id, { appendBody: 'Y' });
+    expect('appendBody' in updated).toBe(false);
+  });
+
+  // A raw HTTP patch reaches the service untyped, and clients routinely serialize
+  // unset fields as null. null must mean ABSENT for body/appendBody — never a
+  // crash, and never a phantom "explicit replace" (code review, 2026-07-23).
+  it('treats appendBody: null as absent instead of crashing on .trim()', async () => {
+    const t = await createTicket({ title: 'Null append', body: 'Keep' });
+    // @ts-expect-error — raw HTTP bodies are untyped; null must not reach .trim()
+    const updated = await updateTicket(t.id, { appendBody: null });
+    expect(updated.body).toBe('Keep');
+  });
+
+  it('treats body: null as no-change, so an append alongside it still lands', async () => {
+    const t = await createTicket({ title: 'Null body', body: 'Original' });
+    // @ts-expect-error — a client spreading a draft object sends nulls for unset fields
+    const updated = await updateTicket(t.id, { body: null, appendBody: 'Add' });
+    expect(updated.body).toBe('Original\n\nAdd');
+  });
+
+  // trim() must only detect the whitespace-only no-op — it must not eat indentation
+  // that makes the appended markdown a code block or a list continuation.
+  it('preserves leading indentation in the appended text', async () => {
+    const t = await createTicket({ title: 'Indent', body: 'Intro' });
+    const updated = await updateTicket(t.id, { appendBody: '    const x = 1;' });
+    expect(updated.body).toBe('Intro\n\n    const x = 1;');
+  });
+
+  it('strips only surrounding blank lines from the append, not indentation', async () => {
+    const t = await createTicket({ title: 'Pad', body: 'Intro' });
+    const updated = await updateTicket(t.id, { appendBody: '\n\n  padded  \n\n' });
+    expect(updated.body).toBe('Intro\n\n  padded');
+  });
+
+  // The whitespace no-op is documented as a no-op — it must not restamp `updated`,
+  // which would reorder the dashboard and reset the archive clock.
+  it('a whitespace-only append leaves the updated timestamp untouched', async () => {
+    const t = await createTicket({ title: 'No restamp', body: 'Keep' });
+    await new Promise((r) => setTimeout(r, 2));
+    const updated = await updateTicket(t.id, { appendBody: '   ' });
+    expect(updated.body).toBe('Keep');
+    expect(updated.updated).toBe(t.updated);
   });
 });
 
