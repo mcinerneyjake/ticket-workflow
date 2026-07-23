@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { handleToolCall, TOOLS, CREATE_STATUS_ENUM, UPDATE_STATUS_ENUM } from './handlers.js';
+import { handleToolCall, TOOLS } from './handlers.js';
+import { CREATE_STATUS_ENUM, UPDATE_STATUS_ENUM } from '../server/validation.js';
 import { createTicket, updateTicket, listTickets } from '../server/tickets.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 
@@ -332,6 +333,32 @@ describe('update_ticket', () => {
     // the ticket is untouched — none of the rejected writes landed
     const now = asRecord(await handleToolCall('get_ticket', { id }));
     expect(now.title).toBe('Seed');
+  });
+
+  // tkt-81b4d35e95e5 — appendBody seam: MCP args → extractTicketFields → updateTicket → persisted file
+  it('appendBody appends non-destructively across the full MCP round-trip (seam)', async () => {
+    const id = await seed({ body: 'Original body' });
+    const updated = asRecord(await handleToolCall('update_ticket', { id, appendBody: '## Added\ntext' }));
+    expect(updated.body).toBe('Original body\n\n## Added\ntext');
+    // source input == persisted output: read back through get_ticket, not the return value
+    const reread = asRecord(await handleToolCall('get_ticket', { id }));
+    expect(reread.body).toBe('Original body\n\n## Added\ntext');
+  });
+
+  it('rejects body and appendBody in the same call (400), body untouched', async () => {
+    const id = await seed({ body: 'Original' });
+    const res = await handleToolCall('update_ticket', { id, body: 'Replace', appendBody: 'Add' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('not both');
+    expect(asRecord(await handleToolCall('get_ticket', { id })).body).toBe('Original');
+  });
+
+  it('rejects a non-string appendBody with 400', async () => {
+    const id = await seed({ body: 'Original' });
+    const res = await handleToolCall('update_ticket', { id, appendBody: 42 });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('appendBody must be a string');
+    expect(asRecord(await handleToolCall('get_ticket', { id })).body).toBe('Original');
   });
 
   it('record_review rejects a nonexistent ticket id instead of ghost-writing an events file', async () => {
