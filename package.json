@@ -23,6 +23,7 @@
   "files": [
     "dist",
     "hooks/guard-bash.mjs",
+    "hooks/guard-ticket.mjs",
     "hooks/track-steps.mjs"
   ],
   "scripts": {

@@ -26,7 +26,9 @@
 // Protocol: read the hook payload as JSON on stdin, inspect
 // `tool_input.command`. Exit 0 to allow; exit 2 to block (stderr is surfaced to
 // Claude so it can self-correct). Anything unexpected → allow (fail open: a
-// guardrail must never wedge legitimate work). The decision logic
+// guardrail must never wedge legitimate work) — EXCEPT an unresolvable branch on
+// commit/push, which fails CLOSED, because that is the one unknown that silently
+// disables the rule it guards (tkt-fbc74a3252fe). The decision logic
 // (parseGit / decide) is exported and pure so it can be unit-tested without
 // spawning a subprocess; the stdin/exit wiring runs only when this file is
 // executed directly as the hook entrypoint.
@@ -275,6 +277,14 @@ function ruleFor(sub, args, branch) {
 
   if (sub === 'push' && pushesMain(args, branch))
     return 'Direct pushes to main are not allowed — push your ticket branch and open a PR. See CLAUDE.md → Branch, commit & PR workflow.';
+
+  // An unresolved branch is NOT a safe branch. Every failure that breaks `git rev-parse` — a bogus
+  // GIT_CONFIG_PARAMETERS, GIT_CEILING_DIRECTORIES over the repo, a safe.directory refusal, git off
+  // PATH — otherwise lands here as a SILENT allow, which is the sink that makes each of those a
+  // main-commit bypass (tkt-fbc74a3252fe). Scoped to commit/push so an unresolvable branch still
+  // can't wedge ordinary work, and last so explicit violations keep their precise message.
+  if ((sub === 'commit' || sub === 'push') && branch === null)
+    return 'Could not determine the current branch, so this commit/push cannot be checked against the never-commit-to-main rule. Refusing rather than guessing — check for a stale GIT_DIR/GIT_CONFIG_PARAMETERS in the environment, or a git safe.directory refusal, then retry. See CLAUDE.md → Branch, commit & PR workflow.';
 
   return null;
 }

@@ -10,10 +10,14 @@ It ships three pieces:
   `start_ticket`, `create_ticket`, `update_ticket`, `record_review`,
   `delete_ticket`. Tickets are markdown files (frontmatter + body); the board is
   the filesystem, no database.
-- **Bash hooks** (`hooks/`) — a `PreToolUse` **guard** (`guard-bash.mjs`) that
-  blocks whole-tree staging and commits/pushes to `main`, and a `PostToolUse`
-  **tracker** (`track-steps.mjs`) that records pipeline milestones (branch,
-  typecheck, lint, test, commit, PR) by watching the commands you run.
+- **Hooks** (`hooks/`) — a `PreToolUse` **guard** (`guard-bash.mjs`) that blocks
+  whole-tree staging and commits/pushes to `main`; a `PostToolUse` **tracker**
+  (`track-steps.mjs`) that records pipeline milestones (branch, typecheck, lint,
+  test, commit, PR) by watching the commands you run; and an opt-in `PreToolUse`
+  guard (`guard-ticket.mjs`) that blocks `create_ticket` so new tickets are
+  authored by a metered local-LLM intake agent instead of by the model driving
+  the session. Wire `guard-ticket` only if you want that policy — the other two
+  suit any consumer.
 - **CLI viewer** (`ticket-workflow`) — `list` and `show <id>`, rendering a
   ticket's pipeline from the same reducer the web board uses.
 
