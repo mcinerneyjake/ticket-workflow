@@ -38,7 +38,7 @@ Add the dependency (public, pinned by tag):
 
 ```jsonc
 // package.json
-"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.1.0" }
+"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.2.1" }
 ```
 
 Wire the MCP server (`.mcp.json`) and the hooks + allowlist (`.claude/settings.json`);
