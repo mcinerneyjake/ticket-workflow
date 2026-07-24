@@ -32,13 +32,33 @@ The board root is resolved at runtime as
 and the hooks, so both write to the same per-repo board. `TICKETS_DIR_OVERRIDE`
 and `EVENTS_DIR_OVERRIDE` take precedence (used by tests).
 
+## Backup-on-write / recovery
+
+`tickets/` is the source of truth and has no built-in history (consumers typically
+gitignore it), so before `updateTicket` overwrites a ticket **body** the prior full
+file — frontmatter + body — is snapshotted to:
+
+```
+<board>/tickets/.history/<id>/<ISO-timestamp>.md
+```
+
+Only body-changing updates snapshot; a structured-only edit (status, priority, …)
+writes nothing to `.history/`. Successive edits accumulate one snapshot per prior
+version, and `list_tickets` ignores `.history/`, so snapshots never surface on the
+board.
+
+**Recovery is manual — there is no restore UI.** To roll a body back, read the
+relevant `.history/<id>/<timestamp>.md` and copy its body into the live ticket (e.g.
+via `update_ticket`). Snapshotting is best-effort: a failure is logged but never
+blocks the edit, so a write can still land without a backup.
+
 ## Consuming it in a repo
 
 Add the dependency (public, pinned by tag):
 
 ```jsonc
 // package.json
-"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.2.1" }
+"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.3.0" }
 ```
 
 Wire the MCP server (`.mcp.json`) and the hooks + allowlist (`.claude/settings.json`);
