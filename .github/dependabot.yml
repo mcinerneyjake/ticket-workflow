@@ -1,0 +1,21 @@
+# Version updates for a published npm package: consumers inherit these deps.
+# Grouped + monthly to stay low-noise; github-actions keeps the SHA-pinned
+# gate.yml actions current (see .github/workflows/gate.yml).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      all-deps:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
