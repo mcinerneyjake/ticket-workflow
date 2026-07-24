@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   extractTicketFields, validatedStatus, CREATE_STATUS_ENUM, UPDATE_STATUS_ENUM,
 } from './validation.js';
-import { HttpError } from './tickets.js';
+import { HttpError, type TicketPatch } from './tickets.js';
 
 // Protocol-neutral validators, extracted from mcp/handlers so a consumer's HTTP
 // controller and the MCP layer share one implementation (tkt-156c5c00149b).
@@ -77,5 +77,13 @@ describe('extractTicketFields', () => {
   it('carries appendBody through and rejects a non-string one', () => {
     expect(extractTicketFields({ appendBody: '## Note' }, UPDATE_STATUS_ENUM)).toEqual({ appendBody: '## Note' });
     expect(() => extractTicketFields({ appendBody: 42 }, UPDATE_STATUS_ENUM)).toThrow(HttpError);
+  });
+
+  // tkt-cb982de01540 — the extractor's output type (TicketFields) is derived from
+  // TicketPatch, so it must stay assignable to it. The annotation fails `tsc` if the
+  // two ever diverge (a field the extractor emits that the service would drop).
+  it('emits a TicketPatch-assignable object (cross-layer field set stays in sync)', () => {
+    const patch: TicketPatch = extractTicketFields({ title: 'x' }, UPDATE_STATUS_ENUM);
+    expect(patch.title).toBe('x');
   });
 });

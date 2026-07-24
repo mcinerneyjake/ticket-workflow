@@ -31,9 +31,12 @@ function isENOENT(err: unknown): boolean {
   return err instanceof Error && 'code' in err && err.code === 'ENOENT';
 }
 
+// The single source of truth for the writable-field set. Exported so validation.ts
+// derives TicketFields from it — a field added here flows to the extractor instead of
+// being silently dropped at the MCP boundary (tkt-cb982de01540).
 // appendBody is a transient instruction, not a Ticket field: it appends to the
 // existing body (non-destructive) and is never persisted. Mutually exclusive with body.
-type TicketPatch = Partial<Pick<Ticket, 'title' | 'type' | 'priority' | 'status' | 'order' | 'body' | 'project' | 'blockers' | 'parent' | 'dueDate' | 'assignee'>> & { appendBody?: string }
+export type TicketPatch = Partial<Pick<Ticket, 'title' | 'type' | 'priority' | 'status' | 'order' | 'body' | 'project' | 'blockers' | 'parent' | 'dueDate' | 'assignee'>> & { appendBody?: string }
 
 // gray-matter parse output. js-yaml auto-parses unquoted ISO dates → Date objects.
 interface RawFrontmatter {
