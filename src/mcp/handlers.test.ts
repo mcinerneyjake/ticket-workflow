@@ -252,6 +252,19 @@ describe('create_ticket', () => {
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain('Invalid status');
   });
+
+  // tkt-aea35fa11c2d (seam) — a model that read the update schema may send appendBody
+  // on create. Before the fix this hard-failed with 400, which under a metered intake
+  // run would bill energy and file NO ticket. It must now succeed and drop appendBody.
+  it('succeeds (does not 400) when create_ticket is given appendBody, and does not persist it', async () => {
+    const created = asRecord(await handleToolCall('create_ticket', { title: 'With stray append', appendBody: '## Note' }));
+    expect(created.title).toBe('With stray append');
+    expect('appendBody' in created).toBe(false);
+    const all = await listTickets();
+    const persisted = all.find((t) => t.id === created.id);
+    expect(persisted?.body).toBe(''); // appendBody was omitted, not written into the body
+    expect(persisted).not.toHaveProperty('appendBody');
+  });
 });
 
 describe('update_ticket', () => {

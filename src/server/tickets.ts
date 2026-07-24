@@ -260,13 +260,10 @@ export async function getTicket(id: string): Promise<Ticket> {
 
 // provenance is a TRUSTED stamp — supplied only by the agent write path, never
 // derived from `input`, so authorship can't be forged by an untrusted caller.
-export async function createTicket(input: Partial<Ticket> & { appendBody?: string }, provenance?: Provenance): Promise<Ticket> {
-  // appendBody is an update-only concept (there's nothing to append to yet); reject
-  // rather than silently drop it, since extractTicketFields feeds both create and update.
-  // `!= null` so an explicit null (a client sending nulls for unset fields) reads as
-  // absent rather than as a supplied append that blocks creation outright.
-  if (input.appendBody != null)
-    throw new HttpError(400, 'appendBody is only valid on update, not create');
+// appendBody is update-only and is gated out on the create path at the extractor
+// (tkt-aea35fa11c2d), so createTicket takes an honest Partial<Ticket> and never has
+// to special-case it — the published .d.ts no longer advertises a field it rejects.
+export async function createTicket(input: Partial<Ticket>, provenance?: Provenance): Promise<Ticket> {
   validateWritableTypes(input);
   assertEnum(TYPES, input.type, 'type');
   assertEnum(PRIORITIES, input.priority, 'priority');
