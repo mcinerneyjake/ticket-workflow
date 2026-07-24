@@ -246,7 +246,9 @@ export async function handleToolCall(
       }
 
       case 'create_ticket':
-        return { content: [textContent(JSON.stringify(await createTicket(extractTicketFields(args, CREATE_STATUS_ENUM), provenance), null, 2))] };
+        // allowAppendBody:false — appendBody is update-only; omit it on create so a
+        // model that read the update schema can't hard-fail a create (tkt-aea35fa11c2d).
+        return { content: [textContent(JSON.stringify(await createTicket(extractTicketFields(args, CREATE_STATUS_ENUM, { allowAppendBody: false }), provenance), null, 2))] };
 
       case 'delete_ticket': {
         const id = extractId(args);

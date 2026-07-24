@@ -36,9 +36,11 @@ export type TicketFields = Omit<TicketPatch, 'order'>
 // allowedStatuses is the per-operation set (create vs update), enforcing the
 // advertised schema at runtime. Invalid values are rejected (parity with the HTTP
 // 400), not silently dropped, so an impossible state (qa at create) surfaces.
+// allowAppendBody gates the update-only appendBody field per operation (see below).
 export function extractTicketFields(
   args: Record<string, unknown> | undefined,
   allowedStatuses: readonly string[],
+  { allowAppendBody = true }: { allowAppendBody?: boolean } = {},
 ): TicketFields {
   const out: TicketFields = {};
   if (!args) return out;
@@ -68,7 +70,11 @@ export function extractTicketFields(
     if (typeof args.body !== 'string') throw new HttpError(400, 'body must be a string');
     out.body = args.body;
   }
-  if (args.appendBody !== undefined) {
+  // appendBody is update-only. On the create path it is OMITTED here (allowAppendBody
+  // false), not rejected — an intake model that read the update schema and sends
+  // appendBody on create must not hard-fail a metered create; the create_ticket MCP
+  // schema is where the intent is documented (tkt-aea35fa11c2d).
+  if (allowAppendBody && args.appendBody !== undefined) {
     if (typeof args.appendBody !== 'string') throw new HttpError(400, 'appendBody must be a string');
     out.appendBody = args.appendBody;
   }

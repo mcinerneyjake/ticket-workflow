@@ -79,6 +79,23 @@ describe('extractTicketFields', () => {
     expect(() => extractTicketFields({ appendBody: 42 }, UPDATE_STATUS_ENUM)).toThrow(HttpError);
   });
 
+  // tkt-aea35fa11c2d — on the create path appendBody is OMITTED (not rejected), so a
+  // model that read the update schema can't hard-fail a metered create by sending it.
+  it('omits appendBody on the create path (allowAppendBody:false), keeping other fields', () => {
+    const out = extractTicketFields(
+      { title: 'New', appendBody: 'should be dropped' },
+      CREATE_STATUS_ENUM,
+      { allowAppendBody: false },
+    );
+    expect(out).toEqual({ title: 'New' });
+  });
+
+  it('does not even type-check appendBody when omitted on create (a bad one is ignored, not a 400)', () => {
+    expect(() =>
+      extractTicketFields({ appendBody: 42 }, CREATE_STATUS_ENUM, { allowAppendBody: false }),
+    ).not.toThrow();
+  });
+
   // tkt-cb982de01540 — the extractor's output type (TicketFields) is derived from
   // TicketPatch, so it must stay assignable to it. The annotation fails `tsc` if the
   // two ever diverge (a field the extractor emits that the service would drop).
