@@ -1,9 +1,9 @@
 import {
   BOARD_STATUSES, CREATE_STATUS_IDS,
   isStatusId, isTicketType, isPriority,
-  type Ticket, type StatusId,
+  type StatusId,
 } from '../shared/constants.js';
-import { HttpError } from './tickets.js';
+import { HttpError, type TicketPatch } from './tickets.js';
 
 // Protocol-neutral write validation — shared by the MCP handlers and a consumer's
 // HTTP intake controller so neither has to depend on the other's layer (tkt-156c5c00149b).
@@ -27,9 +27,11 @@ export function validatedStatus(value: string, allowedStatuses: readonly string[
   return value;
 }
 
-// appendBody is a transient instruction, not a Ticket field: it appends to the
-// existing body (non-destructive) and is never persisted. Mutually exclusive with body.
-type TicketFields = Partial<Pick<Ticket, 'title' | 'type' | 'priority' | 'status' | 'body' | 'project' | 'blockers' | 'parent' | 'dueDate' | 'assignee'>> & { appendBody?: string }
+// Derived from TicketPatch so the extractor's field set can't drift from the
+// service's writable set (tkt-cb982de01540). `order` is excluded on purpose: it is
+// set by the reorder path directly on the service, never through this client-facing
+// field extractor — the sanctioned commented-exclusion pattern.
+export type TicketFields = Omit<TicketPatch, 'order'>
 
 // allowedStatuses is the per-operation set (create vs update), enforcing the
 // advertised schema at runtime. Invalid values are rejected (parity with the HTTP
