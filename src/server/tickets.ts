@@ -442,9 +442,22 @@ export async function archiveStaleTickets(): Promise<number> {
     return !Number.isNaN(updatedAt) && now - updatedAt >= ARCHIVE_AGE_MS;
   });
   const archived = new Date().toISOString();
-  await Promise.all(stale.map((ticket) => writeTicket({ ...ticket, status: 'archived', updated: archived })));
-  console.log(`[archive] Archived ${stale.length} stale ticket(s)`);
-  return stale.length;
+  // Serialize each archive write with concurrent updateTickets on the same id, and
+  // re-read under the lock: writing the stale listTickets() snapshot would clobber an
+  // update that landed after the read (tkt-dea70aad5c1a). Re-check `done` too — an
+  // update may have moved the ticket out of done since the snapshot.
+  let count = 0;
+  await Promise.all(stale.map((ticket) => withTicketLock(ticket.id, async () => {
+    const cur = await getTicket(ticket.id).catch((err) => {
+      if (err instanceof HttpError && err.status === 404) return null; // deleted meanwhile
+      throw err;
+    });
+    if (!cur || cur.status !== 'done') return;
+    await writeTicket({ ...cur, status: 'archived', updated: archived });
+    count += 1;
+  })));
+  console.log(`[archive] Archived ${count} stale ticket(s)`);
+  return count;
 }
 
 export async function searchTickets(q: string): Promise<Ticket[]> {
@@ -503,10 +516,18 @@ export async function deleteTicket(id: string): Promise<void> {
   try {
     const affected = (await listTickets()).filter((t) => t.blockers.includes(id) || t.parent === id);
     await Promise.all(
-      affected.map((t) => writeTicket({
-        ...t,
-        blockers: t.blockers.filter((b) => b !== id),
-        parent: t.parent === id ? null : t.parent,
+      affected.map((t) => withTicketLock(t.id, async () => {
+        // Re-read under the lock so a concurrent updateTicket isn't clobbered by the
+        // stale snapshot (tkt-dea70aad5c1a).
+        const cur = await getTicket(t.id).catch((err) => {
+          if (err instanceof HttpError && err.status === 404) return null; // deleted meanwhile
+          throw err;
+        });
+        if (!cur) return;
+        const blockers = cur.blockers.filter((b) => b !== id);
+        const parent = cur.parent === id ? null : cur.parent;
+        if (blockers.length === cur.blockers.length && parent === cur.parent) return; // edge already gone
+        await writeTicket({ ...cur, blockers, parent });
       })),
     );
   } catch (err) {
