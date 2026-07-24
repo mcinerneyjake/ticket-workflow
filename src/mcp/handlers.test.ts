@@ -1,10 +1,12 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import { handleToolCall, TOOLS } from './handlers.js';
 import { CREATE_STATUS_ENUM, UPDATE_STATUS_ENUM } from '../server/validation.js';
 import { createTicket, updateTicket, listTickets } from '../server/tickets.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 
-setupTempTicketDirs('kanban-mcp-test');
+const dirs = setupTempTicketDirs('kanban-mcp-test');
 
 // ---------------------------------------------------------------------------
 // Parsing helpers — narrow JSON.parse output with predicates, no casts.
@@ -561,5 +563,20 @@ describe('provenance stamping', () => {
     const updated = asRecord(await handleToolCall('update_ticket', { id, title: 'Edited' }, { source: 'agent', runId: 'run-2' }));
     expect(updated.source).toBeNull(); // authorship unchanged
     expect(updated.runId).toBe('run-2'); // run linked
+  });
+});
+
+// tkt-18d53c0c7cd8 — MCP → service → file round-trip: a destructive update_ticket
+// leaves a recoverable prior-body snapshot on disk under .history/<id>/.
+describe('update_ticket backup-on-write round-trip (tkt-18d53c0c7cd8)', () => {
+  it('a body-replacing update_ticket leaves a recoverable prior-body snapshot', async () => {
+    const created = await createTicket({ title: 'Doc', body: 'ORIGINAL BODY' });
+    await handleToolCall('update_ticket', { id: created.id, body: 'REPLACED BODY' });
+    const histDir = path.join(dirs.tickets, '.history', created.id);
+    const files = await fs.readdir(histDir);
+    expect(files).toHaveLength(1);
+    const snap = await fs.readFile(path.join(histDir, files[0]), 'utf8');
+    expect(snap).toContain('ORIGINAL BODY'); // prior body recoverable
+    expect(snap).not.toContain('REPLACED BODY');
   });
 });

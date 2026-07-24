@@ -147,19 +147,43 @@ function serialize(ticket: Ticket): string {
   return matter.stringify(`\n${ticket.body}\n`, data);
 }
 
-// Atomic temp-file + rename: a crash mid-write leaves the original intact.
-// Per-call random suffix (not just pid) so two overlapping writes to the same id
+// Atomic temp-file + rename: a crash mid-write leaves the target intact.
+// Per-call random suffix (not just pid) so two overlapping writes to the same path
 // can't share a temp path and interleave. Temp cleaned up on rename failure.
-async function writeTicket(ticket: Ticket) {
-  await ensureDir();
-  const file = ticketPath(ticket.id);
+async function atomicWrite(file: string, contents: string): Promise<void> {
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  await fs.writeFile(tmp, serialize(ticket), 'utf8');
+  await fs.writeFile(tmp, contents, 'utf8');
   try {
     await fs.rename(tmp, file);
   } catch (err) {
     await fs.rm(tmp, { force: true });
     throw err;
+  }
+}
+
+async function writeTicket(ticket: Ticket) {
+  await ensureDir();
+  await atomicWrite(ticketPath(ticket.id), serialize(ticket));
+}
+
+// Backup-on-write undo (tkt-18d53c0c7cd8): before updateTicket overwrites a body,
+// snapshot the PRIOR full file (frontmatter + body) to a gitignored
+// `<ticketsDir>/.history/<id>/<timestamp>.md`. `tickets/` has no git history and
+// writeTicket atomically renames over the file, so without this an overwrite is
+// unrecoverable. Recovery is manual (read the file) — no restore UI in v1.
+// Non-blocking: a snapshot failure logs loudly but must not wedge a legitimate edit;
+// only the undo for that one overwrite is lost. listTickets skips `.history` (a
+// directory, not a `.md` file), so snapshots never leak into the board.
+async function snapshotHistory(prior: Ticket): Promise<void> {
+  try {
+    const dir = path.join(getTicketsDir(), '.history', prior.id);
+    await fs.mkdir(dir, { recursive: true });
+    // Timestamp + random suffix: sequential same-millisecond updates under the per-id
+    // lock could otherwise collide on the filename.
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    await atomicWrite(path.join(dir, `${stamp}-${randomUUID().slice(0, 8)}.md`), serialize(prior));
+  } catch (err) {
+    console.error(`[history] failed to snapshot prior body for ${prior.id} before overwrite:`, err);
   }
 }
 
@@ -425,6 +449,9 @@ async function updateTicketLocked(id: string, patch: TicketPatch, provenance?: P
   // Compared through serialize() so the check covers exactly what gets persisted
   // and picks up any field added later, rather than a second hand-kept field list.
   if (serialize({ ...merged, updated: existing.updated }) === serialize(existing)) return existing;
+  // Snapshot the prior body before the overwrite loses it (tkt-18d53c0c7cd8). Body-
+  // changing writes only — a structured-only edit keeps the same body, nothing to undo.
+  if (merged.body !== existing.body) await snapshotHistory(existing);
   await writeTicket(merged);
   // Emit only on a real status change — body/priority/reorder patches must not record a milestone.
   if (merged.status !== existing.status) await emitStatusStep(id, merged.status);

@@ -1109,3 +1109,61 @@ describe('archive/delete writes serialize with updateTicket (tkt-dea70aad5c1a)',
     }
   });
 });
+
+// tkt-18d53c0c7cd8 — backup-on-write: an overwrite of a gitignored, history-less body
+// is unrecoverable, so updateTicket snapshots the prior file before a body change.
+describe('backup-on-write history snapshots (tkt-18d53c0c7cd8)', () => {
+  async function historyFiles(id: string): Promise<string[]> {
+    return fs.readdir(path.join(dirs.tickets, '.history', id)).catch(() => []);
+  }
+  async function readSnapshot(id: string, file: string): Promise<string> {
+    return fs.readFile(path.join(dirs.tickets, '.history', id, file), 'utf8');
+  }
+
+  it('snapshots the prior full file before a body-replacing update', async () => {
+    const t = await createTicket({ title: 'Doc', body: 'ORIGINAL' });
+    await updateTicket(t.id, { body: 'REPLACED' });
+    const files = await historyFiles(t.id);
+    expect(files).toHaveLength(1);
+    const snap = await readSnapshot(t.id, files[0]);
+    expect(snap).toContain('ORIGINAL');       // prior body preserved for recovery
+    expect(snap).not.toContain('REPLACED');    // snapshot is the PRIOR state
+    expect(snap).toContain('title: Doc');      // full file: frontmatter too
+    expect((await getTicket(t.id)).body).toBe('REPLACED'); // current file overwritten
+  });
+
+  it('snapshots on an appendBody update too (body changes)', async () => {
+    const t = await createTicket({ title: 'Doc', body: 'BASE' });
+    await updateTicket(t.id, { appendBody: 'MORE' });
+    const files = await historyFiles(t.id);
+    expect(files).toHaveLength(1);
+    expect(await readSnapshot(t.id, files[0])).not.toContain('MORE'); // prior state only
+  });
+
+  it('does NOT snapshot a structured-only update (body unchanged)', async () => {
+    const t = await createTicket({ title: 'Doc', body: 'BODY' });
+    await updateTicket(t.id, { priority: 'high', status: 'todo' });
+    expect(await historyFiles(t.id)).toHaveLength(0);
+  });
+
+  it('does NOT snapshot a no-op update', async () => {
+    const t = await createTicket({ title: 'Doc', body: 'BODY' });
+    await updateTicket(t.id, { body: 'BODY' }); // same body → no write, no snapshot
+    expect(await historyFiles(t.id)).toHaveLength(0);
+  });
+
+  it('accumulates one snapshot per prior version across successive body edits', async () => {
+    const t = await createTicket({ title: 'Doc', body: 'V1' });
+    await updateTicket(t.id, { body: 'V2' });
+    await updateTicket(t.id, { body: 'V3' });
+    expect(await historyFiles(t.id)).toHaveLength(2); // V1 and V2 snapshotted
+  });
+
+  it('does not let .history leak into listTickets', async () => {
+    const t = await createTicket({ title: 'Doc', body: 'V1' });
+    await updateTicket(t.id, { body: 'V2' });
+    const all = await listTickets();
+    expect(all).toHaveLength(1);
+    expect(all[0].id).toBe(t.id);
+  });
+});
