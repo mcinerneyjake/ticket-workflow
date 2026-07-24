@@ -67,13 +67,28 @@ function toSummary(t: Ticket): TicketSummary {
   };
 }
 
-type ListFilters = { status: StatusId | null; project: string | null; query: string | null }
+type ListFilters = { status: StatusId | null; project: string | null; query: string | null; limit: number }
+
+// Default cap on the unfiltered payload. The slim projection alone stopped scaling
+// (~97KB / 442 tickets exceeds the MCP output cap → spills to a temp file every call,
+// tkt-d6fb2ce5c780); a default limit keeps an unfiltered list_tickets usable at scale.
+const DEFAULT_LIST_LIMIT = 100;
 
 // Trim a string filter arg; non-string/blank → null (matches the HTTP route's trim convention).
 function normalizeFilter(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+// Present-but-invalid limit is REJECTED, not coerced (parity with the status filter) —
+// a malformed limit must not silently fall back to a huge default and re-blow the cap.
+function extractLimit(value: unknown): number {
+  if (value === undefined || value === null) return DEFAULT_LIST_LIMIT;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new HttpError(400, `Invalid limit: ${String(value)} (must be a positive integer)`);
+  }
+  return value;
 }
 
 // Status validated against all STATUS_IDS (incl. archived). Present-but-invalid is
@@ -86,14 +101,21 @@ function extractListFilters(args: Record<string, unknown> | undefined): ListFilt
     }
     status = validatedStatus(args.status, STATUS_IDS);
   }
-  return { status, project: normalizeFilter(args?.project), query: normalizeFilter(args?.query) };
+  return {
+    status,
+    project: normalizeFilter(args?.project),
+    query: normalizeFilter(args?.query),
+    limit: extractLimit(args?.limit),
+  };
 }
 
 // AND-combine the optional filters. query is a case-insensitive title substring.
 function applyListFilters(tickets: Ticket[], f: ListFilters): Ticket[] {
   const q = f.query?.toLowerCase();
   return tickets.filter((t) =>
-    (f.status === null || t.status === f.status) &&
+    // Default view hides archived (~half the board, rarely wanted); an explicit
+    // status:archived still reaches them (tkt-d6fb2ce5c780).
+    (f.status === null ? t.status !== 'archived' : t.status === f.status) &&
     (f.project === null || t.project === f.project) &&
     (q === undefined || t.title.toLowerCase().includes(q)),
   );
@@ -106,13 +128,14 @@ function applyListFilters(tickets: Ticket[], f: ListFilters): Ticket[] {
 export const TOOLS: Tool[] = [
   {
     name: 'list_tickets',
-    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
+    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
     inputSchema: {
       type: 'object',
       properties: {
-        status: { type: 'string', enum: STATUS_IDS, description: 'Only return tickets with this status (includes archived)' },
+        status: { type: 'string', enum: STATUS_IDS, description: 'Only return tickets with this status. Archived is excluded by default — pass "archived" to see archived tickets.' },
         project: { type: 'string', description: 'Only return tickets in this project' },
         query: { type: 'string', description: 'Case-insensitive substring match on the ticket title' },
+        limit: { type: 'number', description: `Max tickets to return (default ${DEFAULT_LIST_LIMIT}). The response reports total/returned/omitted; raise this or filter to see more.` },
       },
       required: [],
     },
@@ -211,10 +234,23 @@ export async function handleToolCall(
   try {
     switch (name) {
       case 'list_tickets': {
-        const filters = extractListFilters(args); // throws on a present-but-invalid status
-        const summaries = applyListFilters(await listTickets(), filters).map(toSummary);
-        // Compact (no indent): a large array's pretty-print whitespace is pure token cost. Single-object results stay pretty below.
-        return { content: [textContent(JSON.stringify(summaries))] };
+        const filters = extractListFilters(args); // throws on a present-but-invalid status/limit
+        const matched = applyListFilters(await listTickets(), filters);
+        const shown = matched.slice(0, filters.limit);
+        const omitted = matched.length - shown.length;
+        // Envelope, not a bare array: total/returned/omitted let the caller see the cut
+        // and page/filter; the bare array couldn't signal truncation (tkt-d6fb2ce5c780).
+        const result: { total: number; returned: number; omitted: number; tickets: TicketSummary[]; note?: string } = {
+          total: matched.length,
+          returned: shown.length,
+          omitted,
+          tickets: shown.map(toSummary),
+        };
+        if (omitted > 0) {
+          result.note = `${omitted} more ticket(s) omitted by limit=${filters.limit}; narrow with status/project/query or raise limit.`;
+        }
+        // Compact (no indent): pretty-print whitespace on a large array is pure token cost.
+        return { content: [textContent(JSON.stringify(result))] };
       }
 
       case 'get_ticket': {

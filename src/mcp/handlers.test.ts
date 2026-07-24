@@ -28,6 +28,20 @@ function asRecordArray(result: { content: { text: string }[] }): Record<string, 
   return parsed;
 }
 
+// list_tickets returns an envelope { total, returned, omitted, tickets, note? }.
+// asList unwraps the tickets array; asEnvelope exposes the metadata (tkt-d6fb2ce5c780).
+function asEnvelope(result: { content: { text: string }[] }): Record<string, unknown> {
+  return asRecord(result);
+}
+
+function asList(result: { content: { text: string }[] }): Record<string, unknown>[] {
+  const tickets = asEnvelope(result).tickets;
+  if (!Array.isArray(tickets) || !tickets.every(isRecord)) {
+    throw new Error(`Expected envelope.tickets array, got: ${result.content[0].text}`);
+  }
+  return tickets;
+}
+
 function statusEnumOf(toolName: string): string[] {
   const tool = TOOLS.find((t) => t.name === toolName);
   if (!tool || !isRecord(tool.inputSchema.properties)) return [];
@@ -63,7 +77,7 @@ describe('list_tickets', () => {
   it('returns a lightweight summary — no full body, includes a one-line summary (happy path)', async () => {
     await seed({ title: 'A', body: '## Heading\n\nFirst real line.' });
     await seed({ title: 'B' });
-    const tickets = asRecordArray(await handleToolCall('list_tickets', undefined));
+    const tickets = asList(await handleToolCall('list_tickets', undefined));
     expect(tickets).toHaveLength(2);
     for (const t of tickets) {
       expect(t).not.toHaveProperty('body');
@@ -74,20 +88,20 @@ describe('list_tickets', () => {
 
   it('summary is the first non-empty body line, markdown-stripped', async () => {
     await seed({ title: 'MD', body: '## Title line\n\nbody text' });
-    const [t] = asRecordArray(await handleToolCall('list_tickets', { query: 'MD' }));
+    const [t] = asList(await handleToolCall('list_tickets', { query: 'MD' }));
     expect(t.summary).toBe('Title line');
   });
 
   it('summary caps a long first line at 100 chars with an ellipsis', async () => {
     await seed({ title: 'Cap', body: 'y'.repeat(200) });
-    const [t] = asRecordArray(await handleToolCall('list_tickets', { query: 'Cap' }));
+    const [t] = asList(await handleToolCall('list_tickets', { query: 'Cap' }));
     expect(t.summary).toBe(`${'y'.repeat(99)}…`);
   });
 
   it('filters by status', async () => {
     await seed({ title: 'todo one', status: 'todo' });
     await seed({ title: 'backlog one', status: 'backlog' });
-    const tickets = asRecordArray(await handleToolCall('list_tickets', { status: 'todo' }));
+    const tickets = asList(await handleToolCall('list_tickets', { status: 'todo' }));
     expect(tickets).toHaveLength(1);
     expect(tickets[0].title).toBe('todo one');
   });
@@ -95,7 +109,7 @@ describe('list_tickets', () => {
   it('filters by project', async () => {
     await seed({ title: 'in proj', project: 'Alpha' });
     await seed({ title: 'no proj' });
-    const tickets = asRecordArray(await handleToolCall('list_tickets', { project: 'Alpha' }));
+    const tickets = asList(await handleToolCall('list_tickets', { project: 'Alpha' }));
     expect(tickets).toHaveLength(1);
     expect(tickets[0].title).toBe('in proj');
   });
@@ -103,7 +117,7 @@ describe('list_tickets', () => {
   it('filters by query (case-insensitive title substring)', async () => {
     await seed({ title: 'Fix the Login bug' });
     await seed({ title: 'Add dashboard' });
-    const tickets = asRecordArray(await handleToolCall('list_tickets', { query: 'login' }));
+    const tickets = asList(await handleToolCall('list_tickets', { query: 'login' }));
     expect(tickets).toHaveLength(1);
     expect(tickets[0].title).toBe('Fix the Login bug');
   });
@@ -112,7 +126,7 @@ describe('list_tickets', () => {
     await seed({ title: 'match', status: 'todo', project: 'Alpha' });
     await seed({ title: 'match', status: 'todo', project: 'Beta' });
     await seed({ title: 'match', status: 'backlog', project: 'Alpha' });
-    const tickets = asRecordArray(await handleToolCall('list_tickets', { status: 'todo', project: 'Alpha' }));
+    const tickets = asList(await handleToolCall('list_tickets', { status: 'todo', project: 'Alpha' }));
     expect(tickets).toHaveLength(1);
   });
 
@@ -136,48 +150,92 @@ describe('list_tickets', () => {
     // `archived` isn't creatable/MCP-settable — reach it via the service updateTicket.
     const goneId = await seed({ title: 'gone', status: 'todo' });
     await updateTicket(goneId, { status: 'archived' });
-    const tickets = asRecordArray(await handleToolCall('list_tickets', { status: 'archived' }));
+    const tickets = asList(await handleToolCall('list_tickets', { status: 'archived' }));
     expect(tickets).toHaveLength(1);
     expect(tickets[0].title).toBe('gone');
   });
 
   it('trims surrounding whitespace on the query filter', async () => {
     await seed({ title: 'Trimmable Login' });
-    const tickets = asRecordArray(await handleToolCall('list_tickets', { query: '  login  ' }));
+    const tickets = asList(await handleToolCall('list_tickets', { query: '  login  ' }));
     expect(tickets).toHaveLength(1);
   });
 
   it('treats a blank project/query filter as no filter', async () => {
     await seed({ title: 'one' });
     await seed({ title: 'two' });
-    const tickets = asRecordArray(await handleToolCall('list_tickets', { project: '   ', query: '' }));
+    const tickets = asList(await handleToolCall('list_tickets', { project: '   ', query: '' }));
     expect(tickets).toHaveLength(2);
   });
 
   it('summary preserves leading content that is not a real markdown marker', async () => {
     await seed({ title: 'NotMarker', body: '#1 priority issue' });
-    const [t] = asRecordArray(await handleToolCall('list_tickets', { query: 'NotMarker' }));
+    const [t] = asList(await handleToolCall('list_tickets', { query: 'NotMarker' }));
     expect(t.summary).toBe('#1 priority issue');
   });
 
   it('summary strips a real list marker', async () => {
     await seed({ title: 'ListItem', body: '- do the thing' });
-    const [t] = asRecordArray(await handleToolCall('list_tickets', { query: 'ListItem' }));
+    const [t] = asList(await handleToolCall('list_tickets', { query: 'ListItem' }));
     expect(t.summary).toBe('do the thing');
   });
 
   it('returns an empty array when the board is empty (edge)', async () => {
-    const tickets = asRecordArray(await handleToolCall('list_tickets', undefined));
+    const tickets = asList(await handleToolCall('list_tickets', undefined));
     expect(tickets).toHaveLength(0);
   });
 
   // The TOOL projection drops the body, but the SERVICE must still return full bodies — agent/retrieval embeds t.body.
   it('leaves the service returning full bodies (agent retrieval path intact)', async () => {
     await seed({ title: 'Has body', body: 'real body content' });
-    const viaTool = asRecordArray(await handleToolCall('list_tickets', undefined));
+    const viaTool = asList(await handleToolCall('list_tickets', undefined));
     expect(viaTool[0]).not.toHaveProperty('body');
     const viaService = await listTickets();
     expect(viaService[0].body).toBe('real body content');
+  });
+
+  // tkt-d6fb2ce5c780 — scale fixes so an unfiltered list fits the MCP output cap.
+  describe('limit + archived-default (envelope)', () => {
+    it('wraps results in an envelope with total/returned/omitted and no note when nothing is cut', async () => {
+      await seed({ title: 'A' });
+      await seed({ title: 'B' });
+      const env = asEnvelope(await handleToolCall('list_tickets', undefined));
+      expect(env).toMatchObject({ total: 2, returned: 2, omitted: 0 });
+      expect(env).not.toHaveProperty('note');
+    });
+
+    it('caps the returned array at limit and reports the omitted count + a note', async () => {
+      for (let i = 0; i < 5; i++) await seed({ title: `T${i}` });
+      const res = await handleToolCall('list_tickets', { limit: 2 });
+      const env = asEnvelope(res);
+      expect(env).toMatchObject({ total: 5, returned: 2, omitted: 3 });
+      expect(asList(res)).toHaveLength(2);
+      expect(String(env.note)).toContain('3 more');
+    });
+
+    it('excludes archived from the default (unfiltered) view', async () => {
+      await seed({ title: 'live', status: 'todo' });
+      const goneId = await seed({ title: 'gone', status: 'todo' });
+      await updateTicket(goneId, { status: 'archived' });
+      const tickets = asList(await handleToolCall('list_tickets', undefined));
+      expect(tickets.map((t) => t.title)).toEqual(['live']); // archived hidden by default
+    });
+
+    it('still returns archived when status:archived is explicit', async () => {
+      const goneId = await seed({ title: 'gone', status: 'todo' });
+      await updateTicket(goneId, { status: 'archived' });
+      const tickets = asList(await handleToolCall('list_tickets', { status: 'archived' }));
+      expect(tickets.map((t) => t.title)).toEqual(['gone']);
+    });
+
+    it('rejects an invalid limit rather than coercing it (400)', async () => {
+      await seed({ title: 'A' });
+      for (const bad of [0, -1, 2.5, 'ten']) {
+        const res = await handleToolCall('list_tickets', { limit: bad });
+        expect(res.isError).toBe(true);
+        expect(res.content[0].text).toContain('Invalid limit');
+      }
+    });
   });
 });
 
