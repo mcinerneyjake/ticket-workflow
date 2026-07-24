@@ -34,8 +34,11 @@ export function setupTempTicketDirs(prefix: string): { tickets: string; events: 
 
   beforeEach(async () => {
     for (const dir of [dirs.tickets, dirs.events]) {
-      const files = await fs.readdir(dir);
-      await Promise.all(files.map((f) => fs.unlink(path.join(dir, f))));
+      const entries = await fs.readdir(dir);
+      // recursive rm, not unlink: the tickets dir now holds a `.history/` subdir
+      // (backup-on-write snapshots, tkt-18d53c0c7cd8) — unlink throws on a directory
+      // and would leave prior-test state behind. rm handles files and subdirs alike.
+      await Promise.all(entries.map((e) => fs.rm(path.join(dir, e), { recursive: true, force: true })));
     }
   });
 
