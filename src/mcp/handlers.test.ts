@@ -71,6 +71,16 @@ describe('TOOLS schema', () => {
     expect(CREATE_STATUS_ENUM).not.toContain('qa');
     expect(UPDATE_STATUS_ENUM).toContain('qa');
   });
+
+  // tkt-b49ec09e97ff — the schema must advertise the same integer contract the runtime
+  // enforces (extractLimit rejects non-integers), or a model passing limit:2.5 gets a
+  // 400 the schema said was valid.
+  it('advertises list_tickets limit as an integer, matching the runtime check', () => {
+    const tool = TOOLS.find((t) => t.name === 'list_tickets');
+    const props = tool && isRecord(tool.inputSchema.properties) ? tool.inputSchema.properties : {};
+    const limit = isRecord(props.limit) ? props.limit : {};
+    expect(limit.type).toBe('integer');
+  });
 });
 
 describe('list_tickets', () => {
