@@ -355,7 +355,34 @@ function mergeBody(existingBody: string, patch: TicketPatch): string {
   return existingBody ? `${existingBody}\n\n${addition}` : addition;
 }
 
-export async function updateTicket(id: string, patch: TicketPatch, provenance?: Provenance): Promise<Ticket> {
+// Per-id async mutex. updateTicket is a read-modify-write with awaits between the
+// read and the atomic rename, so two concurrent updates to the SAME id interleave:
+// both read the same `existing`, and the second rename clobbers the first wholesale —
+// a silently lost update (a dropped appendBody; tkt-b3a53c992933). Serializing per id
+// makes each update read the state the previous one persisted. In-process only:
+// separate MCP/Express/agent processes over one tickets/ dir still need a lockfile
+// (tkt-18d53c0c7cd8 follow-up). Keyed per id so unrelated tickets never block.
+const updateChains = new Map<string, Promise<unknown>>();
+
+function withTicketLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  // `prev` is always a never-rejecting tail (below), so a prior failure can't wedge
+  // the chain. Set the new tail synchronously so a same-tick caller queues behind us.
+  const prev = updateChains.get(id) ?? Promise.resolve();
+  const result = prev.then(fn);
+  const tail = result.then(() => {}, () => {});
+  updateChains.set(id, tail);
+  // Prune when this is the last op for the id, so the map doesn't grow unbounded.
+  void tail.then(() => {
+    if (updateChains.get(id) === tail) updateChains.delete(id);
+  });
+  return result;
+}
+
+export function updateTicket(id: string, patch: TicketPatch, provenance?: Provenance): Promise<Ticket> {
+  return withTicketLock(id, () => updateTicketLocked(id, patch, provenance));
+}
+
+async function updateTicketLocked(id: string, patch: TicketPatch, provenance?: Provenance): Promise<Ticket> {
   validateWritableTypes(patch);
   validateEnums(patch);
   assertDueDate(patch.dueDate);

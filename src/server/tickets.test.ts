@@ -1018,3 +1018,57 @@ describe('provenance (source + runId)', () => {
     expect(t.runId).toBe('run-x');
   });
 });
+
+// tkt-b3a53c992933 — updateTicket is a read-modify-write with awaits between the read
+// and the atomic rename; without the per-id mutex two concurrent updates interleaved
+// and the second clobbered the first (a silently lost append). Before the fix the
+// first test persisted only "BASE\n\nTWO" and both callers returned success.
+describe('updateTicket concurrency (per-id mutex)', () => {
+  it('serializes two concurrent appends without losing one', async () => {
+    const t = await createTicket({ title: 'Race', body: 'BASE' });
+    await Promise.all([
+      updateTicket(t.id, { appendBody: 'ONE' }),
+      updateTicket(t.id, { appendBody: 'TWO' }),
+    ]);
+    const final = await getTicket(t.id);
+    expect(final.body.startsWith('BASE')).toBe(true);
+    expect(final.body).toContain('ONE'); // neither append is lost…
+    expect(final.body).toContain('TWO'); // …regardless of which lands first
+  });
+
+  it('serializes a concurrent append and a field edit (both persist)', async () => {
+    const t = await createTicket({ title: 'Race2', body: 'BASE' });
+    await Promise.all([
+      updateTicket(t.id, { appendBody: 'ADDED' }),
+      updateTicket(t.id, { priority: 'urgent' }),
+    ]);
+    const final = await getTicket(t.id);
+    expect(final.body).toContain('ADDED');
+    expect(final.priority).toBe('urgent');
+  });
+
+  it('does not block concurrent updates to different ids', async () => {
+    const [a, b] = await Promise.all([
+      createTicket({ title: 'A', body: 'A0' }),
+      createTicket({ title: 'B', body: 'B0' }),
+    ]);
+    await Promise.all([
+      updateTicket(a.id, { appendBody: 'A1' }),
+      updateTicket(b.id, { appendBody: 'B1' }),
+    ]);
+    expect((await getTicket(a.id)).body).toContain('A1');
+    expect((await getTicket(b.id)).body).toContain('B1');
+  });
+
+  it('a failed update does not wedge the lock for later updates on the same id', async () => {
+    const t = await createTicket({ title: 'Wedge', body: 'BASE' });
+    // First update rejects (bad dueDate) inside the lock; the append queued behind it
+    // on the SAME id must still run — a rejected op must never wedge the chain.
+    const results = await Promise.allSettled([
+      updateTicket(t.id, { dueDate: 'nonsense' }),
+      updateTicket(t.id, { appendBody: 'KEEP' }),
+    ]);
+    expect(results[0].status).toBe('rejected');
+    expect((await getTicket(t.id)).body).toContain('KEEP');
+  });
+});
