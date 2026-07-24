@@ -1072,3 +1072,40 @@ describe('updateTicket concurrency (per-id mutex)', () => {
     expect((await getTicket(t.id)).body).toContain('KEEP');
   });
 });
+
+// tkt-dea70aad5c1a — archiveStaleTickets and deleteTicket cleanup also do a read-
+// modify-write and used to write their stale listTickets() snapshot outside the lock,
+// clobbering a concurrent updateTicket. Both now go through withTicketLock + re-read.
+// These are timing races, so each runs many iterations: without the fix at least one
+// interleaving loses the append (verified red by bypassing the lock).
+describe('archive/delete writes serialize with updateTicket (tkt-dea70aad5c1a)', () => {
+  const ROUNDS = 30;
+
+  it('archiveStaleTickets never clobbers a concurrent append on the same stale ticket', async () => {
+    for (let i = 0; i < ROUNDS; i++) {
+      const id = `tkt-arch-race-${i}`;
+      await writeRaw(id, makeRaw('Stale', i + 1, { status: 'done', updated: STALE_DATE }));
+      await Promise.all([
+        updateTicket(id, { appendBody: 'KEEP' }),
+        archiveStaleTickets(),
+      ]);
+      expect((await getTicket(id)).body, `round ${i}`).toContain('KEEP');
+    }
+  });
+
+  it('deleteTicket cleanup never clobbers a concurrent append on an affected ticket', async () => {
+    for (let i = 0; i < ROUNDS; i++) {
+      const victimId = `tkt-victim-${i}`;
+      const affectedId = `tkt-affected-${i}`;
+      await writeRaw(victimId, makeRaw('Victim', i * 2 + 1));
+      await writeRaw(affectedId, makeRaw('Affected', i * 2 + 2, { blockers: `["${victimId}"]` }));
+      await Promise.all([
+        updateTicket(affectedId, { appendBody: 'KEEP' }),
+        deleteTicket(victimId),
+      ]);
+      const final = await getTicket(affectedId);
+      expect(final.body, `round ${i}`).toContain('KEEP');       // append survived cleanup
+      expect(final.blockers, `round ${i}`).not.toContain(victimId); // edge still stripped
+    }
+  });
+});
