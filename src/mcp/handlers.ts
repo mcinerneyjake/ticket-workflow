@@ -135,7 +135,7 @@ export const TOOLS: Tool[] = [
         status: { type: 'string', enum: STATUS_IDS, description: 'Only return tickets with this status. Archived is excluded by default — pass "archived" to see archived tickets.' },
         project: { type: 'string', description: 'Only return tickets in this project' },
         query: { type: 'string', description: 'Case-insensitive substring match on the ticket title' },
-        limit: { type: 'number', description: `Max tickets to return (default ${DEFAULT_LIST_LIMIT}). The response reports total/returned/omitted; raise this or filter to see more.` },
+        limit: { type: 'integer', description: `Max tickets to return (default ${DEFAULT_LIST_LIMIT}). The response reports total/returned/omitted; raise this or filter to see more.` },
       },
       required: [],
     },
