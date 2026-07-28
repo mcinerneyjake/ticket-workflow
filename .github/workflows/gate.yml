@@ -19,13 +19,15 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # 20 is the `engines.node` floor: declaring a floor CI never runs is how the
+  # 24 is the `engines.node` floor: declaring a floor CI never runs is how the
   # @types/node drift went unnoticed (tkt-dd957c29c349). Bump both together.
+  # Single leg because 24 is the newest LTS — add the next one when it ships
+  # (Node 26 enters LTS 2026-10), so the matrix keeps covering floor + newest.
   suite:
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 22]
+        node: [24]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

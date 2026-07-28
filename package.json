@@ -6,7 +6,7 @@
   "author": "Jake McInerney",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "bin": {
     "ticket-workflow-mcp": "dist/mcp/server.js",
@@ -37,7 +37,7 @@
     "gray-matter": "^4.0.3"
   },
   "devDependencies": {
-    "@types/node": "^20.19.43",
+    "@types/node": "^24.13.3",
     "typescript": "^7.0.2",
     "vitest": "^4.1.9"
   }
