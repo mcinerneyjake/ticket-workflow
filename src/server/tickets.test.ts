@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { listTickets, listProjects, getTicket, createTicket, updateTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, HttpError } from './tickets.js';
@@ -960,6 +960,39 @@ describe('corrupt ticket file resilience', () => {
     expect((await httpError(getTicket('tkt-bad'))).status).toBe(500);
     expect((await httpError(getTicket('tkt-bad'))).status).toBe(500);        // still 500, not a ghost
     warn.mockRestore();
+  });
+});
+
+// tkt-0612c572b49e — a concurrent delete/archive (or an atomic-write rename) can remove a file
+// between readdir and readFile. The board read must degrade to skipping it, as the unparseable
+// case already does, rather than failing whole.
+describe('concurrent file deletion during listTickets', () => {
+  // Restore here, not after the assertions: a failing expect would skip an inline mockRestore and
+  // leak the spy into the next test (it already did once while writing these).
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('skips a file that is named by readdir but gone by readFile, keeps the rest, and warns', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
+    const survivor = await createTicket({ title: 'Survivor' });
+    // A dangling symlink stands in for the race without mocking fs: readdir still names it,
+    // readFile follows it and gets the same real ENOENT a mid-flight delete produces.
+    await fs.symlink(path.join(dirs.tickets, 'gone.md'), path.join(dirs.tickets, 'tkt-ghost.md'));
+
+    const all = await listTickets(); // must not throw
+
+    expect(all.map((t) => t.id)).toContain(survivor.id);
+    expect(all.map((t) => t.id)).not.toContain('tkt-ghost');
+    expect(warn).toHaveBeenCalled();
+  });
+
+  it('still surfaces a non-ENOENT read failure instead of silently swallowing it', async () => {
+    await createTicket({ title: 'A' });
+    const denied = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    vi.spyOn(fs, 'readFile').mockRejectedValue(denied);
+
+    await expect(listTickets()).rejects.toThrow(/EACCES/);
   });
 });
 

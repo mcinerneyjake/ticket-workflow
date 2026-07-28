@@ -247,7 +247,16 @@ export async function listTickets(): Promise<Ticket[]> {
   const tickets: Ticket[] = [];
   for (const file of files) {
     if (!file.endsWith('.md')) continue;
-    const raw = await fs.readFile(path.join(getTicketsDir(), file), 'utf8');
+    let raw: string;
+    try {
+      raw = await fs.readFile(path.join(getTicketsDir(), file), 'utf8');
+    } catch (err) {
+      // A concurrent delete/archive can remove a file readdir just named (tkt-0612c572b49e).
+      // Skip it like an unparseable one; anything else is a real fault and must still surface.
+      if (!isENOENT(err)) throw err;
+      console.warn(`[tickets] skipping ticket file that disappeared mid-read: ${file}`);
+      continue;
+    }
     try {
       const { data, content } = matter(raw, NO_CACHE); // NO_CACHE → consistent throw on bad YAML
       tickets.push(normalize(file.slice(0, -3), data, content));
