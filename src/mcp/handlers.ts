@@ -210,6 +210,15 @@ export const TOOLS: Tool[] = [
     },
   },
   {
+    name: 'archive_ticket',
+    description: 'Archive a ticket by ID — retires it off the board: archived tickets are excluded from list_tickets by default. Use this for a superseded or abandoned ticket instead of deleting it. Archiving an already-archived ticket is a no-op. Find it again with list_tickets status "archived". Reversible, but the ticket\'s previous status is NOT recorded — restore it with update_ticket by setting the status the ticket should return to (a ticket archived while done should go back to "done", not "backlog"), and check its current status with get_ticket before archiving if you may need to restore it later.',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Ticket ID' } },
+      required: ['id'],
+    },
+  },
+  {
     name: 'delete_ticket',
     description: 'Permanently delete a ticket by ID.',
     inputSchema: {
@@ -285,6 +294,15 @@ export async function handleToolCall(
         // allowAppendBody:false — appendBody is update-only; omit it on create so a
         // model that read the update schema can't hard-fail a create (tkt-aea35fa11c2d).
         return { content: [textContent(JSON.stringify(await createTicket(extractTicketFields(args, CREATE_STATUS_ENUM, { allowAppendBody: false }), provenance), null, 2))] };
+
+      // A named tool, not a status value on update_ticket: `archived` is deliberately absent from
+      // UPDATE_STATUS_ENUM so archiving can't be reached by mistyping a field on an ordinary edit,
+      // and so it stays out of the intake agent's name-allowlisted toolset (tkt-f388cfc8ad4b).
+      case 'archive_ticket': {
+        const id = extractId(args);
+        if (!id) throw new HttpError(400, 'Missing required field: id');
+        return { content: [textContent(JSON.stringify(await updateTicket(id, { status: 'archived' }), null, 2))] };
+      }
 
       case 'delete_ticket': {
         const id = extractId(args);

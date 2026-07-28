@@ -1,6 +1,6 @@
 {
   "name": "ticket-workflow",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Local-first, per-repo ticket board + git/PR pipeline: an MCP server, guard/telemetry Bash hooks, and a pipeline CLI. Decoupled — each repo owns its own tickets/ + events/.",
   "license": "MIT",
   "author": "Jake McInerney",
