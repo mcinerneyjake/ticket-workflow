@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { handleToolCall, TOOLS } from './handlers.js';
 import { CREATE_STATUS_ENUM, UPDATE_STATUS_ENUM } from '../server/validation.js';
-import { createTicket, updateTicket, listTickets } from '../server/tickets.js';
+import { createTicket, updateTicket, listTickets, getTicket } from '../server/tickets.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 
 const dirs = setupTempTicketDirs('kanban-mcp-test');
@@ -60,10 +60,19 @@ async function seed(fields: Parameters<typeof createTicket>[0] = {}): Promise<st
 // ---------------------------------------------------------------------------
 
 describe('TOOLS schema', () => {
-  it('exposes exactly the seven kanban tools', () => {
+  it('exposes exactly the eight kanban tools', () => {
     expect(new Set(TOOLS.map((t) => t.name))).toEqual(
-      new Set(['list_tickets', 'get_ticket', 'update_ticket', 'start_ticket', 'create_ticket', 'record_review', 'delete_ticket']),
+      new Set(['list_tickets', 'get_ticket', 'update_ticket', 'start_ticket', 'create_ticket', 'record_review', 'archive_ticket', 'delete_ticket']),
     );
+  });
+
+  // tkt-f388cfc8ad4b — archive_ticket exists BECAUSE archived is not an update_ticket status.
+  // If a later change adds it to the enum, archiving becomes reachable by mistyping a field on an
+  // ordinary edit and this tool's reason for existing is gone — so pin the absence, not just the tool.
+  it('keeps archived off the update_ticket status enum', () => {
+    expect(statusEnumOf('update_ticket')).not.toContain('archived');
+    expect(UPDATE_STATUS_ENUM).not.toContain('archived');
+    expect(statusEnumOf('create_ticket')).not.toContain('archived');
   });
 
   // qa is transition-only: update into it, never create in it — the schemas reflect that asymmetry.
@@ -480,6 +489,90 @@ describe('start_ticket', () => {
     const res = await handleToolCall('start_ticket', { id: 'tkt-doesnotexist' });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain('not found');
+  });
+});
+
+describe('archive_ticket', () => {
+  it('archives an active ticket (happy path)', async () => {
+    const id = await seed({ status: 'backlog' });
+    const res = await handleToolCall('archive_ticket', { id });
+    expect(res.isError).toBeFalsy();
+    expect(asRecord(res).status).toBe('archived');
+    const stored = await getTicket(id);
+    expect(stored.status).toBe('archived');
+  });
+
+  it('archives from any board status, not just done (unlike archiveStaleTickets)', async () => {
+    for (const status of ['todo', 'in-progress', 'qa', 'done'] as const) {
+      const id = await seed({ status: status === 'qa' ? 'todo' : status });
+      if (status === 'qa') await updateTicket(id, { status: 'qa' });
+      expect(asRecord(await handleToolCall('archive_ticket', { id })).status).toBe('archived');
+    }
+  });
+
+  it('is a no-op on an already-archived ticket (edge case)', async () => {
+    const id = await seed();
+    const first = asRecord(await handleToolCall('archive_ticket', { id }));
+    const file = path.join(dirs.tickets, `${id}.md`);
+    const before = await fs.stat(file, { bigint: true });
+    const second = await handleToolCall('archive_ticket', { id });
+    expect(second.isError).toBeFalsy();
+    expect(asRecord(second).updated).toBe(first.updated);
+    // mtime at ns resolution, not the `updated` stamp alone: `updated` is millisecond-resolution, so
+    // two writes inside one millisecond make that equality pass vacuously — reporting the service's
+    // no-change short-circuit as held while every repeat archive is in fact rewriting the file.
+    expect((await fs.stat(file, { bigint: true })).mtimeNs).toBe(before.mtimeNs);
+  });
+
+  it('records no pipeline milestone — archived is deliberately unmapped in STATUS_STEP', async () => {
+    const id = await seed();
+    await updateTicket(id, { status: 'in-progress' }); // emits the `started` milestone
+    const file = path.join(dirs.events, `${id}.jsonl`);
+    const before = await fs.readFile(file, 'utf8');
+    await handleToolCall('archive_ticket', { id });
+    // STATUS_STEP is a Partial<Record<StatusId, StepId>>, so mapping `archived` is a one-line change
+    // away; without this assertion it would silently start counting abandoned work as reaching done.
+    expect(await fs.readFile(file, 'utf8')).toBe(before);
+  });
+
+  it('is the ONLY archive path — update_ticket rejects status archived at runtime (not just in the schema)', async () => {
+    const id = await seed();
+    // Pins the enforcement, not the constant: the advertised enums could stay correct while a
+    // refactor widened the extractor's allowed set, silently handing the intake agent (which holds
+    // update_ticket) the ability to make tickets vanish — the thing this tool exists to prevent.
+    const res = await handleToolCall('update_ticket', { id, status: 'archived' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('Invalid status: archived');
+    expect((await getTicket(id)).status).not.toBe('archived');
+  });
+
+  it('leaves the ticket recoverable — update_ticket sets it back to backlog (round-trip)', async () => {
+    const id = await seed({ status: 'todo', body: 'original body' });
+    // Assert the archive leg landed before restoring: without it the restore alone passes even
+    // when archiving is a no-op, and the test stops proving a round-trip (caught by red-control).
+    expect(asRecord(await handleToolCall('archive_ticket', { id })).status).toBe('archived');
+    const restored = asRecord(await handleToolCall('update_ticket', { id, status: 'backlog' }));
+    expect(restored.status).toBe('backlog');
+    expect(restored.body).toContain('original body');
+  });
+
+  it('stays findable while archived via list_tickets status:archived', async () => {
+    const id = await seed({ title: 'Superseded work' });
+    await handleToolCall('archive_ticket', { id });
+    expect(asList(await handleToolCall('list_tickets', {})).map((t) => t.id)).not.toContain(id);
+    expect(asList(await handleToolCall('list_tickets', { status: 'archived' })).map((t) => t.id)).toContain(id);
+  });
+
+  it('errors on an unknown id (rejection)', async () => {
+    const res = await handleToolCall('archive_ticket', { id: 'tkt-doesnotexist' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('not found');
+  });
+
+  it('errors when id is missing (rejection)', async () => {
+    const res = await handleToolCall('archive_ticket', {});
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('Missing required field: id');
   });
 });
 

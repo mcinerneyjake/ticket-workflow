@@ -8,8 +8,14 @@ It ships three pieces:
 
 - **MCP server** (`ticket-workflow-mcp`) — `list_tickets`, `get_ticket`,
   `start_ticket`, `create_ticket`, `update_ticket`, `record_review`,
-  `delete_ticket`. Tickets are markdown files (frontmatter + body); the board is
-  the filesystem, no database.
+  `archive_ticket`, `delete_ticket`. Tickets are markdown files (frontmatter +
+  body); the board is the filesystem, no database.
+
+  Archiving is its own tool rather than an `update_ticket` status: `archived` is
+  deliberately absent from that tool's status enum, so a ticket can't be retired
+  by mistyping a field on an ordinary edit, and the tool stays out of any
+  name-allowlisted agent toolset. It is reversible — `update_ticket` back to
+  `backlog`, and `list_tickets` with `status: "archived"` to find it again.
 - **Hooks** (`hooks/`) — a `PreToolUse` **guard** (`guard-bash.mjs`) that blocks
   whole-tree staging and commits/pushes to `main`; a `PostToolUse` **tracker**
   (`track-steps.mjs`) that records pipeline milestones (branch, typecheck, lint,
@@ -58,7 +64,7 @@ Add the dependency (public, pinned by tag):
 
 ```jsonc
 // package.json
-"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.3.0" }
+"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.4.0" }
 ```
 
 Wire the MCP server (`.mcp.json`) and the hooks + allowlist (`.claude/settings.json`);
