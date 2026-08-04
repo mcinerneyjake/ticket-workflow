@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { listTickets, listProjects, getTicket, createTicket, updateTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, HttpError } from './tickets.js';
+import { listTickets, listBoard, listProjects, getTicket, createTicket, updateTicket, deleteTicket, archiveStaleTickets, searchTickets, filterBySearch, summarize, summarizeBoard, HttpError } from './tickets.js';
 import { readEvents } from './events.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 import type { Ticket } from '../shared/constants.js';
@@ -931,6 +931,9 @@ describe('write-path type + create-status validation', () => {
 
 describe('corrupt ticket file resilience', () => {
   const CORRUPT = "---\ntitle: 'unclosed\n---\n"; // unclosed quote → gray-matter throws
+  // The real-world trigger (tkt-6cd916608a2f): a hand-edited unquoted title whose
+  // colon makes YAML read "Fix the seam" as a nested mapping key.
+  const UNQUOTED_COLON = '---\ntitle: Fix the seam: stale tabs\ntype: task\n---\n';
 
   it('listTickets skips an unparseable file, keeps the rest of the board, and warns', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
@@ -960,6 +963,42 @@ describe('corrupt ticket file resilience', () => {
     expect((await httpError(getTicket('tkt-bad'))).status).toBe(500);
     expect((await httpError(getTicket('tkt-bad'))).status).toBe(500);        // still 500, not a ghost
     warn.mockRestore();
+  });
+
+  // tkt-6cd916608a2f — skipping is correct; skipping *silently* is the bug. A caller
+  // holding no independent expected count reads the short list as the whole board.
+  it('listBoard reports an unparseable file to the caller, naming it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
+    const good = await createTicket({ title: 'Good one' });
+    await writeRaw('tkt-colon', UNQUOTED_COLON);
+
+    const board = await listBoard();
+
+    expect(board.tickets.map((t) => t.id)).toEqual([good.id]);
+    expect(board.unreadable).toHaveLength(1);
+    expect(board.unreadable[0]?.file).toBe('tkt-colon.md');
+    expect(board.unreadable[0]?.reason).toBeTruthy();
+    warn.mockRestore();
+  });
+
+  it('listBoard reports an empty unreadable list when every file parses', async () => {
+    await createTicket({ title: 'A' });
+    const board = await listBoard();
+    expect(board.tickets).toHaveLength(1);
+    expect(board.unreadable).toEqual([]); // always present, so "no field" can't read as "nothing wrong"
+  });
+
+  it('listBoard reports a file that vanishes between readdir and readFile', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
+    await createTicket({ title: 'Survivor' });
+    await fs.symlink(path.join(dirs.tickets, 'gone.md'), path.join(dirs.tickets, 'tkt-ghost.md'));
+
+    const board = await listBoard();
+
+    expect(board.tickets).toHaveLength(1);
+    expect(board.unreadable.map((u) => u.file)).toEqual(['tkt-ghost.md']);
+    warn.mockRestore();
+    vi.restoreAllMocks();
   });
 });
 

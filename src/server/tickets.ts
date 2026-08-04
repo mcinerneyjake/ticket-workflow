@@ -238,13 +238,28 @@ function newId(): string {
 // ticket silently reappears as an empty ghost. Empty object = defaults, no cache.
 const NO_CACHE: Parameters<typeof matter>[1] = {};
 
+// A ticket file the board read had to skip. Skipping is deliberate — one corrupt
+// file must not 500 the whole board (tkt-cd9d5026c34f) — but reporting it only to
+// stderr made the board quietly smaller, which is the fail-open answer this repo
+// rejects: a short list reads as complete (tkt-6cd916608a2f).
+export interface UnreadableTicketFile {
+  file: string
+  reason: string
+}
+
+export interface BoardListing {
+  tickets: Ticket[]
+  unreadable: UnreadableTicketFile[]
+}
+
 
 // --- Public API ------------------------------------------------------------
 
-export async function listTickets(): Promise<Ticket[]> {
+export async function listBoard(): Promise<BoardListing> {
   await ensureDir();
   const files = await fs.readdir(getTicketsDir());
   const tickets: Ticket[] = [];
+  const unreadable: UnreadableTicketFile[] = [];
   for (const file of files) {
     if (!file.endsWith('.md')) continue;
     let raw: string;
@@ -255,17 +270,23 @@ export async function listTickets(): Promise<Ticket[]> {
       // Skip it like an unparseable one; anything else is a real fault and must still surface.
       if (!isENOENT(err)) throw err;
       console.warn(`[tickets] skipping ticket file that disappeared mid-read: ${file}`);
+      unreadable.push({ file, reason: 'file disappeared between readdir and read' });
       continue;
     }
     try {
       const { data, content } = matter(raw, NO_CACHE); // NO_CACHE → consistent throw on bad YAML
       tickets.push(normalize(file.slice(0, -3), data, content));
     } catch (err) {
-      // Unparseable frontmatter must not take the whole board down — skip + warn so the rest stays up.
+      // Unparseable frontmatter must not take the whole board down — skip so the rest stays up.
       console.warn(`[tickets] skipping unparseable ticket file ${file}:`, err instanceof Error ? err.message : err);
+      unreadable.push({ file, reason: err instanceof Error ? err.message : String(err) });
     }
   }
-  return tickets.sort((a, b) => a.order - b.order);
+  return { tickets: tickets.sort((a, b) => a.order - b.order), unreadable };
+}
+
+export async function listTickets(): Promise<Ticket[]> {
+  return (await listBoard()).tickets;
 }
 
 export async function listProjects(): Promise<string[]> {
@@ -496,12 +517,17 @@ export async function archiveStaleTickets(): Promise<number> {
   return count;
 }
 
-export async function searchTickets(q: string): Promise<Ticket[]> {
+// Pure so a caller that already holds a BoardListing can search it without a second
+// read — re-reading would drop the `unreadable` report that came with the first.
+export function filterBySearch(tickets: Ticket[], q: string): Ticket[] {
   const term = q.toLowerCase();
-  const tickets = await listTickets();
   return tickets.filter(
     (t) => t.title.toLowerCase().includes(term) || t.body.toLowerCase().includes(term),
   );
+}
+
+export async function searchTickets(q: string): Promise<Ticket[]> {
+  return filterBySearch(await listTickets(), q);
 }
 
 const RECENT_LIMIT = 8;

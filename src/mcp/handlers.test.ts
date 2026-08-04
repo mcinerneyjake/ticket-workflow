@@ -258,6 +258,47 @@ describe('list_tickets', () => {
       }
     });
   });
+
+  // tkt-6cd916608a2f — a file that won't parse is skipped so the board survives, but the
+  // caller must be told, or a short list reads as the whole board.
+  describe('unreadable files (envelope)', () => {
+    const UNQUOTED_COLON = '---\ntitle: Fix the seam: stale tabs\ntype: task\n---\n';
+
+    async function writeCorrupt() {
+      await fs.writeFile(path.join(dirs.tickets, 'tkt-colon.md'), UNQUOTED_COLON, 'utf8');
+    }
+
+    it('reports an unparseable file in the envelope and the note, still returning the good tickets', async () => {
+      await seed({ title: 'Good' });
+      await writeCorrupt();
+
+      const res = await handleToolCall('list_tickets', undefined);
+      const env = asEnvelope(res);
+
+      expect(res.isError).toBeUndefined();             // board still renders (tkt-cd9d5026c34f)
+      expect(asList(res).map((t) => t.title)).toEqual(['Good']);
+      expect(env.unreadable).toEqual([{ file: 'tkt-colon.md', reason: expect.any(String) }]);
+      expect(String(env.note)).toContain('tkt-colon.md');
+    });
+
+    it('reports unreadable files even when a filter excludes every readable ticket', async () => {
+      // A file that won't parse has no status to filter on — a filter must not hide it.
+      await seed({ title: 'Good', status: 'todo' });
+      await writeCorrupt();
+
+      const env = asEnvelope(await handleToolCall('list_tickets', { status: 'done' }));
+
+      expect(env).toMatchObject({ total: 0, returned: 0 });
+      expect(env.unreadable).toHaveLength(1);
+    });
+
+    it('reports an empty unreadable list on a healthy board', async () => {
+      await seed({ title: 'A' });
+      const env = asEnvelope(await handleToolCall('list_tickets', undefined));
+      expect(env.unreadable).toEqual([]);
+      expect(env).not.toHaveProperty('note');
+    });
+  });
 });
 
 describe('get_ticket', () => {

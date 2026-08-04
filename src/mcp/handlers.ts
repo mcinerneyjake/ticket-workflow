@@ -1,6 +1,7 @@
 import { type Tool } from '@modelcontextprotocol/sdk/types.js';
 import {
-  listTickets, getTicket, createTicket, updateTicket, deleteTicket, HttpError,
+  listBoard, getTicket, createTicket, updateTicket, deleteTicket, HttpError,
+  type UnreadableTicketFile,
 } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import {
@@ -128,7 +129,7 @@ function applyListFilters(tickets: Ticket[], f: ListFilters): Ticket[] {
 export const TOOLS: Tool[] = [
   {
     name: 'list_tickets',
-    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
+    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, unreadable, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. unreadable lists any ticket FILES that could not be parsed — they are skipped so one corrupt file cannot take the board down, and they are absent from every count, so a non-empty unreadable means the board is larger than total reports. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -244,20 +245,30 @@ export async function handleToolCall(
     switch (name) {
       case 'list_tickets': {
         const filters = extractListFilters(args); // throws on a present-but-invalid status/limit
-        const matched = applyListFilters(await listTickets(), filters);
+        const { tickets, unreadable } = await listBoard();
+        const matched = applyListFilters(tickets, filters);
         const shown = matched.slice(0, filters.limit);
         const omitted = matched.length - shown.length;
         // Envelope, not a bare array: total/returned/omitted let the caller see the cut
         // and page/filter; the bare array couldn't signal truncation (tkt-d6fb2ce5c780).
-        const result: { total: number; returned: number; omitted: number; tickets: TicketSummary[]; note?: string } = {
+        // `unreadable` is board-wide and deliberately NOT run through the filters — a file
+        // that won't parse has no status/project to match on, so a filter must never hide
+        // it. Always present, even empty: an absent field reads as "nothing wrong".
+        const result: { total: number; returned: number; omitted: number; unreadable: UnreadableTicketFile[]; tickets: TicketSummary[]; note?: string } = {
           total: matched.length,
           returned: shown.length,
           omitted,
+          unreadable,
           tickets: shown.map(toSummary),
         };
+        const notes: string[] = [];
         if (omitted > 0) {
-          result.note = `${omitted} more ticket(s) omitted by limit=${filters.limit}; narrow with status/project/query or raise limit.`;
+          notes.push(`${omitted} more ticket(s) omitted by limit=${filters.limit}; narrow with status/project/query or raise limit.`);
         }
+        if (unreadable.length > 0) {
+          notes.push(`${unreadable.length} ticket file(s) could NOT be read and are missing from every count above: ${unreadable.map((u) => u.file).join(', ')}. Fix the frontmatter — an unquoted title containing a colon is the usual cause.`);
+        }
+        if (notes.length > 0) result.note = notes.join(' ');
         // Compact (no indent): pretty-print whitespace on a large array is pure token cost.
         return { content: [textContent(JSON.stringify(result))] };
       }

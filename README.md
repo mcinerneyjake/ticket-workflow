@@ -58,6 +58,21 @@ relevant `.history/<id>/<timestamp>.md` and copy its body into the live ticket (
 via `update_ticket`). Snapshotting is best-effort: a failure is logged but never
 blocks the edit, so a write can still land without a backup.
 
+## Corrupt ticket files
+
+A ticket file whose frontmatter won't parse is **skipped**, not fatal — one
+hand-edited file must never take the whole board down. But the skip is reported to
+the caller, never only to stderr: `listBoard()` returns
+`{ tickets, unreadable: [{ file, reason }] }`, and `list_tickets` carries the same
+`unreadable` array in its envelope plus a `note` naming the files. `listTickets()`
+is the tickets-only shorthand for callers that don't need the report.
+
+This matters because the failure is otherwise invisible: a shorter list looks
+exactly like a complete one. `unreadable` is board-wide and is **not** run through
+the `status`/`project`/`query` filters — a file that won't parse has no fields to
+filter on, so no filter may hide it. The usual cause is a hand-edited unquoted
+`title:` containing a colon.
+
 ## Consuming it in a repo
 
 Add the dependency (public, pinned by tag):
