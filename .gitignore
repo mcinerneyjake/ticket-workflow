@@ -4,3 +4,4 @@ tickets/
 events/
 *.tsbuildinfo
 coverage/
+.DS_Store
