@@ -13,70 +13,87 @@
 // CONTRAST with guard-bash: that hook BLOCKS (PreToolUse, exit 2). This one only
 // reports — it always exits 0 and can never wedge a session.
 //
-// It is NOT silent-on-failure, though. Inside a worktree, "I could not determine
-// staleness" is reported as loudly as staleness itself, because the permissive
-// answer here is exactly the wrong one. Outside a worktree it prints nothing:
-// that is the common case and there is genuinely nothing to say.
+// THE INVARIANT THAT MATTERS: every probe has three outcomes, never two —
+// clean, stale, or COULD-NOT-CHECK. A failed probe must never render as clean.
+// The first cut of this file got that wrong in four separate places (a broken
+// git env, a failed merge-base, a failed diff, and an unparseable threshold all
+// silently reported "fine"), which is the exact fail-open shape it was written
+// to eliminate. Hence `null` — not `[]`, not `false` — for "did not run", and
+// `assessWorktree` routing every null to `level: 'unknown'`.
 //
-// Never fetches. The comparison is against whatever origin/<base> the local repo
-// already has, so a warning is a floor, not an exact figure — a stale remote ref
-// means the real drift can only be larger. formatReport says so.
+// Never fetches. The comparison is against whatever base ref the local repo
+// already has, so a distance is a floor, not an exact figure.
 
 import { execFileSync } from 'node:child_process';
+import { readFileSync, realpathSync } from 'node:fs';
+import { basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-// Instruction files whose drift misleads an agent rather than merely aging.
-// Anything read as project instructions belongs here; source files do not.
+// Matched by BASENAME, not by exact path: nested instruction files are a
+// supported Claude Code feature, so apps/web/CLAUDE.md must count.
 export const INSTRUCTION_FILES = ['CLAUDE.md', 'AGENTS.md', '.cursorrules'];
 
 export const DEFAULT_THRESHOLD = 15;
 
-// Pure. `facts` is everything the git layer could learn; this decides what to say.
-// Returns { level, summary, lines } — level 'ok' means print nothing.
+/** Pure. `facts` is everything the git layer could learn; this decides what to say. */
 export function assessWorktree(facts) {
-  const { isLinkedWorktree, branch, behind, staleFiles, baseRef, threshold = DEFAULT_THRESHOLD } =
-    facts;
+  const {
+    isLinkedWorktree,
+    branch,
+    behind,
+    staleFiles,
+    baseRef,
+    threshold = DEFAULT_THRESHOLD,
+    probeError,
+  } = facts;
 
-  if (!isLinkedWorktree) return { level: 'ok', summary: '', lines: [] };
+  if (isLinkedWorktree === false) return { level: 'ok', summary: '', lines: [] };
 
-  // `rev-parse --abbrev-ref HEAD` yields the literal "HEAD" when detached, which
-  // would otherwise render as "worktree on 'HEAD'".
-  const where = !branch || branch === 'HEAD' ? 'detached worktree' : `worktree on '${branch}'`;
+  const where =
+    !branch || branch === 'HEAD' ? 'detached worktree' : `worktree on '${branch}'`;
 
-  // Fail loud, not open: unresolvable base ref means the check did not run.
+  // isLinkedWorktree === null means git could not answer. Cannot assume "not a
+  // worktree" — that is the permissive answer, and a poisoned GIT_CONFIG_PARAMETERS
+  // or a safe.directory refusal would silently disable this hook entirely.
+  if (isLinkedWorktree === null) {
+    return unknown('git could not be queried', [
+      `Could not determine whether this directory is a git worktree${probeError ? ` (${probeError})` : ''}, so instruction-file staleness was NOT checked.`,
+      'If this IS a worktree, its CLAUDE.md may be out of date — and a stale instruction file does not fail, it instructs. Fix the git environment (look for a poisoned GIT_CONFIG_PARAMETERS, a stale GIT_DIR, or a safe.directory refusal) rather than trusting the silence.',
+    ]);
+  }
+
   if (!baseRef) {
-    return {
-      level: 'unknown',
-      summary: `Stale-worktree check could not run in this ${where}.`,
-      lines: [
-        `This session is in a git ${where}, but no base ref (origin/main or origin/master) could be resolved, so staleness was NOT checked.`,
-        'Treat this checkout as unverified: its CLAUDE.md and other instruction files may be out of date, and a stale instruction file does not fail — it instructs.',
-        'Confirm the base ref exists (git fetch origin) before trusting project instructions read here.',
-      ],
-    };
+    return unknown(`no base ref resolvable in this ${where}`, [
+      `This session is in a git ${where}, but no base ref could be resolved (tried origin/HEAD, origin/main, origin/master, and local main/master), so staleness was NOT checked.`,
+      'Treat this checkout as unverified: a stale instruction file does not fail, it instructs.',
+    ]);
   }
 
   if (behind === null) {
-    return {
-      level: 'unknown',
-      summary: `Stale-worktree check could not run in this ${where}.`,
-      lines: [
-        `This session is in a git ${where}, but the commit distance to ${baseRef} could not be computed, so staleness was NOT checked.`,
-        'Treat this checkout as unverified — a stale instruction file does not fail, it instructs.',
-      ],
-    };
+    return unknown(`commit distance unavailable in this ${where}`, [
+      `This session is in a git ${where}, but the commit distance to ${baseRef} could not be computed, so staleness was NOT checked.`,
+      'Treat this checkout as unverified — a stale instruction file does not fail, it instructs.',
+    ]);
   }
 
-  const stale = staleFiles ?? [];
+  // null (not []) means the merge-base or diff probe failed. "I could not look"
+  // must not become "nothing changed".
+  if (staleFiles === null) {
+    return unknown(`instruction-file check failed in this ${where}`, [
+      `This session is in a git ${where}, ${behind} commit(s) behind ${baseRef}, but whether any instruction file changed on ${baseRef} could NOT be determined (merge-base or diff failed — an unrelated history, a shallow clone, or oversized diff output will do this).`,
+      `Do not assume the CLAUDE.md here is current: compare it against ${baseRef} yourself before following it.`,
+    ]);
+  }
+
   const behindThreshold = behind >= threshold;
-  if (!stale.length && !behindThreshold) return { level: 'ok', summary: '', lines: [] };
+  if (!staleFiles.length && !behindThreshold) return { level: 'ok', summary: '', lines: [] };
 
   const lines = [`This session is in a git ${where}, ${behind} commit(s) behind ${baseRef}.`];
 
-  // The specific hazard, and the reason this hook exists at all.
-  if (stale.length) {
+  if (staleFiles.length) {
+    const plural = staleFiles.length === 1;
     lines.push(
-      `${stale.join(', ')} changed on ${baseRef} since this branch diverged, so the cop${stale.length === 1 ? 'y' : 'ies'} here ${stale.length === 1 ? 'is' : 'are'} STALE. Read the version on ${baseRef} instead — a stale instruction file does not fail, it instructs.`,
+      `${staleFiles.join(', ')} changed on ${baseRef} since this branch diverged, so the cop${plural ? 'y' : 'ies'} here ${plural ? 'is' : 'are'} STALE. Read the version on ${baseRef} instead — a stale instruction file does not fail, it instructs.`,
     );
   } else {
     lines.push(
@@ -90,15 +107,37 @@ export function assessWorktree(facts) {
 
   return {
     level: 'warn',
-    summary: stale.length
-      ? `Stale ${stale.join(', ')} in this ${where} (${behind} behind ${baseRef}) — read the ${baseRef} version.`
+    summary: staleFiles.length
+      ? `Stale ${staleFiles.join(', ')} in this ${where} (${behind} behind ${baseRef}) — read the ${baseRef} version.`
       : `This ${where} is ${behind} commits behind ${baseRef}.`,
     lines,
   };
 }
 
-// Pure. Shapes the SessionStart hook payload: systemMessage is shown to the
-// user, additionalContext is injected into the model's context.
+function unknown(what, lines) {
+  return { level: 'unknown', summary: `Stale-worktree check did not run: ${what}.`, lines };
+}
+
+/** Pure. Truthiness would discard a deliberate 0; an unparseable value is reported, not swallowed. */
+export function parseThreshold(raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return { threshold: DEFAULT_THRESHOLD };
+  }
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n) || n < 0) {
+    return {
+      threshold: DEFAULT_THRESHOLD,
+      warning: `WORKTREE_STALE_THRESHOLD="${raw}" is not a non-negative number; using the default of ${DEFAULT_THRESHOLD}.`,
+    };
+  }
+  return { threshold: n };
+}
+
+/** Pure. Which changed paths are instruction files, matched by basename. */
+export function instructionFilesIn(changedPaths) {
+  return changedPaths.filter((p) => INSTRUCTION_FILES.includes(basename(p)));
+}
+
 export function formatReport(assessment) {
   if (assessment.level === 'ok') return null;
   return {
@@ -111,60 +150,156 @@ export function formatReport(assessment) {
   };
 }
 
-function git(args, cwd) {
-  return execFileSync('git', args, {
-    cwd,
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-  }).trim();
-}
-
+// Returns { out } or { err } — callers must distinguish "git said no" from
+// "git could not answer", so a thrown error is never flattened into null.
 function tryGit(args, cwd) {
   try {
-    return git(args, cwd);
-  } catch {
-    return null;
+    const out = execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 64 * 1024 * 1024, // a big repo's diff must not truncate into a false "no drift"
+    });
+    return { out: out.trim() };
+  } catch (e) {
+    return { err: String(e?.stderr || e?.message || e).trim() };
   }
 }
 
-export function gatherFacts(cwd, threshold = DEFAULT_THRESHOLD) {
-  const gitDir = tryGit(['rev-parse', '--absolute-git-dir'], cwd);
-  const commonDir = tryGit(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd);
-  // Not a repo at all, or git unusable — there is no worktree to be stale.
-  if (!gitDir || !commonDir) return { isLinkedWorktree: false };
-  if (gitDir === commonDir) return { isLinkedWorktree: false };
+const NOT_A_REPO = /not a git repository|does not appear to be a git repository/i;
 
-  const branch = tryGit(['rev-parse', '--abbrev-ref', 'HEAD'], cwd);
-  const baseRef = ['origin/main', 'origin/master'].find(
-    (ref) => tryGit(['rev-parse', '--verify', '--quiet', ref], cwd) !== null,
-  );
+export function gatherFacts(cwd, threshold = DEFAULT_THRESHOLD) {
+  const inside = tryGit(['rev-parse', '--is-inside-work-tree'], cwd);
+  if (inside.err) {
+    // Genuinely outside a repo is the common case and warrants silence. Any other
+    // git failure means the check could not run, which must be said out loud.
+    if (NOT_A_REPO.test(inside.err)) return { isLinkedWorktree: false };
+    return { isLinkedWorktree: null, probeError: firstLine(inside.err), threshold };
+  }
+  if (inside.out !== 'true') return { isLinkedWorktree: false };
+
+  const gitDir = tryGit(['rev-parse', '--absolute-git-dir'], cwd);
+  // --path-format=absolute needs git >= 2.31; --git-common-dir alone is older and
+  // may be relative, so it is resolved against the worktree root when needed.
+  let commonDir = tryGit(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd);
+  if (commonDir.err) {
+    const relative = tryGit(['rev-parse', '--git-common-dir'], cwd);
+    const root = tryGit(['rev-parse', '--show-toplevel'], cwd);
+    commonDir =
+      relative.out && root.out
+        ? { out: relative.out.startsWith('/') ? relative.out : `${root.out}/${relative.out}` }
+        : relative;
+  }
+  if (gitDir.err || commonDir.err) {
+    return {
+      isLinkedWorktree: null,
+      probeError: firstLine(gitDir.err || commonDir.err),
+      threshold,
+    };
+  }
+  if (resolveReal(gitDir.out) === resolveReal(commonDir.out)) return { isLinkedWorktree: false };
+
+  const branch = tryGit(['rev-parse', '--abbrev-ref', 'HEAD'], cwd).out ?? null;
+  const baseRef = resolveBaseRef(cwd);
   if (!baseRef) return { isLinkedWorktree: true, branch, baseRef: null, threshold };
 
-  const behindRaw = tryGit(['rev-list', '--count', `HEAD..${baseRef}`], cwd);
-  const behind = behindRaw !== null && /^\d+$/.test(behindRaw) ? Number(behindRaw) : null;
+  const behindRaw = tryGit(['rev-list', '--count', `HEAD..${baseRef}`], cwd).out;
+  const behind = behindRaw && /^\d+$/.test(behindRaw) ? Number(behindRaw) : null;
 
   // The direct probe for the actual defect: did an instruction file move on the
-  // base branch since this branch diverged? Local edits to it are intentional
-  // and must not count, which is why this diffs merge-base..baseRef and not the
-  // working tree.
-  const mergeBase = tryGit(['merge-base', 'HEAD', baseRef], cwd);
-  let staleFiles = [];
+  // base branch since this branch diverged? Diffs merge-base..baseRef, not the
+  // working tree, so a deliberate local edit to CLAUDE.md is not "drift".
+  // --no-relative because diff.relative would make paths cwd-relative in a
+  // subdirectory session and silently match nothing.
+  let staleFiles = null;
+  const mergeBase = tryGit(['merge-base', 'HEAD', baseRef], cwd).out;
   if (mergeBase) {
-    const changed = tryGit(['diff', '--name-only', `${mergeBase}..${baseRef}`], cwd);
-    if (changed !== null) {
-      const changedSet = new Set(changed.split('\n').filter(Boolean));
-      staleFiles = INSTRUCTION_FILES.filter((f) => changedSet.has(f));
+    const changed = tryGit(
+      ['diff', '--no-relative', '--name-only', `${mergeBase}..${baseRef}`],
+      cwd,
+    );
+    if (changed.out !== undefined) {
+      staleFiles = instructionFilesIn(changed.out.split('\n').filter(Boolean));
     }
   }
 
   return { isLinkedWorktree: true, branch, behind, staleFiles, baseRef, threshold };
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+// origin/HEAD first: it names the repo's ACTUAL default branch, so a repo on
+// `develop` is not permanently alarmed about a missing origin/main. Local
+// main/master last, for repos with no remote at all.
+export function resolveBaseRef(cwd) {
+  const head = tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], cwd).out;
+  const candidates = [
+    ...(head ? [head] : []),
+    'origin/main',
+    'origin/master',
+    'main',
+    'master',
+  ];
+  for (const ref of candidates) {
+    if (tryGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], cwd).out) return ref;
+  }
+  return null;
+}
+
+function firstLine(text) {
+  return String(text ?? '').split('\n')[0].slice(0, 200);
+}
+
+function resolveReal(p) {
   try {
-    const threshold = Number(process.env.WORKTREE_STALE_THRESHOLD) || DEFAULT_THRESHOLD;
-    const report = formatReport(assessWorktree(gatherFacts(process.cwd(), threshold)));
-    if (report) process.stdout.write(JSON.stringify(report));
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+function isMain() {
+  const argv1 = process.argv[1];
+  if (!argv1) return false;
+  // Compare realpaths: a hook wired through a symlink would otherwise load and
+  // exit without ever running.
+  try {
+    return realpathSync(argv1) === realpathSync(new URL(import.meta.url));
+  } catch {
+    return import.meta.url === pathToFileURL(argv1).href;
+  }
+}
+
+if (isMain()) {
+  try {
+    let payload;
+    try {
+      payload = JSON.parse(readFileSync(0, 'utf8'));
+    } catch {
+      payload = undefined;
+    }
+    // payload.cwd is the project dir, matching guard-bash's convention.
+    const startDir = payload?.cwd ?? process.cwd();
+    const { threshold, warning } = parseThreshold(process.env.WORKTREE_STALE_THRESHOLD);
+    const assessment = assessWorktree(gatherFacts(startDir, threshold));
+    const report = formatReport(assessment);
+    if (warning) {
+      // A misconfigured threshold is itself a silent-failure risk, so it is
+      // surfaced even when the worktree is otherwise clean.
+      const merged = report ?? {
+        systemMessage: '',
+        suppressOutput: true,
+        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '' },
+      };
+      merged.systemMessage = [warning, merged.systemMessage].filter(Boolean).join(' ');
+      merged.hookSpecificOutput.additionalContext = [
+        warning,
+        merged.hookSpecificOutput.additionalContext,
+      ]
+        .filter(Boolean)
+        .join(' ');
+      process.stdout.write(JSON.stringify(merged));
+    } else if (report) {
+      process.stdout.write(JSON.stringify(report));
+    }
   } catch {
     // A reporting hook must never wedge a session start.
   }

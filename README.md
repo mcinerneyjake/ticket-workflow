@@ -22,8 +22,14 @@ It ships three pieces:
   test, commit, PR) by watching the commands you run; and an opt-in `PreToolUse`
   guard (`guard-ticket.mjs`) that blocks `create_ticket` so new tickets are
   authored by a metered local-LLM intake agent instead of by the model driving
-  the session. Wire `guard-ticket` only if you want that policy — the other two
-  suit any consumer.
+  the session; and a `SessionStart` **staleness warning**
+  (`warn-stale-worktree.mjs`) that reports when the session opened in a git
+  worktree whose `CLAUDE.md` / `AGENTS.md` / `.cursorrules` has since changed on
+  the base branch — a stale instruction file does not fail, it *instructs*. It
+  only writes to stdout, never blocks, and stays silent outside a linked
+  worktree; set `WORKTREE_STALE_THRESHOLD` to tune the commit-distance fallback
+  (default 15, `0` to always report). Wire `guard-ticket` only if you want that
+  policy — the others suit any consumer.
 - **CLI viewer** (`ticket-workflow`) — `list` and `show <id>`, rendering a
   ticket's pipeline from the same reducer the web board uses.
 
