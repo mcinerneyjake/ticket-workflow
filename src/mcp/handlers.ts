@@ -75,6 +75,10 @@ type ListFilters = { status: StatusId | null; project: string | null; query: str
 // tkt-d6fb2ce5c780); a default limit keeps an unfiltered list_tickets usable at scale.
 const DEFAULT_LIST_LIMIT = 100;
 
+// The `unassigned` array stays complete; only its rendering in `note` is capped, so a
+// board with many strays can't crowd out the omitted/unreadable notes beside it.
+const UNASSIGNED_NOTE_LIMIT = 20;
+
 // Trim a string filter arg; non-string/blank → null (matches the HTTP route's trim convention).
 function normalizeFilter(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -129,7 +133,7 @@ function applyListFilters(tickets: Ticket[], f: ListFilters): Ticket[] {
 export const TOOLS: Tool[] = [
   {
     name: 'list_tickets',
-    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, unreadable, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. unreadable lists any ticket FILES that could not be parsed — they are skipped so one corrupt file cannot take the board down, and they are absent from every count, so a non-empty unreadable means the board is larger than total reports. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
+    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, unreadable, unassigned, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. unreadable lists any ticket FILES that could not be parsed — they are skipped so one corrupt file cannot take the board down, and they are absent from every count, so a non-empty unreadable means the board is larger than total reports. unassigned lists the ids of non-archived tickets that have NO project: they are missing from every project-filtered view, so no work queue can select them until a project is set. unreadable and unassigned are both board-wide and are NOT narrowed by your filters, so their numbers stay comparable across calls. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -249,16 +253,23 @@ export async function handleToolCall(
         const matched = applyListFilters(tickets, filters);
         const shown = matched.slice(0, filters.limit);
         const omitted = matched.length - shown.length;
+        // A ticket with no project is absent from every project-filtered view, so no work
+        // queue can ever select it (tkt-88f229321ad9). Board-wide and NOT run through the
+        // caller's filters, for the same reason as `unreadable`: a filter that hides it
+        // reproduces the bug. Archived is excluded — that is a deliberate exit from the
+        // board, and it is 42 of the 44 unassigned files on the real board.
+        const unassigned = tickets.filter((t) => !t.project && t.status !== 'archived').map((t) => t.id);
         // Envelope, not a bare array: total/returned/omitted let the caller see the cut
         // and page/filter; the bare array couldn't signal truncation (tkt-d6fb2ce5c780).
         // `unreadable` is board-wide and deliberately NOT run through the filters — a file
         // that won't parse has no status/project to match on, so a filter must never hide
         // it. Always present, even empty: an absent field reads as "nothing wrong".
-        const result: { total: number; returned: number; omitted: number; unreadable: UnreadableTicketFile[]; tickets: TicketSummary[]; note?: string } = {
+        const result: { total: number; returned: number; omitted: number; unreadable: UnreadableTicketFile[]; unassigned: string[]; tickets: TicketSummary[]; note?: string } = {
           total: matched.length,
           returned: shown.length,
           omitted,
           unreadable,
+          unassigned,
           tickets: shown.map(toSummary),
         };
         const notes: string[] = [];
@@ -267,6 +278,12 @@ export async function handleToolCall(
         }
         if (unreadable.length > 0) {
           notes.push(`${unreadable.length} ticket file(s) could NOT be read and are missing from every count above: ${unreadable.map((u) => u.file).join(', ')}. Fix the frontmatter — an unquoted title containing a colon is the usual cause.`);
+        }
+        if (unassigned.length > 0) {
+          // Cap the ids so a board with many strays can't crowd out the notes beside it.
+          const shownIds = unassigned.slice(0, UNASSIGNED_NOTE_LIMIT);
+          const more = unassigned.length - shownIds.length;
+          notes.push(`${unassigned.length} non-archived ticket(s) have NO project and are therefore invisible to every project-filtered view: ${shownIds.join(', ')}${more > 0 ? `, and ${more} more` : ''}. Assign a project with update_ticket, or they can never be selected as work.`);
         }
         if (notes.length > 0) result.note = notes.join(' ');
         // Compact (no indent): pretty-print whitespace on a large array is pure token cost.

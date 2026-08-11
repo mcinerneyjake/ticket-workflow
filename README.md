@@ -79,6 +79,24 @@ the `status`/`project`/`query` filters — a file that won't parse has no fields
 filter on, so no filter may hide it. The usual cause is a hand-edited unquoted
 `title:` containing a colon.
 
+## Unassigned tickets
+
+A ticket with no `project` is absent from every project-filtered view, so a work
+queue that selects with `list_tickets({ project })` can never pick it — it is not
+mislabelled, it is out of the queue. `list_tickets` therefore reports
+`unassigned: [id, …]` in its envelope, plus a `note` naming the ids.
+
+Like `unreadable`, it is board-wide and **not** narrowed by your filters — a
+`project` filter would exclude the very tickets being reported, which is the bug
+itself. Archived tickets are excluded: archiving is a deliberate exit from the
+board, so an archived ticket without a project is not a lost one.
+
+Dropping an unresolvable project on the agent write path is deliberate (the intake
+model hallucinates project names, and projects are *derived* from ticket values, so
+a name that matches nothing is dropped rather than minted). This field is what
+reconciles the result afterwards, so the drop does not depend on someone reading a
+warning that has scrolled past.
+
 ## Consuming it in a repo
 
 Add the dependency (public, pinned by tag):

@@ -218,8 +218,10 @@ describe('list_tickets', () => {
   // tkt-d6fb2ce5c780 — scale fixes so an unfiltered list fits the MCP output cap.
   describe('limit + archived-default (envelope)', () => {
     it('wraps results in an envelope with total/returned/omitted and no note when nothing is cut', async () => {
-      await seed({ title: 'A' });
-      await seed({ title: 'B' });
+      // Projects set so the assertion stays about truncation: a project-less fixture
+      // now earns an unassigned note of its own (tkt-88f229321ad9).
+      await seed({ title: 'A', project: 'kanban' });
+      await seed({ title: 'B', project: 'kanban' });
       const env = asEnvelope(await handleToolCall('list_tickets', undefined));
       expect(env).toMatchObject({ total: 2, returned: 2, omitted: 0 });
       expect(env).not.toHaveProperty('note');
@@ -293,10 +295,62 @@ describe('list_tickets', () => {
     });
 
     it('reports an empty unreadable list on a healthy board', async () => {
-      await seed({ title: 'A' });
+      // Project set so "healthy" means healthy on both axes — a project-less fixture
+      // now earns an unassigned note of its own (tkt-88f229321ad9).
+      await seed({ title: 'A', project: 'kanban' });
       const env = asEnvelope(await handleToolCall('list_tickets', undefined));
       expect(env.unreadable).toEqual([]);
       expect(env).not.toHaveProperty('note');
+    });
+  });
+
+  // tkt-88f229321ad9 — a ticket with no project is excluded from every project-filtered
+  // view, so it can never be selected as work. The drop itself is a deliberate guard
+  // (tkt-beef54d90c59); what was missing is anything reporting the result afterwards.
+  describe('unassigned tickets (envelope)', () => {
+    it('reports an unassigned ticket even when a project filter excludes it', async () => {
+      // The actual failure mode: this is how the work queue reads the board.
+      const orphan = await seed({ title: 'Orphan', project: null });
+      await seed({ title: 'Owned', project: 'kanban' });
+
+      const res = await handleToolCall('list_tickets', { project: 'kanban' });
+      const env = asEnvelope(res);
+
+      expect(asList(res).map((t) => t.title)).toEqual(['Owned']);
+      expect(env.unassigned).toEqual([orphan]);
+      expect(String(env.note)).toContain(orphan);
+    });
+
+    // Positive control: without this, "it reports unassigned" could be a field that is
+    // never empty — it would fire on every healthy board and be tuned out.
+    it('reports an empty unassigned list when every ticket has a project', async () => {
+      await seed({ title: 'Owned', project: 'kanban' });
+      const env = asEnvelope(await handleToolCall('list_tickets', undefined));
+      expect(env.unassigned).toEqual([]);
+      expect(env).not.toHaveProperty('note');
+    });
+
+    // Archived is a deliberate exit from the board, so an archived ticket without a
+    // project is not a lost ticket. 42 of the 44 unassigned files on the real board are
+    // archived — counting them would bury the 2 that matter.
+    it('excludes archived tickets from the unassigned report', async () => {
+      // createTicket rejects `archived`, so reach it the way the board does: update.
+      const id = await seed({ title: 'Archived orphan', project: null });
+      await updateTicket(id, { status: 'archived' });
+
+      const env = asEnvelope(await handleToolCall('list_tickets', undefined));
+      expect(env.unassigned).toEqual([]);
+    });
+
+    // Same property that makes `unreadable` trustworthy: the number does not move with
+    // the caller's filter, so it stays comparable across calls.
+    it('reports the same unassigned ids regardless of the caller status filter', async () => {
+      const orphan = await seed({ title: 'Orphan', project: null, status: 'todo' });
+
+      for (const args of [undefined, { status: 'done' }, { status: 'archived' }]) {
+        const env = asEnvelope(await handleToolCall('list_tickets', args));
+        expect(env.unassigned).toEqual([orphan]);
+      }
     });
   });
 });
