@@ -95,6 +95,18 @@ unassigned one there is not lost work, and at least one such ticket is deliberat
 project-less because it spans several repos. A field that flagged those on every
 call is a field nobody reads by the second week.
 
+Two more bounds, for the same reason:
+
+- **Empty when the board uses no projects at all.** `project` is optional, and a
+  single-repo board has nothing to partition — every ticket would be reported, on
+  every call, with nothing wrong.
+- **Capped at 20 ids**, with the true total in `note`. A truncated list must never
+  read as the whole story.
+
+A project of *whitespace* counts as unassigned: it is stored verbatim while a
+caller's blank filter is normalized to "no filter", so no filter value can ever
+match it — strictly worse than an absent project, and invisible without this.
+
 Dropping an unresolvable project on the agent write path is deliberate (the intake
 model hallucinates project names, and projects are *derived* from ticket values, so
 a name that matches nothing is dropped rather than minted). This field is what
@@ -107,7 +119,7 @@ Add the dependency (public, pinned by tag):
 
 ```jsonc
 // package.json
-"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.4.0" }
+"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.8.0" }
 ```
 
 Wire the MCP server (`.mcp.json`) and the hooks + allowlist (`.claude/settings.json`);
