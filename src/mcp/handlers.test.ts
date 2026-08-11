@@ -330,16 +330,28 @@ describe('list_tickets', () => {
       expect(env).not.toHaveProperty('note');
     });
 
-    // Archived is a deliberate exit from the board, so an archived ticket without a
-    // project is not a lost ticket. 42 of the 44 unassigned files on the real board are
-    // archived — counting them would bury the 2 that matter.
-    it('excludes archived tickets from the unassigned report', async () => {
+    // done/archived are past selection, so an unassigned one is not lost work. On the
+    // real board they are ALL of them (42 archived + 2 done) — and one of those two is
+    // deliberately project-less because it is cross-repo, so reporting settled tickets
+    // would mean crying wolf on every single call.
+    it.each(['done', 'archived'] as const)('excludes %s tickets from the unassigned report', async (status) => {
       // createTicket rejects `archived`, so reach it the way the board does: update.
-      const id = await seed({ title: 'Archived orphan', project: null });
-      await updateTicket(id, { status: 'archived' });
+      const id = await seed({ title: `${status} orphan`, project: null });
+      await updateTicket(id, { status });
 
       const env = asEnvelope(await handleToolCall('list_tickets', undefined));
       expect(env.unassigned).toEqual([]);
+    });
+
+    // The statuses that DO matter — anything a work queue could still pick up. Without
+    // this, narrowing to open tickets could quietly narrow to nothing.
+    it.each(['backlog', 'todo', 'in-progress', 'qa'] as const)('reports an unassigned %s ticket', async (status) => {
+      // Set via update, not create — CREATE_STATUS_ENUM has no `qa`.
+      const id = await seed({ title: `${status} orphan`, project: null });
+      await updateTicket(id, { status });
+
+      const env = asEnvelope(await handleToolCall('list_tickets', undefined));
+      expect(env.unassigned).toEqual([id]);
     });
 
     // Same property that makes `unreadable` trustworthy: the number does not move with

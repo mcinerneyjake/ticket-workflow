@@ -79,6 +79,9 @@ const DEFAULT_LIST_LIMIT = 100;
 // board with many strays can't crowd out the omitted/unreadable notes beside it.
 const UNASSIGNED_NOTE_LIMIT = 20;
 
+// Statuses past work selection — a ticket here can't be "stranded out of the queue".
+const SETTLED_STATUSES: readonly StatusId[] = ['done', 'archived'];
+
 // Trim a string filter arg; non-string/blank → null (matches the HTTP route's trim convention).
 function normalizeFilter(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -133,7 +136,7 @@ function applyListFilters(tickets: Ticket[], f: ListFilters): Ticket[] {
 export const TOOLS: Tool[] = [
   {
     name: 'list_tickets',
-    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, unreadable, unassigned, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. unreadable lists any ticket FILES that could not be parsed — they are skipped so one corrupt file cannot take the board down, and they are absent from every count, so a non-empty unreadable means the board is larger than total reports. unassigned lists the ids of non-archived tickets that have NO project: they are missing from every project-filtered view, so no work queue can select them until a project is set. unreadable and unassigned are both board-wide and are NOT narrowed by your filters, so their numbers stay comparable across calls. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
+    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, unreadable, unassigned, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. unreadable lists any ticket FILES that could not be parsed — they are skipped so one corrupt file cannot take the board down, and they are absent from every count, so a non-empty unreadable means the board is larger than total reports. unassigned lists the ids of OPEN tickets (not done, not archived) that have NO project: they are missing from every project-filtered view, so no work queue can select them until a project is set. unreadable and unassigned are both board-wide and are NOT narrowed by your filters, so their numbers stay comparable across calls. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -256,9 +259,12 @@ export async function handleToolCall(
         // A ticket with no project is absent from every project-filtered view, so no work
         // queue can ever select it (tkt-88f229321ad9). Board-wide and NOT run through the
         // caller's filters, for the same reason as `unreadable`: a filter that hides it
-        // reproduces the bug. Archived is excluded — that is a deliberate exit from the
-        // board, and it is 42 of the 44 unassigned files on the real board.
-        const unassigned = tickets.filter((t) => !t.project && t.status !== 'archived').map((t) => t.id);
+        // reproduces the bug.
+        // Scoped to OPEN tickets. done/archived are past selection, so an unassigned one
+        // is not lost work — and on the real board they are all of them (42 archived + 2
+        // done), one of which is deliberately project-less because it is cross-repo. A
+        // field that flags those on every call is one nobody reads by the second week.
+        const unassigned = tickets.filter((t) => !t.project && !SETTLED_STATUSES.includes(t.status)).map((t) => t.id);
         // Envelope, not a bare array: total/returned/omitted let the caller see the cut
         // and page/filter; the bare array couldn't signal truncation (tkt-d6fb2ce5c780).
         // `unreadable` is board-wide and deliberately NOT run through the filters — a file

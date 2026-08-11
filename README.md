@@ -88,8 +88,12 @@ mislabelled, it is out of the queue. `list_tickets` therefore reports
 
 Like `unreadable`, it is board-wide and **not** narrowed by your filters — a
 `project` filter would exclude the very tickets being reported, which is the bug
-itself. Archived tickets are excluded: archiving is a deliberate exit from the
-board, so an archived ticket without a project is not a lost one.
+itself.
+
+It covers **open** tickets only. `done` and `archived` are past selection, so an
+unassigned one there is not lost work, and at least one such ticket is deliberately
+project-less because it spans several repos. A field that flagged those on every
+call is a field nobody reads by the second week.
 
 Dropping an unresolvable project on the agent write path is deliberate (the intake
 model hallucinates project names, and projects are *derived* from ticket values, so
