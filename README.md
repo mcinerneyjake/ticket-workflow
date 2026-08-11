@@ -79,13 +79,47 @@ the `status`/`project`/`query` filters — a file that won't parse has no fields
 filter on, so no filter may hide it. The usual cause is a hand-edited unquoted
 `title:` containing a colon.
 
+## Unassigned tickets
+
+A ticket with no `project` is absent from every project-filtered view, so a work
+queue that selects with `list_tickets({ project })` can never pick it — it is not
+mislabelled, it is out of the queue. `list_tickets` therefore reports
+`unassigned: [id, …]` in its envelope, plus a `note` naming the ids.
+
+Like `unreadable`, it is board-wide and **not** narrowed by your filters — a
+`project` filter would exclude the very tickets being reported, which is the bug
+itself.
+
+It covers **open** tickets only. `done` and `archived` are past selection, so an
+unassigned one there is not lost work, and at least one such ticket is deliberately
+project-less because it spans several repos. A field that flagged those on every
+call is a field nobody reads by the second week.
+
+Two more bounds, for the same reason:
+
+- **Empty when the board uses no projects at all.** `project` is optional, and a
+  single-repo board has nothing to partition — every ticket would be reported, on
+  every call, with nothing wrong.
+- **Capped at 20 ids**, with the true total in `note`. A truncated list must never
+  read as the whole story.
+
+A project of *whitespace* counts as unassigned: it is stored verbatim while a
+caller's blank filter is normalized to "no filter", so no filter value can ever
+match it — strictly worse than an absent project, and invisible without this.
+
+Dropping an unresolvable project on the agent write path is deliberate (the intake
+model hallucinates project names, and projects are *derived* from ticket values, so
+a name that matches nothing is dropped rather than minted). This field is what
+reconciles the result afterwards, so the drop does not depend on someone reading a
+warning that has scrolled past.
+
 ## Consuming it in a repo
 
 Add the dependency (public, pinned by tag):
 
 ```jsonc
 // package.json
-"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.4.0" }
+"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.8.0" }
 ```
 
 Wire the MCP server (`.mcp.json`) and the hooks + allowlist (`.claude/settings.json`);

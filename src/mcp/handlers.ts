@@ -75,6 +75,26 @@ type ListFilters = { status: StatusId | null; project: string | null; query: str
 // tkt-d6fb2ce5c780); a default limit keeps an unfiltered list_tickets usable at scale.
 const DEFAULT_LIST_LIMIT = 100;
 
+// Bounds the ids carried in the envelope. The full count still rides in `note`, so a
+// truncated list can't read as the whole story (same contract as `omitted`).
+const UNASSIGNED_LIMIT = 20;
+
+// Statuses past work selection — a ticket here can't be "stranded out of the queue".
+const SETTLED_STATUSES: readonly StatusId[] = ['done', 'archived'];
+
+// A project of whitespace is worse than none: it is stored verbatim while
+// `normalizeFilter` blanks the caller's filter, so NO filter value can ever match it.
+function hasProject(t: Ticket): boolean {
+  return t.project !== null && t.project.trim().length > 0;
+}
+
+// Silent on a board using no projects at all: nothing to partition, so every ticket
+// would be reported on every call.
+function findUnassigned(tickets: Ticket[]): string[] {
+  if (!tickets.some(hasProject)) return [];
+  return tickets.filter((t) => !hasProject(t) && !SETTLED_STATUSES.includes(t.status)).map((t) => t.id);
+}
+
 // Trim a string filter arg; non-string/blank → null (matches the HTTP route's trim convention).
 function normalizeFilter(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -129,7 +149,7 @@ function applyListFilters(tickets: Ticket[], f: ListFilters): Ticket[] {
 export const TOOLS: Tool[] = [
   {
     name: 'list_tickets',
-    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, unreadable, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. unreadable lists any ticket FILES that could not be parsed — they are skipped so one corrupt file cannot take the board down, and they are absent from every count, so a non-empty unreadable means the board is larger than total reports. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
+    description: 'List kanban tickets as a lightweight summary — id, title, status, priority, type, project, and a one-line summary of each body (NOT the full body; call get_ticket for that). Returns an object { total, returned, omitted, unreadable, unassigned, tickets, note? }: total is the matched count, tickets is capped at limit, and note explains how to see the rest when omitted > 0. unreadable lists any ticket FILES that could not be parsed — they are skipped so one corrupt file cannot take the board down, and they are absent from every count, so a non-empty unreadable means the board is larger than total reports. unassigned lists the ids of OPEN tickets (not done, not archived) that have NO usable project: they are missing from every project-filtered view, so no work queue can select them until a project is set. It is capped at 20 ids — note carries the true total — and is empty on a board that uses no projects at all. unreadable and unassigned are both board-wide and are NOT narrowed by your filters, so their numbers stay comparable across calls. Archived tickets are EXCLUDED by default; pass status:"archived" to see them. Optionally filter by status, project, or a case-insensitive title substring (query). Use this first to find a ticket before working on it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -249,16 +269,21 @@ export async function handleToolCall(
         const matched = applyListFilters(tickets, filters);
         const shown = matched.slice(0, filters.limit);
         const omitted = matched.length - shown.length;
+        // Board-wide, like `unreadable`: a project filter would hide the very tickets
+        // being reported (tkt-88f229321ad9).
+        const unassignedAll = findUnassigned(tickets);
+        const unassigned = unassignedAll.slice(0, UNASSIGNED_LIMIT);
         // Envelope, not a bare array: total/returned/omitted let the caller see the cut
         // and page/filter; the bare array couldn't signal truncation (tkt-d6fb2ce5c780).
         // `unreadable` is board-wide and deliberately NOT run through the filters — a file
         // that won't parse has no status/project to match on, so a filter must never hide
         // it. Always present, even empty: an absent field reads as "nothing wrong".
-        const result: { total: number; returned: number; omitted: number; unreadable: UnreadableTicketFile[]; tickets: TicketSummary[]; note?: string } = {
+        const result: { total: number; returned: number; omitted: number; unreadable: UnreadableTicketFile[]; unassigned: string[]; tickets: TicketSummary[]; note?: string } = {
           total: matched.length,
           returned: shown.length,
           omitted,
           unreadable,
+          unassigned,
           tickets: shown.map(toSummary),
         };
         const notes: string[] = [];
@@ -267,6 +292,10 @@ export async function handleToolCall(
         }
         if (unreadable.length > 0) {
           notes.push(`${unreadable.length} ticket file(s) could NOT be read and are missing from every count above: ${unreadable.map((u) => u.file).join(', ')}. Fix the frontmatter — an unquoted title containing a colon is the usual cause.`);
+        }
+        if (unassignedAll.length > 0) {
+          const more = unassignedAll.length - unassigned.length;
+          notes.push(`${unassignedAll.length} open ticket(s) have NO project and are therefore invisible to every project-filtered view: ${unassigned.join(', ')}${more > 0 ? `, and ${more} more (not listed in \`unassigned\`)` : ''}. Assign a project with update_ticket, or they can never be selected as work.`);
         }
         if (notes.length > 0) result.note = notes.join(' ');
         // Compact (no indent): pretty-print whitespace on a large array is pure token cost.
