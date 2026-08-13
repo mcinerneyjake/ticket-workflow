@@ -144,10 +144,16 @@ export function isStepState(val: string): val is StepState {
 }
 
 // GET /api/tickets/:id/events payload. Shared server/client to prevent drift.
+// Both counts are REQUIRED, not optional: a consumer defaulting with `?? 0` would report a damaged
+// log as healthy, which is the one failure they exist to make visible (tkt-355581f9dab3).
+// `skipped` = lines lost. `unrecognized` = lines this reader's vocabulary is too old to parse —
+// version skew, not damage. Only `skipped > 0` means the pipeline below is missing history.
 export type TicketEventsResponse = {
   ticketId: string
   pipeline: PipelineStep[]
   events: TicketEvent[]
+  skipped: number
+  unrecognized: number
 }
 
 // Trimmed ticket for the "recently updated" widget — avoids shipping every body.

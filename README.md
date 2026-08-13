@@ -79,6 +79,41 @@ the `status`/`project`/`query` filters — a file that won't parse has no fields
 filter on, so no filter may hide it. The usual cause is a hand-edited unquoted
 `title:` containing a colon.
 
+## Corrupt event lines
+
+The same rule applies to the JSONL telemetry, for the same reason: a line that
+won't parse is skipped rather than fatal, and a shorter pipeline looks exactly like
+a ticket with fewer milestones. So `readEvents()` returns
+`{ events, skipped, unrecognized }`, and `getTicketEvents()` — the payload behind
+`GET /api/tickets/:id/events` and the `get_ticket_events` tool — carries both counts
+beside the pipeline it reduced.
+
+**The two counts mean different things, and only one is a problem:**
+
+| field | meaning | act on it? |
+|---|---|---|
+| `skipped` | structurally unreadable — bad JSON, missing or wrong-typed required keys. History is **lost**. | yes |
+| `unrecognized` | well-formed, but names a `step`/`state` this reader's version doesn't know. **Version skew, not damage.** | bump the pin |
+
+They are separate because the `track-steps` hook is installed **once per machine**
+while readers are pinned **per repo**. A newer hook writing a step id added after a
+consumer's pin is routine; folding that into `skipped` would report every healthy
+log as damaged for as long as the pin lagged.
+
+Neither count is logged to stderr — this path is polled (a board re-reads it every
+few seconds while a ticket is on screen), so reporting is left to the caller that
+decides to surface it.
+
+One deliberate exemption: a non-empty **final** line that won't parse is *not*
+counted. `appendEvent` terminates every complete record with `\n`, so an
+unterminated tail is a write in flight, and counting it would flap between polls.
+Once any later event lands it is no longer last, and it is counted from then on.
+
+> **Breaking in 0.10.0:** `readEvents()` previously returned `TicketEvent[]`. It now
+> returns `{ events, skipped, unrecognized }`, and `TicketEventsResponse` gained both
+> counts as **required** fields — optional ones would let a consumer default them with
+> `?? 0` and report a damaged log as healthy.
+
 ## Unassigned tickets
 
 A ticket with no `project` is absent from every project-filtered view, so a work

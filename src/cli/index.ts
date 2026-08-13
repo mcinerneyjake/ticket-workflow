@@ -33,13 +33,18 @@ export async function cmdShow(id: string): Promise<void> {
   // id (caught in main → exit 1). Without this, getTicketEvents on a typo'd/deleted
   // id returns an all-pending pipeline, indistinguishable from a real un-started one.
   const ticket = await getTicket(id);
-  const { pipeline } = await getTicketEvents(id);
+  const { pipeline, skipped, unrecognized } = await getTicketEvents(id);
   console.log(`${ticket.id}  ${ticket.status}  ${ticket.title}`);
   for (const step of pipeline) {
     const glyph = GLYPH[step.state] ?? '·';
     const when = step.at ? `  (${step.at})` : '';
     console.log(`  ${glyph} ${step.label}${when}`);
   }
+  // Without this the pipeline above renders a discarded event as a never-run step — the exact
+  // ambiguity the counts exist to remove. Returning them from readEvents does NOT force a caller
+  // to look: destructuring drops them and typecheck stays clean, which is how this was missed.
+  if (skipped > 0) console.log(`  ! ${skipped} unreadable line(s) — steps above may be incomplete`);
+  if (unrecognized > 0) console.log(`  ! ${unrecognized} line(s) written by a newer ticket-workflow`);
 }
 
 // The advertised list is GENERATED from the canonical ids, never transcribed (tkt-2b6448a398b9):

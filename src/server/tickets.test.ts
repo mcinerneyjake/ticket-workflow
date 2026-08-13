@@ -828,7 +828,7 @@ describe('updateTicket — status-milestone telemetry', () => {
   it('records a `started` event on the transition into in-progress', async () => {
     const t = await createTicket({ title: 'A', status: 'todo' });
     await updateTicket(t.id, { status: 'in-progress' });
-    const events = await readEvents(t.id);
+    const { events } = await readEvents(t.id);
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ step: 'started', state: 'reached' });
   });
@@ -837,25 +837,25 @@ describe('updateTicket — status-milestone telemetry', () => {
     const t = await createTicket({ title: 'A', status: 'in-progress' });
     await updateTicket(t.id, { status: 'qa' });
     await updateTicket(t.id, { status: 'done' });
-    expect((await readEvents(t.id)).map((e) => e.step)).toEqual(['qa', 'done']);
+    expect((await readEvents(t.id)).events.map((e) => e.step)).toEqual(['qa', 'done']);
   });
 
   it('emits nothing for a body/priority-only patch (no status change)', async () => {
     const t = await createTicket({ title: 'A', status: 'in-progress' });
     await updateTicket(t.id, { body: 'new body', priority: 'high' });
-    expect(await readEvents(t.id)).toEqual([]);
+    expect((await readEvents(t.id)).events).toEqual([]);
   });
 
   it('emits nothing when the status patch is a no-op', async () => {
     const t = await createTicket({ title: 'A', status: 'in-progress' });
     await updateTicket(t.id, { status: 'in-progress' });
-    expect(await readEvents(t.id)).toEqual([]);
+    expect((await readEvents(t.id)).events).toEqual([]);
   });
 
   it('emits nothing for a transition into an untracked status (todo)', async () => {
     const t = await createTicket({ title: 'A', status: 'backlog' });
     await updateTicket(t.id, { status: 'todo' });
-    expect(await readEvents(t.id)).toEqual([]);
+    expect((await readEvents(t.id)).events).toEqual([]);
   });
 });
 
