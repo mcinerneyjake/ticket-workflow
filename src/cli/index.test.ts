@@ -15,7 +15,13 @@ vi.mock('../server/events.js', async (importOriginal) => {
   return { ...actual, getTicketEvents: vi.fn(actual.getTicketEvents) };
 });
 
-setupTempTicketDirs('tw-cli-test');
+const dirs = setupTempTicketDirs('tw-cli-test');
+
+// Seed a raw events file directly, bypassing appendEvent's validation — the only way to stage a
+// corrupt log, since appendEvent cannot produce one.
+async function writeRawEvents(ticketId: string, lines: string[]) {
+  await fs.writeFile(path.join(dirs.events, `${ticketId}.jsonl`), lines.join('\n'), 'utf8');
+}
 
 // Restored individually rather than via restoreAllMocks, which would strip the getTicketEvents
 // wrapper above and leave the happy-path test asserting against undefined.
@@ -114,6 +120,43 @@ describe('cmdShow', () => {
     // typo'd id reduce to an all-pending pipeline indistinguishable from a real un-started ticket.
     // Swapping the two calls turns this red; a 404-only assertion stays green either way.
     expect(vi.mocked(getTicketEvents).mock.calls.length).toBe(before);
+  });
+
+  // Review finding on tkt-355581f9dab3: returning the counts from readEvents does NOT force a
+  // caller to look at them — cmdShow destructured only `pipeline` and typecheck stayed clean while
+  // it rendered a damaged log as a normal one. These pin the only channel that reports the loss here.
+  it('warns when events were lost, so a discarded step is not read as a step never run', async () => {
+    const t = await createTicket({ title: 'Damaged', type: 'chore', priority: 'low', status: 'todo' });
+    await writeRawEvents(t.id, [
+      'not json at all',
+      JSON.stringify({ ticketId: t.id, step: 'lint', state: 'passed', at: '2026-07-01T00:00:00.000Z' }),
+      JSON.stringify({ ticketId: t.id, step: 'commit', state: 'passed' }), // missing `at`
+      '', // force a trailing newline so no line is treated as mid-write
+    ]);
+    const lines = captureLog();
+    await cmdShow(t.id);
+    expect(lines.some((l) => l.includes('! 2 unreadable line(s)'))).toBe(true);
+  });
+
+  it('distinguishes a newer writer from data loss', async () => {
+    const t = await createTicket({ title: 'Skewed', type: 'chore', priority: 'low', status: 'todo' });
+    await writeRawEvents(t.id, [
+      JSON.stringify({ ticketId: t.id, step: 'lint', state: 'passed', at: '2026-07-01T00:00:00.000Z' }),
+      JSON.stringify({ ticketId: t.id, step: 'deploy', state: 'passed', at: 'x' }), // future step id
+      '',
+    ]);
+    const lines = captureLog();
+    await cmdShow(t.id);
+    expect(lines.some((l) => l.includes('written by a newer ticket-workflow'))).toBe(true);
+    expect(lines.some((l) => l.includes('unreadable line(s)'))).toBe(false); // skew is not loss
+  });
+
+  it('stays quiet on a clean log — a warning on every show would train the reader to ignore it', async () => {
+    const t = await createTicket({ title: 'Clean', type: 'chore', priority: 'low', status: 'todo' });
+    await appendEvent({ ticketId: t.id, step: 'lint', state: 'passed' });
+    const lines = captureLog();
+    await cmdShow(t.id);
+    expect(lines.some((l) => l.includes('!'))).toBe(false);
   });
 
   it('prints the ticket header and one line per pipeline step', async () => {
