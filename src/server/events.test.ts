@@ -94,6 +94,36 @@ describe('readEvents', () => {
     const err = await httpError(readEvents('../../etc/passwd'));
     expect(err.status).toBe(400);
   });
+
+  // "I could not read this" must not return the same answer as "there is nothing here":
+  // an unreadable log rendered as an empty pipeline (tkt-fc7c6846903d).
+  //
+  // skipIf, not an early return: root bypasses the mode bits and Windows chmod only toggles the
+  // read-only bit, so the case cannot be staged there — and a test that silently REPORTS PASSED
+  // where it never ran is the same fail-open this ticket exists to remove. Skipped is visible.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'rejects an unreadable events file instead of returning [] like an absent one',
+    async () => {
+      await writeRaw('tkt-noperm', [
+        JSON.stringify({ ticketId: 'tkt-noperm', step: 'lint', state: 'passed', at: '2026-07-01T00:00:00.000Z' }),
+      ]);
+      const file = path.join(tmpDir, 'tkt-noperm.jsonl');
+      await fs.chmod(file, 0o000);
+      try {
+        const err = await httpError(readEvents('tkt-noperm'));
+        expect(err.status).toBe(500);
+        expect(err.message).toContain('EACCES');
+        // The absolute events dir must not ride along — consumers surface this message to clients.
+        expect(err.message).not.toContain(tmpDir);
+      } finally {
+        await fs.chmod(file, 0o644);
+      }
+    },
+  );
+
+  it('still returns [] for a genuinely absent file (the ENOENT case stays permissive)', async () => {
+    expect(await readEvents('tkt-absent')).toEqual([]);
+  });
 });
 
 describe('reducePipeline', () => {

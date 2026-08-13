@@ -10,7 +10,7 @@ import {
   type TicketEventsResponse,
 } from '../shared/constants.js';
 import { eventsDir } from '../paths.js';
-import { HttpError } from './tickets.js';
+import { HttpError, isENOENT, errnoCode } from './tickets.js';
 
 // Workflow-step telemetry: append-only JSONL, one file per ticket, in events/
 // (outside tickets/). Writers persist directly (appendEvent + PostToolUse hook);
@@ -88,13 +88,21 @@ function parseEventLine(line: string): TicketEvent | null {
 }
 
 // All events for a ticket in file order. No file (never worked) → empty list, not an error.
+// Only ENOENT may read as "no events": an unreadable log (EACCES/EIO/EMFILE) returning []
+// is the permissive answer to "I could not check", and renders as an empty pipeline
+// indistinguishable from a ticket nobody has worked (tkt-fc7c6846903d).
 export async function readEvents(ticketId: string): Promise<TicketEvent[]> {
   const file = eventsPath(ticketId);
   let raw: string;
   try {
     raw = await fs.readFile(file, 'utf8');
-  } catch {
-    return [];
+  } catch (err) {
+    if (isENOENT(err)) return [];
+    // The path and stack stay server-side; the thrown message carries only the errno, because
+    // consumers surface HttpError messages to clients and a raw fs error embeds the events dir.
+    console.error('[events] read failed', file, err);
+    const code = errnoCode(err);
+    throw new HttpError(500, `Could not read events for ${ticketId}${code ? ` (${code})` : ''}`);
   }
   const events: TicketEvent[] = [];
   for (const line of raw.split('\n')) {

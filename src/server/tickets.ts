@@ -27,8 +27,15 @@ export class HttpError extends Error {
 }
 
 // ENOENT = "not found" (404); every other fs error is a real fault → 500, not a masked 404.
-function isENOENT(err: unknown): boolean {
+// Exported so events.ts applies the same rule — two predicates for one convention drift.
+export function isENOENT(err: unknown): boolean {
   return err instanceof Error && 'code' in err && err.code === 'ENOENT';
+}
+
+// The errno, for a message that names the fault without leaking the path.
+export function errnoCode(err: unknown): string | null {
+  if (!(err instanceof Error) || !('code' in err) || typeof err.code !== 'string') return null;
+  return err.code;
 }
 
 // The single source of truth for the writable-field set. Exported so validation.ts
