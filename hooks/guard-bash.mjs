@@ -35,7 +35,7 @@
 
 import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { isMain } from './lib/is-main.mjs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -307,7 +307,7 @@ function currentBranch(dir, fallbackDir) {
   return (dir ? branchIn(dir) : null) ?? branchIn(fallbackDir);
 }
 
-function main() {
+export function main() {
   let payload;
   try {
     payload = JSON.parse(readFileSync(0, 'utf8'));
@@ -328,6 +328,6 @@ function main() {
 
 // Run the I/O wiring only when invoked directly as the hook (not when imported
 // by the test).
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main();
 }

@@ -35,7 +35,7 @@
 // when this file is executed directly as the hook entrypoint.
 
 import { readFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { isMain } from './lib/is-main.mjs';
 
 // Matches the create tool whether named `mcp__kanban__create_ticket` (the real
 // tool id) or a bare `create_ticket`, so the check survives a server rename and
@@ -59,7 +59,7 @@ export function decide(payload) {
   return { blocked: false };
 }
 
-function main() {
+export function main() {
   let payload;
   try {
     payload = JSON.parse(readFileSync(0, 'utf8'));
@@ -75,6 +75,6 @@ function main() {
 }
 
 // Run the I/O wiring only when invoked directly as the hook (not when imported by the test).
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main();
 }

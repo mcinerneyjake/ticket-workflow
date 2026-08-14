@@ -28,8 +28,11 @@ It ships three pieces:
   the base branch — a stale instruction file does not fail, it *instructs*. It
   only writes to stdout, never blocks, and stays silent outside a linked
   worktree; set `WORKTREE_STALE_THRESHOLD` to tune the commit-distance fallback
-  (default 15, `0` to always report). Wire `guard-ticket` only if you want that
-  policy — the others suit any consumer.
+  (default 15, `0` to always report). Also a `PreToolUse` guard
+  (`guard-review-target.mjs`) that refuses a `/code-review` with no explicit
+  target when the session's own repository has no diff to review, because a
+  wrong-repo review reads exactly like a clean one. Wire `guard-ticket` only if
+  you want that policy — the others suit any consumer.
 - **CLI viewer** (`ticket-workflow`) — `list` and `show <id>`, rendering a
   ticket's pipeline from the same reducer the web board uses.
 
@@ -154,12 +157,32 @@ Add the dependency (public, pinned by tag):
 
 ```jsonc
 // package.json
-"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.8.0" }
+"devDependencies": { "ticket-workflow": "git+https://github.com/mcinerneyjake/ticket-workflow.git#v0.11.0" }
 ```
 
 Wire the MCP server (`.mcp.json`) and the hooks + allowlist (`.claude/settings.json`);
 see a consuming repo's config for the exact shape. Run `npx ticket-workflow show <id>`
 to view a ticket's pipeline.
+
+### Wiring the hooks from an install
+
+Each hook is available both as a script path and as a subpath import, so a consumer can wire the
+installed copy instead of vendoring one that then drifts:
+
+```jsonc
+// .claude/settings.json — run the installed file directly
+"command": "node node_modules/ticket-workflow/hooks/guard-bash.mjs"
+```
+
+```js
+// or import it, to set consumer-specific policy before handing over
+import { main } from 'ticket-workflow/hooks/guard-bash.mjs';
+main();
+```
+
+The exported subpaths are exactly the five hook files above. Importing a hook does **not** run it;
+`main()` reads the payload from stdin and ends in `process.exit()`, so it is one hook per process —
+which is how Claude Code invokes them anyway (one process per matcher).
 
 ## Development
 

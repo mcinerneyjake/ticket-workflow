@@ -27,7 +27,7 @@
 import { execFileSync } from 'node:child_process';
 import { readFileSync, realpathSync } from 'node:fs';
 import { basename } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMain } from './lib/is-main.mjs';
 
 // Matched by BASENAME, not by exact path: nested instruction files are a
 // supported Claude Code feature, so apps/web/CLAUDE.md must count.
@@ -256,19 +256,10 @@ function resolveReal(p) {
   }
 }
 
-function isMain() {
-  const argv1 = process.argv[1];
-  if (!argv1) return false;
-  // Compare realpaths: a hook wired through a symlink would otherwise load and
-  // exit without ever running.
-  try {
-    return realpathSync(argv1) === realpathSync(new URL(import.meta.url));
-  } catch {
-    return import.meta.url === pathToFileURL(argv1).href;
-  }
-}
-
-if (isMain()) {
+// Extracted from the direct-execution tail so a consumer can import and call it, matching the other
+// four hooks. It keeps the trailing process.exit(0) they all have: `main` IS the I/O wiring, so a
+// launcher that imports it gets the hook's real exit behaviour rather than a half-run.
+export function main() {
   try {
     let payload;
     try {
@@ -305,3 +296,5 @@ if (isMain()) {
   }
   process.exit(0);
 }
+
+if (isMain(import.meta.url)) main();

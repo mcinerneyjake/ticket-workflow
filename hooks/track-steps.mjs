@@ -26,7 +26,7 @@
 import { readFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMain } from './lib/is-main.mjs';
 
 // The milestones this hook can emit. MUST stay a subset of shared/constants.ts
 // STEP_IDS — track-steps.test.mjs asserts parity so the two can't drift.
@@ -143,7 +143,7 @@ function record(ticketId, step, state, at) {
   appendFileSync(path.join(dir, `${ticketId}.jsonl`), line, { encoding: 'utf8', flag: 'a' });
 }
 
-function main() {
+export function main() {
   let payload;
   try {
     payload = JSON.parse(readFileSync(0, 'utf8'));
@@ -172,6 +172,6 @@ function main() {
 
 // Run the I/O wiring only when invoked directly as the hook (not when imported
 // by the test).
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main();
 }
