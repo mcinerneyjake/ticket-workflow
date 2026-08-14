@@ -28,7 +28,7 @@
 
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { isMain } from './lib/is-main.mjs';
 
 // `/ultrareview` is a deprecated alias for `/code-review ultra`; it resolves the same way, so it
 // carries the same defect and is guarded too.
@@ -136,7 +136,7 @@ function gitRunner() {
   };
 }
 
-function main() {
+export function main() {
   let payload;
   try {
     payload = JSON.parse(readFileSync(0, 'utf8'));
@@ -152,6 +152,6 @@ function main() {
 }
 
 // Run the I/O wiring only when invoked directly as the hook (not when imported by the test).
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMain(import.meta.url)) {
   main();
 }
