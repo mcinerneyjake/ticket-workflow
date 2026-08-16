@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { realpathSync, statSync } from 'node:fs';
+import path from 'node:path';
 import { listTickets, getTicket } from '../server/tickets.js';
 import { getTicketEvents } from '../server/events.js';
 import { isStatusId, STATUS_IDS } from '../shared/constants.js';
 import { runChecks, exitCodeFor, formatResults } from '../doctor/checks.js';
 import { gatherFacts } from '../doctor/gather.js';
 import { runAudit, auditExitCode, formatAudit } from '../audit/run.js';
+import { runInit } from '../init/run.js';
 import { buildReport, formatReport } from '../verify/rules.js';
 import { gatherTicketFacts } from '../verify/gather.js';
 
@@ -132,6 +134,63 @@ export function cmdAudit(args: string[], stat: (p: string) => { isDirectory(): b
   process.exitCode = auditExitCode(report);
 }
 
+export function parseInitArgs(args: readonly string[]): { targetDir: string; tier: 'core' | 'node'; force: boolean } {
+  const out = { targetDir: '.', tier: 'node' as 'core' | 'node', force: false };
+  let sawPath = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--force') {
+      out.force = true;
+    } else if (a === '--tier') {
+      const v = args[++i];
+      if (v !== 'core' && v !== 'node') throw new Error('--tier requires "core" or "node"');
+      out.tier = v;
+    } else if (a.startsWith('-')) {
+      throw new Error(`unknown option for init: ${a} (accepts --tier <core|node>, --force)`);
+    } else if (!sawPath) {
+      out.targetDir = a;
+      sawPath = true;
+    } else {
+      throw new Error(`init takes at most one path (got "${out.targetDir}" and "${a}")`);
+    }
+  }
+  return out;
+}
+
+export function cmdInit(args: string[], stat: (p: string) => { isDirectory(): boolean } = statSync): void {
+  const { targetDir, tier, force } = parseInitArgs(args);
+  // A missing leaf is created (initializing a new dir is the headline use), but only under an
+  // existing parent, and never over a non-directory: a typo'd deep path silently scaffolded with
+  // exit 0 gives no signal that the intended repo was never touched.
+  let exists = true;
+  try {
+    if (!stat(targetDir).isDirectory()) throw new Error('non-directory');
+  } catch (err) {
+    if (err instanceof Error && err.message === 'non-directory') {
+      throw new Error(`init target exists and is not a directory: ${targetDir}`);
+    }
+    exists = false;
+  }
+  if (!exists) {
+    const parent = path.dirname(path.resolve(targetDir));
+    try {
+      if (!stat(parent).isDirectory()) throw new Error('bad parent');
+    } catch {
+      throw new Error(`init target's parent does not exist: ${parent} — check the path for typos`);
+    }
+    console.log(`created    ${targetDir}`);
+  }
+  const result = runInit(targetDir, { tier, force });
+  for (const f of result.wrote) console.log(`wrote      ${f}`);
+  for (const f of result.preserved) console.log(`preserved  ${f}`);
+  console.log(`\n${formatAudit(result.report)}`);
+  // Not "done" — a fresh scaffold has real work only a human can do; claiming completion here is
+  // the fail-open shape one level up.
+  console.log('\nRemaining human steps:');
+  for (const s of result.humanSteps) console.log(`  - ${s}`);
+  process.exitCode = result.exitCode;
+}
+
 const VERIFY_FLAGS = ['--all', '--json'];
 
 export function parseVerifyArgs(args: readonly string[]): { id: string | null; all: boolean; json: boolean; project: string | null } {
@@ -188,6 +247,9 @@ export async function main(): Promise<void> {
     case 'audit':
       cmdAudit(rest);
       break;
+    case 'init':
+      cmdInit(rest);
+      break;
     case 'verify':
       await cmdVerify(rest);
       break;
@@ -200,7 +262,7 @@ export async function main(): Promise<void> {
     default:
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
-          'audit <path> [--json] | verify [<id>] [--all] [--project <name>] [--json]>',
+          'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;
   }
