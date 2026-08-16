@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, main, isMain } from './index.js';
+import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, cmdVerify, parseVerifyArgs, main, isMain } from './index.js';
 import { createTicket, HttpError } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import { STATUS_IDS } from '../shared/constants.js';
@@ -281,6 +281,67 @@ describe('main', () => {
     expect(() => parseDoctorFlags(['--stict'])).toThrow(/unknown option/);
     expect(() => parseDoctorFlags(['--strict=true'])).toThrow(/unknown option/);
     expect(parseDoctorFlags(['--strict', '--no-mcp'])).toEqual({ strict: true, probeMcp: false });
+  });
+
+  it('advertises verify in the usage line', async () => {
+    const bare = captureLog();
+    await withArgv([], async () => { await main(); });
+    expect(bare[0]).toContain('verify');
+  });
+
+  it('main() ROUTES verify — renaming the case must not stay green', async () => {
+    // The previous test of this name only read the usage string: renaming `case 'verify'` left all
+    // 31 CLI tests green while the real command printed usage and exited 1. This drives main()
+    // against the temp board, so only actual routing satisfies it.
+    await createTicket({ title: 'Routed to verify', type: 'chore', priority: 'low', status: 'done' });
+    const lines = captureLog();
+    await withArgv(['verify'], async () => {
+      await main();
+      expect(process.exitCode).toBeUndefined(); // routed AND report-only
+    });
+    const out = lines.join('\n');
+    expect(out).toContain('could NOT be judged');
+    expect(out).not.toContain('usage:');
+  });
+
+  it('parses verify arguments, and REJECTS what it does not recognise', () => {
+    expect(parseVerifyArgs([])).toEqual({ id: null, all: false, json: false, project: null });
+    expect(parseVerifyArgs(['tkt-1', '--all', '--json', '--project', 'kanban'])).toEqual({
+      id: 'tkt-1', all: true, json: true, project: 'kanban',
+    });
+    expect(() => parseVerifyArgs(['--al'])).toThrow(/unknown option/);
+    expect(() => parseVerifyArgs(['--project'])).toThrow(/requires a value/);
+    // A flag swallowed as the project name would filter to a project nothing matches, and report a
+    // confident empty result rather than an error.
+    expect(() => parseVerifyArgs(['--project', '--json'])).toThrow(/requires a value/);
+    expect(() => parseVerifyArgs(['tkt-1', 'tkt-2'])).toThrow(/at most one ticket id/);
+  });
+
+  it('verify is REPORT-ONLY — a violation must not set a failing exit code', async () => {
+    // The plan is explicit that this must not emit a build-failing verdict until the discrepancy
+    // rate is defensible. Facts are injected so the assertion does not depend on the real board.
+    const lines = captureLog();
+    await withArgv(['verify'], async () => {
+      await cmdVerify([], async () => ({
+        facts: [{
+          id: 'tkt-x', title: 'T', status: 'done', steps: { branch: 'passed' },
+          skippedLines: 0, unrecognizedLines: 0, unreadableLog: false,
+          claim: { kind: 'added' as const, text: '3 added — x' },
+        }],
+        unreadable: 0,
+      }));
+      expect(process.exitCode).toBeUndefined();
+    });
+    expect(lines.join('\n')).toContain('VIOLATIONS');
+  });
+
+  it('verify --json emits the counts as data, including the unparseable-file count', async () => {
+    const lines = captureLog();
+    await withArgv(['verify'], async () => {
+      await cmdVerify(['--json'], async () => ({ facts: [], unreadable: 2 }));
+    });
+    const parsed: unknown = JSON.parse(lines.join(''));
+    expect(parsed).toMatchObject({ considered: 0, unknown: 0, boardUnreadable: 2 });
   });
 
   it('routes `list --status` through parseStatus', async () => {
