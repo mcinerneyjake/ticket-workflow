@@ -90,7 +90,20 @@ describe('the disguised shapes', () => {
       'git add -p; git commit -m x',
       'false || gh pr merge 40 --squash',
       'cd /tmp\ngit push origin main',
+      // The exact shape the incident took: change directory into another repo, then merge there.
+      // guard-bash's own main-branch rules are cwd-sensitive, so this is the shape most likely to be
+      // mis-parsed (tkt-e508ad42a68a).
+      'cd /Users/x/repos/some-repo && gh pr merge 40 --squash --delete-branch',
+      'cd ../other-repo; gh pr create --base main --title x --body y',
     ]) {
+      expect(decide(payload(command)).blocked, command).toBe(true);
+    }
+  });
+
+  it('blocks a merge whether or not the PR number is explicit', () => {
+    // `gh pr merge` with no number merges the PR for the CURRENT branch — the form used by this
+    // project's own workflow, and the one an agent reaches for by default.
+    for (const command of ['gh pr merge', 'gh pr merge --squash --delete-branch', 'gh pr merge 40']) {
       expect(decide(payload(command)).blocked, command).toBe(true);
     }
   });
@@ -98,6 +111,9 @@ describe('the disguised shapes', () => {
   it('sees through an env prefix and `git -C <dir>`', () => {
     expect(decide(payload('GIT_AUTHOR_NAME=x git commit -m y')).blocked).toBe(true);
     expect(decide(payload('git -C /other/repo push')).blocked).toBe(true);
+    // The gh half of the same shape, and the one that matters most here: `GH_TOKEN=…` is how a
+    // different credential gets in front of a merge (tkt-e508ad42a68a).
+    expect(decide(payload('GH_TOKEN=ghp_x gh pr merge 40 --squash')).blocked).toBe(true);
   });
 
   it('does NOT fire on a mention of a gate inside quoted data', () => {
