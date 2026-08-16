@@ -47,6 +47,12 @@ export interface AuditCheck {
   run(ctx: AuditContext): AuditResult;
 }
 
+/** Array-REJECTING record predicate: `typeof [] === 'object'`, and an array where an object was
+ *  expected must read as "could not determine", never as a record whose every key is undefined. */
+export function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
 export function makeResult(
   check: Pick<AuditCheck, 'id' | 'tier' | 'advisory'>,
   status: AuditStatus,

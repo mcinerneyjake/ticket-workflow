@@ -1,7 +1,7 @@
 {
   "name": "ticket-workflow",
   "version": "0.14.0",
-  "description": "Local-first, per-repo ticket board + git/PR pipeline: an MCP server, guard/telemetry Bash hooks, and a pipeline CLI. Decoupled \u2014 each repo owns its own tickets/ + events/.",
+  "description": "Local-first, per-repo ticket board + git/PR pipeline: an MCP server, guard/telemetry Bash hooks, and a pipeline CLI. Decoupled — each repo owns its own tickets/ + events/.",
   "license": "MIT",
   "author": "Jake McInerney",
   "type": "module",
@@ -39,16 +39,24 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
+    "lint": "eslint .",
     "test": "vitest run",
-    "prepare": "npm run build"
+    "test:coverage": "vitest run --coverage",
+    "prepare": "husky && npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "gray-matter": "^4.0.3"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^24.13.3",
-    "typescript": "^7.0.2",
+    "@vitest/coverage-v8": "^4.1.10",
+    "eslint": "^10.8.1",
+    "globals": "^17.11.0",
+    "husky": "^9.1.7",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.67.0",
     "vitest": "^4.1.9"
   }
 }

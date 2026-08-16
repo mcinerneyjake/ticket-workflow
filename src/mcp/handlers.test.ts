@@ -23,14 +23,6 @@ function asRecord(result: { content: { text: string }[] }): Record<string, unkno
   return parsed;
 }
 
-function asRecordArray(result: { content: { text: string }[] }): Record<string, unknown>[] {
-  const parsed: unknown = JSON.parse(result.content[0].text);
-  if (!Array.isArray(parsed) || !parsed.every(isRecord)) {
-    throw new Error(`Expected JSON object array, got: ${result.content[0].text}`);
-  }
-  return parsed;
-}
-
 // list_tickets returns an envelope { total, returned, omitted, tickets, note? }.
 // asList unwraps the tickets array; asEnvelope exposes the metadata (tkt-d6fb2ce5c780).
 function asEnvelope(result: { content: { text: string }[] }): Record<string, unknown> {

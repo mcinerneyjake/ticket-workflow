@@ -37,7 +37,12 @@ export const tsconfigStrict: AuditCheck = {
       return makeResult(this, 'blocked', 'node_modules/.bin/tsc does not exist — run npm ci, then re-audit');
     }
     if (shown.kind === 'error') return makeResult(this, 'blocked', `tsc could not run: ${shown.message}`);
-    if (!shown.ok) return makeResult(this, 'blocked', `tsc --showConfig failed: ${shown.stderr.trim().split('\n')[0] ?? ''}`);
+    if (!shown.ok) {
+      // tsc writes diagnostics (TS18003 "no inputs", etc.) to STDOUT — read it first; an unrelated
+      // stderr warning must not displace the actual diagnostic.
+      const firstLine = (shown.stdout.trim() || shown.stderr.trim()).split('\n')[0] ?? '';
+      return makeResult(this, 'blocked', `tsc --showConfig failed: ${firstLine}`);
+    }
     let resolved: unknown;
     try {
       resolved = JSON.parse(shown.stdout);

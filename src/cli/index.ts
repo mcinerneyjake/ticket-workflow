@@ -135,7 +135,7 @@ export function cmdAudit(args: string[], stat: (p: string) => { isDirectory(): b
 }
 
 export function parseInitArgs(args: readonly string[]): { targetDir: string; tier: 'core' | 'node'; force: boolean } {
-  const out = { targetDir: '.', tier: 'node' as 'core' | 'node', force: false };
+  const out: { targetDir: string; tier: 'core' | 'node'; force: boolean } = { targetDir: '.', tier: 'node', force: false };
   let sawPath = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -167,7 +167,7 @@ export function cmdInit(args: string[], stat: (p: string) => { isDirectory(): bo
     if (!stat(targetDir).isDirectory()) throw new Error('non-directory');
   } catch (err) {
     if (err instanceof Error && err.message === 'non-directory') {
-      throw new Error(`init target exists and is not a directory: ${targetDir}`);
+      throw new Error(`init target exists and is not a directory: ${targetDir}`, { cause: err });
     }
     exists = false;
   }
@@ -194,7 +194,7 @@ export function cmdInit(args: string[], stat: (p: string) => { isDirectory(): bo
 const VERIFY_FLAGS = ['--all', '--json'];
 
 export function parseVerifyArgs(args: readonly string[]): { id: string | null; all: boolean; json: boolean; project: string | null } {
-  const out = { id: null as string | null, all: false, json: false, project: null as string | null };
+  const out: { id: string | null; all: boolean; json: boolean; project: string | null } = { id: null, all: false, json: false, project: null };
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--project') {

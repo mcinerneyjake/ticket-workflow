@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__kanban__list_tickets",
+      "mcp__kanban__get_ticket",
+      "mcp__kanban__start_ticket",
+      "mcp__kanban__update_ticket",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git branch*)",
+      "Bash(git switch *)",
+      "Bash(git pull*)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr checks *)",
+      "Bash(gh pr merge *)",
+      "Bash(npm run typecheck)",
+      "Bash(npm run lint)",
+      "Bash(npm test)",
+      "Bash(npm run test:coverage)",
+      "Bash(npm run build)",
+      "Bash(npx vitest run *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard-bash.mjs\""
+          }
+        ]
+      }
+    ]
+  }
+}

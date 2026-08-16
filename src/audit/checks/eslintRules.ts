@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { makeResult, type AuditCheck, type AuditContext, type AuditResult } from '../types.js';
+import { isRecord, makeResult, type AuditCheck, type AuditContext, type AuditResult } from '../types.js';
 
 const CONFIG_CANDIDATES = ['eslint.config.js', 'eslint.config.mjs', 'eslint.config.cjs', 'eslint.config.ts', 'eslint.config.mts', 'eslint.config.cts'];
 
@@ -47,12 +47,12 @@ export const eslintRules: AuditCheck = {
     } catch {
       return makeResult(this, 'blocked', 'eslint --print-config returned unparseable output');
     }
-    const rules =
-      typeof resolved === 'object' && resolved !== null && 'rules' in resolved && typeof resolved.rules === 'object' && resolved.rules !== null
-        ? resolved.rules
-        : {};
+    if (!isRecord(resolved) || !isRecord(resolved.rules)) {
+      return makeResult(this, 'blocked', 'eslint --print-config answered with an unexpected shape — cannot read resolved rules');
+    }
+    const rules: Record<string, unknown> = resolved.rules;
     const ruleEntry = (name: string): unknown[] | undefined => {
-      const v = (rules as Record<string, unknown>)[name];
+      const v = rules[name];
       return Array.isArray(v) ? v : undefined;
     };
     const notError = REQUIRED_RULES.filter((r) => {
