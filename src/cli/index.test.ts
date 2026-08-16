@@ -3,10 +3,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseStatus, statusUsage, cmdList, cmdShow, main, isMain } from './index.js';
+import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, main, isMain } from './index.js';
 import { createTicket, HttpError } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import { STATUS_IDS } from '../shared/constants.js';
+import type { DoctorFacts } from '../doctor/checks.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 
 // Wrapped (not stubbed) so cmdShow's ordering is observable: the real implementation still runs.
@@ -198,6 +199,21 @@ describe('cmdList', () => {
   });
 });
 
+// A wholly healthy machine, stated in full so no field can default to the passing answer.
+const ALL_OK_FACTS: DoctorFacts = {
+  postToolUse: [{ command: 'track-steps.sh', kind: 'writer' }],
+  guardCopies: [],
+  canonicalShas: {},
+  installs: [{ root: '/tools', version: '9.9.9' }],
+  selfVersion: '9.9.9',
+  mcp: { probed: true, configured: true, resolved: true, version: '9.9.9' },
+  board: { root: '/b', via: 'writer wiring', ticketsDir: '/b/tickets', ticketsDirExists: true, targets: [{ source: 'w', root: '/b' }] },
+  protectedBranch: { current: 'feat/x', protects: ['main'], existing: ['main'], hasRemote: true },
+  lastHookEventAt: '2026-08-16T00:00:00.000Z',
+  now: '2026-08-16T01:00:00.000Z',
+  gateScripts: { r: ['typecheck', 'lint', 'test'] },
+};
+
 describe('main', () => {
   it('exits 0 on a bare invocation but 1 on an unknown subcommand', async () => {
     const bare = captureLog();
@@ -220,6 +236,51 @@ describe('main', () => {
     await withArgv(['show'], async () => {
       await expect(main()).rejects.toThrow(/usage: ticket-workflow show <id>/);
     });
+  });
+
+  it('advertises doctor, so the command is discoverable from the usage line', async () => {
+    const bare = captureLog();
+    await withArgv([], async () => {
+      await main();
+    });
+    expect(bare[0]).toContain('doctor');
+  });
+
+  it('routes `doctor` and sets an exit CODE rather than throwing', async () => {
+    // main()'s catch prints only an error message, so a check that threw would replace the report
+    // with one line — and a MISMATCH is a successful diagnosis, not a crash.
+    //
+    // Facts are INJECTED. Running the real gatherFacts made this read the developer's own
+    // ~/.claude — so what it exercised varied per machine, and asserting `[0, 2]` accepted every
+    // value exitCodeFor can return, i.e. the assertion could not fail.
+    const lines = captureLog();
+    await withArgv(['doctor', '--no-mcp'], async () => {
+      await cmdDoctor(['--no-mcp'], async () => ALL_OK_FACTS);
+      expect(process.exitCode).toBe(0);
+    });
+    expect(lines.join('\n')).toContain('OK        writer-uniqueness');
+  });
+
+  it('exits 2 when a check MISMATCHes, on the same injected facts', async () => {
+    captureLog();
+    await withArgv(['doctor'], async () => {
+      await cmdDoctor([], async () => ({
+        ...ALL_OK_FACTS,
+        postToolUse: [
+          { command: 'a', kind: 'writer' as const },
+          { command: 'b', kind: 'writer' as const },
+        ],
+      }));
+      expect(process.exitCode).toBe(2);
+    });
+  });
+
+  it('REJECTS an unknown doctor flag instead of quietly running without it', async () => {
+    // `--stict` used to run non-strict and exit 0 — one character disarming the check, the same
+    // shape run-hook.mjs refuses for its fail direction.
+    expect(() => parseDoctorFlags(['--stict'])).toThrow(/unknown option/);
+    expect(() => parseDoctorFlags(['--strict=true'])).toThrow(/unknown option/);
+    expect(parseDoctorFlags(['--strict', '--no-mcp'])).toEqual({ strict: true, probeMcp: false });
   });
 
   it('routes `list --status` through parseStatus', async () => {

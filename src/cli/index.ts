@@ -3,6 +3,8 @@ import { realpathSync } from 'node:fs';
 import { listTickets, getTicket } from '../server/tickets.js';
 import { getTicketEvents } from '../server/events.js';
 import { isStatusId, STATUS_IDS } from '../shared/constants.js';
+import { runChecks, exitCodeFor, formatResults } from '../doctor/checks.js';
+import { gatherFacts } from '../doctor/gather.js';
 
 // Lightweight per-repo board viewer. Resolves the board from the cwd/
 // CLAUDE_PROJECT_DIR (see paths.ts), so it shows whichever repo it runs in.
@@ -65,11 +67,43 @@ export function parseStatus(args: string[]): string | null {
   return value;
 }
 
+const DOCTOR_FLAGS = ['--strict', '--no-mcp'];
+
+// An unrecognised flag is REJECTED, never ignored. `includes('--strict')` alone means a typo'd
+// `--stict` runs non-strict and exits 0 — one character silently disarming the check, which is the
+// same shape run-hook.mjs refuses for its fail direction.
+export function parseDoctorFlags(args: readonly string[]): { strict: boolean; probeMcp: boolean } {
+  const unknown = args.filter((a) => !DOCTOR_FLAGS.includes(a));
+  if (unknown.length > 0) {
+    throw new Error(`unknown option(s) for doctor: ${unknown.join(', ')} (accepts ${DOCTOR_FLAGS.join(', ')})`);
+  }
+  return { strict: args.includes('--strict'), probeMcp: !args.includes('--no-mcp') };
+}
+
+// Sets process.exitCode rather than throwing: a MISMATCH is a successful diagnosis, and main()'s
+// catch prints only an error message — which would hide the report that is the whole output.
+// `gather` is injectable so a test can drive a fixture machine instead of the developer's own.
+export async function cmdDoctor(args: string[], gather: typeof gatherFacts = gatherFacts): Promise<void> {
+  const { strict, probeMcp } = parseDoctorFlags(args);
+  const facts = await gather({ probeMcpServer: probeMcp });
+  const results = runChecks(facts);
+  console.log(formatResults(results));
+  const code = exitCodeFor(results, strict);
+  if (code !== 0) {
+    const failing = results.filter((r) => r.status === 'mismatch' || (strict && r.status === 'unknown'));
+    console.log(`\n${failing.length} check(s) need attention${strict ? ' (--strict: UNKNOWN counts)' : ''}.`);
+  }
+  process.exitCode = code;
+}
+
 export async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
     case 'list':
       await cmdList(parseStatus(rest));
+      break;
+    case 'doctor':
+      await cmdDoctor(rest);
       break;
     case 'show': {
       const id = rest[0];
@@ -78,7 +112,7 @@ export async function main(): Promise<void> {
       break;
     }
     default:
-      console.log('usage: ticket-workflow <list [--status <status>] | show <id>>');
+      console.log('usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp]>');
       process.exitCode = cmd === undefined ? 0 : 1;
   }
 }
