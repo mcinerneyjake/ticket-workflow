@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, cmdVerify, parseVerifyArgs, main, isMain } from './index.js';
+import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain } from './index.js';
 import { createTicket, HttpError } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import { STATUS_IDS } from '../shared/constants.js';
@@ -352,6 +352,29 @@ describe('main', () => {
     });
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain('Routed');
+  });
+});
+
+describe('parseAuditArgs', () => {
+  it('takes one path and the --json flag', () => {
+    expect(parseAuditArgs(['/some/repo'])).toEqual({ repoDir: '/some/repo', json: false });
+    expect(parseAuditArgs(['/some/repo', '--json'])).toEqual({ repoDir: '/some/repo', json: true });
+  });
+
+  it('rejects an unknown flag instead of ignoring it — a typo must not change what a gate runs', () => {
+    expect(() => parseAuditArgs(['/some/repo', '--jsom'])).toThrow(/unknown option/);
+    // Single-dash too: '-json' silently becoming the PATH would audit a directory that does not
+    // exist and report confident all-FAIL conformance about it.
+    expect(() => parseAuditArgs(['/some/repo', '-json'])).toThrow(/unknown option/);
+  });
+
+  it('rejects zero and multiple paths', () => {
+    expect(() => parseAuditArgs([])).toThrow(/usage/);
+    expect(() => parseAuditArgs(['/a', '/b'])).toThrow(/usage/);
+  });
+
+  it('cmdAudit refuses a non-directory target instead of reporting it non-conformant', () => {
+    expect(() => cmdAudit(['/definitely/not/a/real/dir'])).toThrow(/not a readable directory/);
   });
 });
 

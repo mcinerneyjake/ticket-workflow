@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-import { realpathSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { listTickets, getTicket } from '../server/tickets.js';
 import { getTicketEvents } from '../server/events.js';
 import { isStatusId, STATUS_IDS } from '../shared/constants.js';
 import { runChecks, exitCodeFor, formatResults } from '../doctor/checks.js';
 import { gatherFacts } from '../doctor/gather.js';
+import { runAudit, auditExitCode, formatAudit } from '../audit/run.js';
 import { buildReport, formatReport } from '../verify/rules.js';
 import { gatherTicketFacts } from '../verify/gather.js';
 
@@ -98,6 +99,39 @@ export async function cmdDoctor(args: string[], gather: typeof gatherFacts = gat
   process.exitCode = code;
 }
 
+const AUDIT_FLAGS = ['--json'];
+
+// Same refusal as doctor's flag parsing: an unrecognised option is REJECTED, never ignored — a
+// typo'd flag silently changing what a gate command does is how gates rot.
+export function parseAuditArgs(args: readonly string[]): { repoDir: string; json: boolean } {
+  // Single-dash tokens are rejected too: `-json` silently becoming the PATH would produce a
+  // confident all-FAIL report about a directory that does not exist.
+  const flags = args.filter((a) => a.startsWith('-'));
+  const unknown = flags.filter((a) => !AUDIT_FLAGS.includes(a));
+  if (unknown.length > 0) {
+    throw new Error(`unknown option(s) for audit: ${unknown.join(', ')} (accepts ${AUDIT_FLAGS.join(', ')})`);
+  }
+  const positional = args.filter((a) => !a.startsWith('-'));
+  if (positional.length !== 1) throw new Error('usage: ticket-workflow audit <path> [--json]');
+  return { repoDir: positional[0], json: flags.includes('--json') };
+}
+
+// Like cmdDoctor: a FAIL/BLOCKED is a successful diagnosis, so the exit code is set rather than
+// thrown — throwing would replace the report with a bare error line. A path that is not a
+// directory DOES throw: auditing nothing must be a distinct invocation error, never an all-FAIL
+// conformance report about a repo the audit never looked at.
+export function cmdAudit(args: string[], stat: (p: string) => { isDirectory(): boolean } = statSync): void {
+  const { repoDir, json } = parseAuditArgs(args);
+  try {
+    if (!stat(repoDir).isDirectory()) throw new Error('not a directory');
+  } catch {
+    throw new Error(`audit target is not a readable directory: ${repoDir}`);
+  }
+  const report = runAudit(repoDir);
+  console.log(json ? JSON.stringify(report, null, 2) : formatAudit(report));
+  process.exitCode = auditExitCode(report);
+}
+
 const VERIFY_FLAGS = ['--all', '--json'];
 
 export function parseVerifyArgs(args: readonly string[]): { id: string | null; all: boolean; json: boolean; project: string | null } {
@@ -151,6 +185,9 @@ export async function main(): Promise<void> {
     case 'doctor':
       await cmdDoctor(rest);
       break;
+    case 'audit':
+      cmdAudit(rest);
+      break;
     case 'verify':
       await cmdVerify(rest);
       break;
@@ -163,7 +200,7 @@ export async function main(): Promise<void> {
     default:
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
-          'verify [<id>] [--all] [--project <name>] [--json]>',
+          'audit <path> [--json] | verify [<id>] [--all] [--project <name>] [--json]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;
   }

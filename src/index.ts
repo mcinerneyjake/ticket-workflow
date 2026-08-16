@@ -7,3 +7,6 @@ export * from './mcp/handlers.js';
 export { boardRoot, ticketsDir, eventsDir } from './paths.js';
 export { guardrailTemplates } from './templates.js';
 export type { GuardrailTemplate, GuardrailTier } from './templates.js';
+export { runAudit, auditExitCode, formatAudit, AUDIT_CHECKS } from './audit/run.js';
+export type { AuditReport } from './audit/run.js';
+export type { AuditResult, AuditStatus, AuditCheck, AuditContext, Exec, ExecResult, ReadResult } from './audit/types.js';
