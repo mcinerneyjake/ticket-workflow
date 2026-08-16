@@ -46,14 +46,23 @@ const MANIFEST: ReadonlyArray<{ source: string; targetPath: string; tier: Guardr
 // src/ and dist/ both sit one level below the package root, so ../templates resolves from either.
 const DEFAULT_TEMPLATES_DIR = fileURLToPath(new URL('../templates/', import.meta.url));
 
+/** One place for tier subsumption, shared by audit's check set and init's scaffold set — two
+ *  hand-copied predicates drift the moment a third tier appears. */
+export function tierIncludes(repoTier: GuardrailTier, itemTier: GuardrailTier): boolean {
+  return repoTier === 'node' || itemTier === 'core';
+}
+
 /**
  * The guardrail template set, read from the package's templates/ directory.
  * Fails loud: a manifest entry whose file is missing or empty throws rather
  * than returning a partial set — "could not read" must never look like a
- * smaller standard. `templatesDir` is a test seam.
+ * smaller standard. Filtering happens BEFORE the reads, so a core-tier caller
+ * is never wedged by a broken node template it would not write.
+ * `templatesDir` is a test seam.
  */
-export function guardrailTemplates(templatesDir: string = DEFAULT_TEMPLATES_DIR): GuardrailTemplate[] {
-  return MANIFEST.map(({ source, targetPath, tier, executable }) => {
+export function guardrailTemplates(templatesDir: string = DEFAULT_TEMPLATES_DIR, tier?: GuardrailTier): GuardrailTemplate[] {
+  const selected = tier === undefined ? MANIFEST : MANIFEST.filter((m) => tierIncludes(tier, m.tier));
+  return selected.map(({ source, targetPath, tier, executable }) => {
     let contents: string;
     try {
       contents = readFileSync(path.join(templatesDir, source), 'utf8');
