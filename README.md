@@ -283,6 +283,39 @@ differently:
    only step that exercises the launcher's reason to exist — with the install present, a mistyped
    fail direction is never even read, so step 1 alone would pass with the guard disarmed.
 
+## `doctor` — checking that the wiring above is actually live
+
+Everything in the two sections above lives in machine-local, unversioned files. No repository's test
+suite can see them, so nothing detects that a hook drifted, that an install half-upgraded, or that
+the telemetry writer stopped recording. `doctor` reads that wiring and reports on it:
+
+```bash
+npx ticket-workflow doctor            # from any repo
+npx ticket-workflow doctor --strict   # UNKNOWN counts as failure (for a gate)
+npx ticket-workflow doctor --no-mcp   # skip starting the MCP server
+```
+
+| check | what it answers |
+|---|---|
+| `writer-uniqueness` | how many `PostToolUse` telemetry writers are wired — two double-log every milestone |
+| `hook-wiring` | does any **vendored** hook copy differ from the one this package ships |
+| `pin` | is more than one version of this package live at once |
+| `mcp` | does the configured server start and answer `initialize`, at what version |
+| `board` | do the MCP server and the telemetry writer point at the **same** board |
+| `protected-branch` | which branches `guard-bash` will actually protect *here* |
+| `reporter-liveness` | when did the hook last write a step only it can write |
+| `toolchain` | which of this repo's gate steps can be recorded at all |
+
+**Every check returns OK / MISMATCH / UNKNOWN, never a boolean.** UNKNOWN is the point: on a machine
+with no `~/.claude` — CI, a container, a fresh clone — the user-scope checks are genuinely
+unanswerable, and reporting that as OK is the fail-open shape this package exists to reject. The
+exit code is 0 unless a check MISMATCHes; `--strict` also fails on UNKNOWN, which is what a gate wants.
+
+Two things it deliberately does **not** claim. It cannot see a *running* MCP server — a session's
+server is not observable from another process — so it answers the weaker, checkable question of
+whether a new session's server would start. And a `hook-wiring` OK means the wired files match what
+this package ships, not that the guards are correct; that is what their own suites are for.
+
 ## Development
 
 ```bash
