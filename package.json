@@ -27,6 +27,7 @@
   },
   "files": [
     "dist",
+    "templates",
     "hooks/lib/default-branch.mjs",
     "hooks/lib/is-main.mjs",
     "hooks/guard-bash.mjs",

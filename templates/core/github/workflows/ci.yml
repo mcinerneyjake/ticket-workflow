@@ -1,0 +1,38 @@
+name: CI
+
+# Mirrors the local pre-commit gate (typecheck + lint + test) server-side, so every PR into main
+# must pass the same checks before merge even if a contributor bypasses the local hook. CI runs the
+# coverage variant so per-file thresholds are enforced, and adds a build step on purpose:
+# typecheck/lint/test never invoke the bundler, so a build-breaking change can compile green.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege: the gate only reads the checkout, never writes back.
+permissions:
+  contents: read
+
+# Cancel superseded PR runs, but never cancel a run on main.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions are SHA-pinned (a mutable tag can be repointed at malicious code); refresh via
+      # Dependabot's github-actions ecosystem, which bumps pinned SHAs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # Kept equal to .nvmrc and the engines floor in package.json.
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run test:coverage
+      - run: npm run build
