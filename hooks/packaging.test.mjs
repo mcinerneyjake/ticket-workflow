@@ -147,7 +147,12 @@ describe('hooks/ packaging contract', () => {
   // An explicit list, never a glob: `./hooks/*` would export the .test.mjs files too, and the point
   // of this map is that the shipped surface is auditable by reading it.
   it('exports no test files, and uses no wildcard', () => {
-    for (const key of Object.keys(pkg.exports)) {
+    const keys = Object.keys(pkg.exports);
+    // Pinned OUTSIDE the loop: an emptied `exports` map contains no wildcard and no test file, so it
+    // satisfies every assertion below while exporting nothing at all. The count is the real claim —
+    // one subpath per hook, plus the root entry, and no fourth kind of export nobody reviewed.
+    expect(keys).toHaveLength(hookFiles.length + 1);
+    for (const key of keys) {
       expect(key).not.toContain('*');
       expect(key).not.toContain('.test.');
     }
@@ -157,6 +162,9 @@ describe('hooks/ packaging contract', () => {
   // resolves to nothing at the consumer, which is the same silent absence in a new disguise.
   it('exports nothing it does not also ship', () => {
     const exported = Object.keys(pkg.exports).filter((k) => k.startsWith('./hooks/'));
+    // Same pin, and it adds a claim the per-hook cases above cannot make: they assert each hook IS
+    // exported, this asserts nothing ELSE is — an export for a deleted hook resolves to nothing.
+    expect(exported).toHaveLength(hookFiles.length);
     for (const key of exported) expect(pkg.files).toContain(key.slice(2));
   });
 
@@ -171,8 +179,13 @@ describe('hooks/ direct-execution contract', () => {
     expect(Object.keys(PROBES).sort()).toEqual([...hookFiles].sort());
   });
 
+  // `spec.check` is where the observable effect is asserted, so these two blocks carry no visible
+  // `expect` of their own. That is not merely a probe artifact: a PROBES entry whose `check` forgot to
+  // assert would pass in silence — the same "exits 0 having done nothing" defect this file exists to
+  // catch, one level down. Asserting the check EXISTS is the guard against that.
   it.each(hookFiles)('%s runs when executed directly', (file) => {
     const spec = PROBES[file]();
+    expect(spec.check, `${file} has a probe with no check`).toBeTypeOf('function');
     const r = runHook(file, spec, HOOKS_DIR);
     spec.check(r, r.env);
   });
@@ -184,6 +197,7 @@ describe('hooks/ direct-execution contract', () => {
   // payload that exits 2 directly.
   it.each(hookFiles)('%s runs identically through a symlink', (file) => {
     const spec = PROBES[file]();
+    expect(spec.check, `${file} has a probe with no check`).toBeTypeOf('function');
     const r = runHook(file, spec, fixtures.links);
     spec.check(r, r.env);
   });

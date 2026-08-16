@@ -206,9 +206,14 @@ describe('audit: each check goes red on exactly its own broken guardrail', () =>
   });
 
   it('control: the unmutated fixture passes every check the mutations above turn red', () => {
+    const covered = new Set(MUTATIONS.map((m) => m.id));
+    // A ratchet, pinned outside the loop. Deleting mutations narrows what this control covers without
+    // failing anything — and at zero it would pass while controlling nothing, the shape
+    // scripts/probe/vacuous-tests.mjs screens for. Raise this floor when checks are added.
+    expect(covered.size, 'the mutation set has shrunk — this control now covers less').toBeGreaterThanOrEqual(13);
     const dir = makeConformingRepo();
     const report = runAudit(dir, execWithEslint);
-    for (const id of new Set(MUTATIONS.map((m) => m.id))) {
+    for (const id of covered) {
       const r = report.results.find((x) => x.id === id);
       if (!r) throw new Error(`check ${id} missing from report`);
       expect(['pass', 'exempt'], `${id}: ${r.detail}`).toContain(r.status);
