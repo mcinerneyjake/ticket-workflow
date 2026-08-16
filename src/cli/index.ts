@@ -6,6 +6,8 @@ import { isStatusId, STATUS_IDS } from '../shared/constants.js';
 import { runChecks, exitCodeFor, formatResults } from '../doctor/checks.js';
 import { gatherFacts } from '../doctor/gather.js';
 import { runAudit, auditExitCode, formatAudit } from '../audit/run.js';
+import { buildReport, formatReport } from '../verify/rules.js';
+import { gatherTicketFacts } from '../verify/gather.js';
 
 // Lightweight per-repo board viewer. Resolves the board from the cwd/
 // CLAUDE_PROJECT_DIR (see paths.ts), so it shows whichever repo it runs in.
@@ -130,6 +132,50 @@ export function cmdAudit(args: string[], stat: (p: string) => { isDirectory(): b
   process.exitCode = auditExitCode(report);
 }
 
+const VERIFY_FLAGS = ['--all', '--json'];
+
+export function parseVerifyArgs(args: readonly string[]): { id: string | null; all: boolean; json: boolean; project: string | null } {
+  const out = { id: null as string | null, all: false, json: false, project: null as string | null };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--project') {
+      const v = args[++i];
+      if (v === undefined || v.startsWith('--')) throw new Error('--project requires a value');
+      out.project = v;
+    } else if (VERIFY_FLAGS.includes(a)) {
+      if (a === '--all') out.all = true;
+      if (a === '--json') out.json = true;
+    } else if (a.startsWith('-')) {
+      // Unrecognised flags are rejected, not ignored: a typo'd option that silently changes nothing
+      // is how a check quietly stops checking what the caller asked for.
+      throw new Error(`unknown option for verify: ${a} (accepts ${VERIFY_FLAGS.join(', ')}, --project <name>)`);
+    } else if (out.id === null) {
+      out.id = a;
+    } else {
+      throw new Error(`verify takes at most one ticket id (got "${out.id}" and "${a}")`);
+    }
+  }
+  return out;
+}
+
+/**
+ * REPORT-ONLY, deliberately: exit 0 even with violations.
+ *
+ * A discrepancy here is a claim the record does not support, which is not the same as proof the work
+ * was skipped — the gate may have run under a command the hook does not recognise. Until that rate is
+ * known and defensible, failing a build on it would be asserting more than the data carries.
+ */
+export async function cmdVerify(args: string[], gather = gatherTicketFacts): Promise<void> {
+  const { id, all, json, project } = parseVerifyArgs(args);
+  const { facts, unreadable } = await gather({ id, project, statuses: all ? null : undefined });
+  const report = buildReport(facts);
+  if (json) {
+    console.log(JSON.stringify({ ...report, boardUnreadable: unreadable }, null, 2));
+    return;
+  }
+  console.log(formatReport(report, unreadable));
+}
+
 export async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
@@ -142,6 +188,9 @@ export async function main(): Promise<void> {
     case 'audit':
       cmdAudit(rest);
       break;
+    case 'verify':
+      await cmdVerify(rest);
+      break;
     case 'show': {
       const id = rest[0];
       if (id === undefined) throw new Error('usage: ticket-workflow show <id>');
@@ -149,7 +198,10 @@ export async function main(): Promise<void> {
       break;
     }
     default:
-      console.log('usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | audit <path> [--json]>');
+      console.log(
+        'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
+          'audit <path> [--json] | verify [<id>] [--all] [--project <name>] [--json]>',
+      );
       process.exitCode = cmd === undefined ? 0 : 1;
   }
 }
