@@ -1,0 +1,39 @@
+name: PR branch name
+
+# Enforces the branch-per-ticket convention documented in CLAUDE.md:
+#   <type>/<id>-<slug>   e.g. chore/tkt-4f7ccb2cd6bc-adopt-branch-per-ticket
+# The id segment is lowercase-alphanumeric (min 6) so both hex and base36 ids pass.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+# Least privilege: this check only inspects the head branch name, nothing else.
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-name-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  branch-name:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate head branch matches <type>/<id>-<slug>
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          echo "Head branch: $BRANCH"
+          # Dependabot cuts branches it can't rename; exempt them so this required, no-bypass check
+          # still RUNS and PASSES (a job-level `if:` skip would leave the required check pending and
+          # hang the merge).
+          if [[ "$BRANCH" == dependabot/* ]]; then
+            echo "✓ dependabot branch — exempt from <type>/<id>-<slug>"
+            exit 0
+          fi
+          if [[ "$BRANCH" =~ ^(fix|feat|task|chore)/tkt-[a-z0-9]{6,}-[a-z0-9-]+$ ]]; then
+            echo "✓ Branch name matches <type>/<id>-<slug>"
+          else
+            echo "::error::Branch '$BRANCH' does not match <type>/<id>-<slug> — type ∈ {fix,feat,task,chore}, id like tkt-4f7ccb2cd6bc, slug lowercase-kebab. See CLAUDE.md → Branch, commit & PR workflow."
+            exit 1
+          fi

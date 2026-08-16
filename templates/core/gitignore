@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+*.tmp
+.DS_Store
+
+# Secrets — never commit.
+.env
+.env.*
+!.env.example
+
+# Local board data — tickets live on this machine, never in the repo.
+tickets/
+events/
+
+# Claude Code per-session worktrees — checkouts, never sources.
+.claude/worktrees/
