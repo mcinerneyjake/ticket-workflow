@@ -24,10 +24,10 @@
 // Never fetches. The comparison is against whatever base ref the local repo
 // already has, so a distance is a floor, not an exact figure.
 
-import { execFileSync } from 'node:child_process';
 import { readFileSync, realpathSync } from 'node:fs';
 import { basename } from 'node:path';
 import { isMain } from './lib/is-main.mjs';
+import { resolveBaseRef, tryGit } from './lib/default-branch.mjs';
 
 // Matched by BASENAME, not by exact path: nested instruction files are a
 // supported Claude Code feature, so apps/web/CLAUDE.md must count.
@@ -152,19 +152,6 @@ export function formatReport(assessment) {
 
 // Returns { out } or { err } — callers must distinguish "git said no" from
 // "git could not answer", so a thrown error is never flattened into null.
-function tryGit(args, cwd) {
-  try {
-    const out = execFileSync('git', args, {
-      cwd,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      maxBuffer: 64 * 1024 * 1024, // a big repo's diff must not truncate into a false "no drift"
-    });
-    return { out: out.trim() };
-  } catch (e) {
-    return { err: String(e?.stderr || e?.message || e).trim() };
-  }
-}
 
 const NOT_A_REPO = /not a git repository|does not appear to be a git repository/i;
 
@@ -226,23 +213,10 @@ export function gatherFacts(cwd, threshold = DEFAULT_THRESHOLD) {
   return { isLinkedWorktree: true, branch, behind, staleFiles, baseRef, threshold };
 }
 
-// origin/HEAD first: it names the repo's ACTUAL default branch, so a repo on
-// `develop` is not permanently alarmed about a missing origin/main. Local
-// main/master last, for repos with no remote at all.
-export function resolveBaseRef(cwd) {
-  const head = tryGit(['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], cwd).out;
-  const candidates = [
-    ...(head ? [head] : []),
-    'origin/main',
-    'origin/master',
-    'main',
-    'master',
-  ];
-  for (const ref of candidates) {
-    if (tryGit(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], cwd).out) return ref;
-  }
-  return null;
-}
+// Re-exported from lib/ so the staleness reporter and the commit guard resolve the default branch
+// through ONE ladder. Two copies would drift, and a guard disagreeing with the reporter about which
+// branch is protected is the kind of split that hides for weeks (tkt-f32915b3e858).
+export { resolveBaseRef };
 
 function firstLine(text) {
   return String(text ?? '').split('\n')[0].slice(0, 200);

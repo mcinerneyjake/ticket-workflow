@@ -296,13 +296,17 @@ describe('decide — the command target picks the repo (tkt-74bc8f9b6ba5)', () =
 // This drives the real hook binary against real repos.
 describe('the real hook, end to end', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'guard-'));
-  const repo = (name, branch) => {
+  const repo = (name, branch, { remote = true, defaultBranch = 'main' } = {}) => {
     const p = join(tmp, name);
     mkdirSync(p);
     const run = (c) => execSync(c, { cwd: p, stdio: 'ignore', env: hermeticEnv() });
-    run('git init -q -b main');
+    run(`git init -q -b ${defaultBranch}`);
+    // The remote is load-bearing, not decoration: the protected-branch rules now only apply to repos
+    // that have one (tkt-f32915b3e858). Without it every repo here is exempt and this whole describe
+    // block passes while asserting nothing — the fresh-temp-dir habit hiding a guard.
+    if (remote) run('git remote add origin https://example.invalid/r.git');
     run('git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init');
-    if (branch !== 'main') run(`git switch -q -c ${branch}`);
+    if (branch !== defaultBranch) run(`git switch -q -c ${branch}`);
     return p;
   };
   const onMain = repo('on-main', 'main');
@@ -322,6 +326,49 @@ describe('the real hook, end to end', () => {
   };
 
   afterAll(() => rmSync(tmp, { recursive: true, force: true }));
+
+  // End-to-end for the merged change: the unit cases above stub the repo shape, so they would pass
+  // even if the real git-backed resolution were wrong. These drive the actual hook against actual
+  // repos (tkt-f32915b3e858 + plan 2.1).
+  const noRemote = repo('no-remote', 'main', { remote: false });
+  const onMaster = repo('on-master', 'master', { defaultBranch: 'master' });
+
+  it('allows a commit on the default branch in a repo with no remote', () => {
+    expect(runHook('git commit -m x', noRemote)).toBe(0);
+  });
+
+  it('still blocks the same commit once a remote exists (the control)', () => {
+    expect(runHook('git commit -m x', onMain)).toBe(2);
+  });
+
+  it('blocks a commit on master when master is the default branch', () => {
+    expect(runHook('git commit -m x', onMaster)).toBe(2);
+  });
+
+  it('prefers a local main over a local master when no remote-tracking ref resolves', () => {
+    // Documents the ladder's real precedence rather than a wish. Creating a local `main` in a
+    // master-default repo makes `main` resolve first (origin/HEAD needs a fetched remote), so `main`
+    // becomes the protected branch here. Worth pinning: the obvious test — "commits on main are
+    // allowed when master is the default" — measures the fixture, not the guard, because creating
+    // that branch is what changes the answer. TICKET_WORKFLOW_PROTECTED_BRANCH is the way out.
+    execSync('git switch -q -c main', { cwd: onMaster, stdio: 'ignore', env: hermeticEnv() });
+    expect(runHook('git commit -m x', onMaster)).toBe(2);
+    expect(runHook('git commit -m x', onMaster, { TICKET_WORKFLOW_PROTECTED_BRANCH: 'master' })).toBe(0);
+    execSync('git switch -q master', { cwd: onMaster, stdio: 'ignore', env: hermeticEnv() });
+  });
+
+  it('still blocks whole-tree staging in a no-remote repo', () => {
+    // The exemption is scoped to the protected-branch rules only.
+    expect(runHook('git add -A', noRemote)).toBe(2);
+  });
+
+  it('fails CLOSED when a remote exists but the default branch cannot be resolved', () => {
+    expect(runHook('git commit -m x', onFeat, { TICKET_WORKFLOW_PROTECTED_BRANCH: '' })).toBe(0);
+  });
+
+  it('honors TICKET_WORKFLOW_PROTECTED_BRANCH', () => {
+    expect(runHook('git commit -m x', onFeat, { TICKET_WORKFLOW_PROTECTED_BRANCH: 'feat/x' })).toBe(2);
+  });
 
   it('blocks a commit on main and allows one on a feature branch', () => {
     expect(runHook('git commit -m x', onMain)).toBe(2);
@@ -393,5 +440,62 @@ describe('decide — no false positives on quoted / heredoc data', () => {
   it('still splits and blocks real chained commands', () => {
     expect(blocked('git add server/x.ts && git add -A', 'feat/x')).toBe(true);
     expect(blocked('git switch main && git commit -m x', 'feat/x')).toBe(true);
+  });
+});
+
+// tkt-f32915b3e858 + plan 2.1. Two opposite corrections to the SAME two rules in ruleFor(), which is
+// why they ship together: gating on remote presence relaxes the guard for local-only repos, while
+// resolving the real default branch tightens it for repos not on `main`. Shipped alone, the
+// fail-closed half of the second lands hardest exactly where the first is trying to stop blocking.
+describe('main-branch rules: remote-gated, default-branch-aware', () => {
+  const repo = (over = {}) => () => ({ hasRemote: true, protectedBranch: 'main', ...over });
+  const verdict = (cmd, branch, over) => decide(cmd, onBranch(branch), undefined, repo(over));
+
+  it('allows a commit on main in a repo with NO remote', () => {
+    // "lands on main via a squash-merged PR" is meaningless with nowhere to push. Hit live in
+    // level-up/job-hunt, which has no remote.
+    expect(verdict('git commit -m x', 'main', { hasRemote: false }).blocked).toBe(false);
+    expect(verdict('git push', 'main', { hasRemote: false }).blocked).toBe(false);
+  });
+
+  it('still blocks a commit on main when a remote IS configured', () => {
+    // The control: without it, the case above is satisfied by a guard that stopped guarding.
+    expect(verdict('git commit -m x', 'main').blocked).toBe(true);
+    expect(verdict('git push', 'main').blocked).toBe(true);
+  });
+
+  it('blocks a commit on the repo\'s real default branch when it is not named main', () => {
+    // A repo on master got ZERO protection and no warning, because 'main' was a bare literal.
+    expect(verdict('git commit -m x', 'master', { protectedBranch: 'master' }).blocked).toBe(true);
+    expect(verdict('git push origin master', 'master', { protectedBranch: 'master' }).blocked).toBe(true);
+  });
+
+  it('does not block a feature branch in a repo whose default branch is master', () => {
+    expect(verdict('git commit -m x', 'feat/x', { protectedBranch: 'master' }).blocked).toBe(false);
+  });
+
+  it('does not treat main as protected when the default branch is master', () => {
+    // 'main' is just another branch there — blocking it would be the hardcoded literal in reverse.
+    expect(verdict('git commit -m x', 'main', { protectedBranch: 'master' }).blocked).toBe(false);
+  });
+
+  it('fails CLOSED when the protected branch cannot be resolved', () => {
+    // Same reasoning as the unresolvable-branch rule: every way of breaking git must not become a
+    // commit-to-default bypass. Run on a branch the other rules would allow, so the block is
+    // attributable to this one.
+    expect(verdict('git commit -m x', 'feat/x', { protectedBranch: null }).blocked).toBe(true);
+    expect(verdict('git push', 'feat/x', { protectedBranch: null }).blocked).toBe(true);
+  });
+
+  it('does not let an unresolvable protected branch wedge ordinary work', () => {
+    expect(verdict('git status', 'feat/x', { protectedBranch: null }).blocked).toBe(false);
+    expect(verdict('git add file.ts', 'feat/x', { protectedBranch: null }).blocked).toBe(false);
+  });
+
+  it('keeps the no-remote exemption from swallowing the unconditional rules', () => {
+    // Whole-tree staging and destructive shapes are not repo-shape-dependent.
+    expect(verdict('git add -A', 'main', { hasRemote: false }).blocked).toBe(true);
+    expect(verdict('git commit -am x', 'main', { hasRemote: false }).blocked).toBe(true);
+    expect(verdict('git reset --hard', 'main', { hasRemote: false }).blocked).toBe(true);
   });
 });

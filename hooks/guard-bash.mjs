@@ -36,6 +36,7 @@
 import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { isMain } from './lib/is-main.mjs';
+import { hasRemote, protectedBranchName } from './lib/default-branch.mjs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -104,18 +105,18 @@ function commitStagesAll(args) {
 
 // True when a push would land on main: an explicit main refspec/target, or a
 // bare push while on main (no explicit non-main target and not a delete/tags op).
-function pushesMain(args, branch) {
+function pushesMain(args, branch, protectedBranch) {
   // Strip a leading `+` (force-refspec syntax) so `+main` is still seen as main.
   const positionals = args.filter((a) => !a.startsWith('-')).map((a) => a.replace(/^\+/, ''));
   const flags = args.filter((a) => a.startsWith('-'));
   const targetsMain = positionals.some(
-    (a) => a === 'main' || a.endsWith(':main') || a.endsWith('/main'),
+    (a) => a === protectedBranch || a.endsWith(`:${protectedBranch}`) || a.endsWith(`/${protectedBranch}`),
   );
   if (targetsMain) return true;
   // `HEAD` / `@` resolve to the current branch, so on main they push main —
   // `git push origin HEAD` while on main must not read as an explicit non-main
   // target.
-  if (branch === 'main' && positionals.some((a) => a === 'HEAD' || a === '@')) return true;
+  if (branch === protectedBranch && positionals.some((a) => a === 'HEAD' || a === '@')) return true;
   const safeFlag = flags.some((f) => ['--delete', '-d', '--tags', '--prune', '--mirror'].includes(f));
   const explicitTarget = positionals.length >= 2; // remote + refspec → not the current branch implicitly
   return branch === 'main' && !safeFlag && !explicitTarget;
@@ -124,12 +125,12 @@ function pushesMain(args, branch) {
 // The branch a `switch`/`checkout -b` moves to, so a chain that creates the
 // branch first isn't judged against the pre-switch branch. Plain
 // `git checkout <x>` is intentionally not tracked (path-vs-branch ambiguous).
-function switchTarget(sub, args) {
+function switchTarget(sub, args, protectedBranch) {
   if (sub !== 'switch' && sub !== 'checkout') return null;
   // `switch -` / `checkout -` jumps to the PREVIOUS branch, which the hook can't
-  // resolve. Assume it could be main so a commit/push later in the SAME chain
-  // stays guarded (else `git switch - && git commit` would sneak onto main).
-  if (args.includes('-')) return 'main';
+  // resolve. Assume it could be the protected branch so a commit/push later in the
+  // SAME chain stays guarded (else `git switch - && git commit` would sneak onto it).
+  if (args.includes('-')) return protectedBranch;
   if (sub === 'switch' || args.includes('-b') || args.includes('-B')) {
     const positionals = args.filter((a) => !a.startsWith('-'));
     return positionals[0] ?? null;
@@ -221,7 +222,12 @@ export function splitSegments(command) {
 // `getBranch(dir)` is injected so the logic stays pure and testable. Branch state is
 // keyed by directory: a chain can `cd` between repos, and a switch in one must not
 // change what we believe another is on (tkt-74bc8f9b6ba5).
-export function decide(command, getBranch, startDir) {
+// `getRepo(dir) -> { hasRemote, protectedBranch }` is injectable like `getBranch`, and defaults to
+// the pre-2.1 behaviour (every repo has a remote, `main` is protected) so a caller that does not
+// supply it gets today's semantics rather than a silently relaxed guard. main() injects the real one.
+const DEFAULT_REPO = () => ({ hasRemote: true, protectedBranch: 'main' });
+
+export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
   if (typeof command !== 'string' || !command.trim()) return { blocked: false };
 
   // Quote/substitution-aware split so each git invocation is checked
@@ -236,6 +242,11 @@ export function decide(command, getBranch, startDir) {
     if (!branches.has(d)) branches.set(d, getBranch(d));
     return branches.get(d);
   };
+  const repos = new Map(); // dir -> repo shape; memoized, so one pair of execs per repo
+  const repoFor = (d) => {
+    if (!repos.has(d)) repos.set(d, getRepo(d));
+    return repos.get(d);
+  };
 
   for (const segment of segments) {
     for (let i = (segment.match(/^\(+/)?.[0].length) ?? 0; i > 0; i--) outer.push(dir);
@@ -248,9 +259,9 @@ export function decide(command, getBranch, startDir) {
       if (git) {
         const { sub, args, repoDir } = git;
         const gitDir = repoDir ? resolveDir(dir, repoDir) : dir; // -C acts on that repo, whatever the cwd
-        const verdict = ruleFor(sub, args, branchFor(gitDir));
+        const verdict = ruleFor(sub, args, branchFor(gitDir), repoFor(gitDir));
         if (verdict) return { blocked: true, reason: verdict };
-        const switched = switchTarget(sub, args);
+        const switched = switchTarget(sub, args, repoFor(gitDir).protectedBranch);
         if (switched) branches.set(gitDir, switched);
       }
     }
@@ -262,7 +273,8 @@ export function decide(command, getBranch, startDir) {
 }
 
 // `branch` is the branch of the repo THIS command acts on, not the hook's.
-function ruleFor(sub, args, branch) {
+// `repo` carries that repo's shape: { hasRemote, protectedBranch }.
+function ruleFor(sub, args, branch, repo) {
   const destructive = destructiveGitReason(sub, args);
   if (destructive) return destructive;
 
@@ -272,11 +284,21 @@ function ruleFor(sub, args, branch) {
   if (sub === 'commit' && commitStagesAll(args))
     return "git commit -a / -am stages every tracked change, bypassing per-ticket staging. Stage this ticket's files explicitly, then commit without -a. See CLAUDE.md.";
 
-  if (sub === 'commit' && branch === 'main')
-    return 'Direct commits to main are not allowed — every ticket lands on its own branch via a squash-merged PR. Cut a <type>/<id>-<slug> branch first. See CLAUDE.md.';
+  // Everything above is repo-shape-independent. The two protected-branch rules below are NOT: the
+  // policy they enforce ("land it on a branch and open a PR") is meaningless in a repo with nowhere
+  // to push, where committing on the default branch is the normal thing to do (tkt-f32915b3e858).
+  //
+  // Order matters. The remote gate comes FIRST so the fail-closed resolution below can never fire in
+  // a local-only repo — that combination is precisely the false block this exempts.
+  if (!repo.hasRemote) return null;
 
-  if (sub === 'push' && pushesMain(args, branch))
-    return 'Direct pushes to main are not allowed — push your ticket branch and open a PR. See CLAUDE.md → Branch, commit & PR workflow.';
+  const { protectedBranch } = repo;
+
+  if (sub === 'commit' && protectedBranch !== null && branch === protectedBranch)
+    return `Direct commits to ${protectedBranch} are not allowed — every ticket lands on its own branch via a squash-merged PR. Cut a <type>/<id>-<slug> branch first. See CLAUDE.md.`;
+
+  if (sub === 'push' && protectedBranch !== null && pushesMain(args, branch, protectedBranch))
+    return `Direct pushes to ${protectedBranch} are not allowed — push your ticket branch and open a PR. See CLAUDE.md → Branch, commit & PR workflow.`;
 
   // An unresolved branch is NOT a safe branch. Every failure that breaks `git rev-parse` — a bogus
   // GIT_CONFIG_PARAMETERS, GIT_CEILING_DIRECTORIES over the repo, a safe.directory refusal, git off
@@ -285,6 +307,12 @@ function ruleFor(sub, args, branch) {
   // can't wedge ordinary work, and last so explicit violations keep their precise message.
   if ((sub === 'commit' || sub === 'push') && branch === null)
     return 'Could not determine the current branch, so this commit/push cannot be checked against the never-commit-to-main rule. Refusing rather than guessing — check for a stale GIT_DIR/GIT_CONFIG_PARAMETERS in the environment, or a git safe.directory refusal, then retry. See CLAUDE.md → Branch, commit & PR workflow.';
+
+  // Same reasoning one level up: if the repo HAS a remote but its default branch cannot be resolved,
+  // we cannot tell whether this commit is landing on it. "Cannot check" must not be the permissive
+  // answer. Set TICKET_WORKFLOW_PROTECTED_BRANCH to state it explicitly.
+  if ((sub === 'commit' || sub === 'push') && protectedBranch === null)
+    return 'Could not determine this repository\'s default branch (tried origin/HEAD, origin/main, origin/master, and local main/master), so this commit/push cannot be checked against the never-commit-to-the-default-branch rule. Refusing rather than guessing — set TICKET_WORKFLOW_PROTECTED_BRANCH to name it explicitly, or fetch the remote so origin/HEAD resolves.';
 
   return null;
 }
@@ -318,7 +346,13 @@ export function main() {
   // payload.cwd is the project dir, not the Bash tool's cwd (verified 2026-07-15).
   const startDir = payload?.cwd ?? process.cwd();
   const getBranch = (dir) => currentBranch(dir, startDir);
-  const { blocked, reason } = decide(payload?.tool_input?.command, getBranch, startDir);
+  // Same fallback as getBranch: an unusable dir must be judged against the session's repo rather
+  // than silently reporting "no remote", which would exempt it from the protected-branch rules.
+  const getRepo = (dir) => {
+    const d = dir ?? startDir;
+    return { hasRemote: hasRemote(d), protectedBranch: protectedBranchName(d) };
+  };
+  const { blocked, reason } = decide(payload?.tool_input?.command, getBranch, startDir, getRepo);
   if (blocked) {
     process.stderr.write(`[guard-bash] Blocked: ${reason}\n`);
     process.exit(2);
