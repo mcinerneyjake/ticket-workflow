@@ -31,8 +31,13 @@ It ships three pieces:
   (default 15, `0` to always report). Also a `PreToolUse` guard
   (`guard-review-target.mjs`) that refuses a `/code-review` with no explicit
   target when the session's own repository has no diff to review, because a
-  wrong-repo review reads exactly like a clean one. Wire `guard-ticket` only if
-  you want that policy — the others suit any consumer.
+  wrong-repo review reads exactly like a clean one. And a `PreToolUse` guard
+  (`guard-subagent-gates.mjs`) that stops a **subagent** running `git commit`,
+  `git push`, `gh pr create` or `gh pr merge` — the actions that sit behind a
+  human approval gate, which a subagent has no channel to ask for. Reading and
+  posting findings (`git log`/`diff`, `gh pr view`/`diff`/`list`,
+  `gh pr comment`) are untouched. Wire `guard-ticket` only if you want that
+  policy — the others suit any consumer.
 - **CLI viewer** (`ticket-workflow`) — `list` and `show <id>`, rendering a
   ticket's pipeline from the same reducer the web board uses.
 
@@ -250,6 +255,7 @@ nothing to block and must not wedge the session — but note it exits **1, not 0
 | `guard-bash` | `PreToolUse` | **closed** (exit 2) |
 | `guard-ticket` | `PreToolUse` | **closed** (exit 2) |
 | `guard-review-target` | `UserPromptExpansion` | **closed** (exit 2) |
+| `guard-subagent-gates` | `PreToolUse` | **closed** (exit 2) |
 | `warn-stale-worktree` | `SessionStart` | open (exit 1) |
 | `track-steps` | `PostToolUse` | open (exit 1) |
 
@@ -263,7 +269,10 @@ Two honest limits on that table:
 - It describes what happens when a hook cannot **load**. It is not a claim about each hook's internal
   behaviour: `guard-bash`, once loaded, deliberately exits 0 on a payload it cannot parse, and only
   its unresolvable-branch rule fails closed. `guard-ticket` and `guard-review-target` do fail closed
-  internally.
+  internally. `guard-subagent-gates` is split: it fails **closed** when it knows the rule applies (a
+  subagent whose command it cannot read) and **exits 1** when it cannot even establish that (an
+  unparseable payload) — blocking there would wedge every main-thread command over a case the rule
+  never covers, so it is loud rather than silent.
 - The `open` rows are a genuine gap. Nothing here detects a reporter that stopped recording; the
   stderr is visible only if someone is looking. Treat "are my hooks actually running?" as a question
   needing its own check.

@@ -58,6 +58,12 @@ const PROBES = {
     payload: {}, // decide() fails closed on a payload carrying no command name
     check: (r) => expect(r.status, r.stderr).toBe(2),
   }),
+  'guard-subagent-gates.mjs': () => ({
+    // agent_id present == inside a subagent; the rule only exists there, so an empty payload (which
+    // exits 0) could not tell a wired hook from a dead one.
+    payload: { tool_name: 'Bash', tool_input: { command: 'gh pr merge 40 --squash' }, agent_id: 'a1' },
+    check: (r) => expect(r.status, r.stderr).toBe(2),
+  }),
   'track-steps.mjs': () => ({
     payload: {
       tool_name: 'Bash',
