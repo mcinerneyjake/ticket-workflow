@@ -45,7 +45,7 @@
     "prepare": "husky && npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "gray-matter": "^4.0.3"
   },
   "devDependencies": {
