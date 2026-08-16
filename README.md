@@ -180,6 +180,12 @@ import { main } from 'ticket-workflow/hooks/guard-bash.mjs';
 main();
 ```
 
+> **Both forms above are fail-open if the install is absent or stale**, and neither is what you want
+> for a guard you rely on. `node <path-that-does-not-exist>` exits 1, and only exit **2** blocks — so
+> a missing `node_modules` reads as *allow*. The bare `main()` call has the same hole: if the package
+> resolves but exports no callable `main`, the throw exits 1, again an allow. Wrap both, as
+> [Installing it once per machine](#installing-it-once-per-machine-user-scope) does.
+
 The exported subpaths are exactly the five hook files above. Importing a hook does **not** run it;
 `main()` reads the payload from stdin and ends in `process.exit()`, so it is one hook per process —
 which is how Claude Code invokes them anyway (one process per matcher).
@@ -199,43 +205,83 @@ Wiring a checkout is the trap worth naming: hooks are re-read on **every** invoc
 out a branch that edits `guard-bash.mjs` re-arms or dis-arms the machine's guard for every running
 session, mid-edit — and `dist/` becomes the MCP server that every newly started session loads.
 
-**Do not point the wiring straight at the installed file either.** Only exit **2** blocks; exit 1 is
-a non-blocking hook *error*. So `node <path-that-no-longer-exists>` exits 1 and reads as **allow** —
-a deleted or half-installed hook silently stops guarding. Wire a tiny launcher that lives *outside*
-`node_modules` (so it survives the install being gone) and converts "cannot load" into the right
-answer for the event:
+**Do not point the wiring straight at the installed file either** — same reason as above: a missing
+file exits 1, which reads as *allow*. Wire a small launcher that converts "cannot load" into the
+right answer for the event.
+
+**Where the launcher lives is load-bearing, and the two constraints pull in opposite directions:**
+
+- **outside `node_modules`** — its whole job is to still exist when the install does not;
+- **but still under the install prefix** (`~/.claude/tools/hooks/`, not `~/.claude/hooks/`), because
+  `import('ticket-workflow/…')` is a *bare specifier*, resolved by walking up from the launcher's own
+  directory. Put it beside `settings.json` instead and it throws `ERR_MODULE_NOT_FOUND` **with the
+  install fully present** — which, failing closed, wedges every Bash call on the machine.
 
 ```js
 // ~/.claude/tools/hooks/run-hook.mjs <hook-name> <closed|open>
 const [name, direction] = process.argv.slice(2);
+
+// Validate up front. `direction === 'closed' ? 2 : 0` would make a one-character typo in
+// settings.json silently disarm the guard, so an unusable direction blocks.
+if (!name || (direction !== 'closed' && direction !== 'open')) {
+  process.stderr.write('[run-hook] BLOCKED: usage: run-hook.mjs <hook-name> <closed|open>\n');
+  process.exit(2);
+}
+
 try {
   const { main } = await import(`ticket-workflow/hooks/${name}.mjs`);
   if (typeof main !== 'function') throw new TypeError('no callable main — stale install?');
   await main();
 } catch (err) {
-  process.stderr.write(`[${name}] could not run the hook: ${err?.code ?? err?.message}\n`);
-  process.exit(direction === 'closed' ? 2 : 0);
+  process.stderr.write(`[${name}] could not run: ${err?.message ?? err?.code ?? 'import failed'}\n`);
+  process.exit(direction === 'closed' ? 2 : 1);
 }
+
+// Every hook here ends in process.exit(); returning instead is a contract violation (a stale pin),
+// and falling off the end exits 0 — an allow. Guards must not resolve that permissively.
+if (direction === 'closed') process.exit(2);
 ```
 
-Fail direction is per event, and the split is deliberate — a guard that cannot run must block, but a
-reporter that cannot run has nothing to block and must not wedge the session:
+Fail direction is per event. A guard that cannot run must block; a reporter that cannot run has
+nothing to block and must not wedge the session — but note it exits **1, not 0**:
 
-| hook | event | cannot run → |
+| hook | event | cannot **load** → |
 |---|---|---|
 | `guard-bash` | `PreToolUse` | **closed** (exit 2) |
 | `guard-ticket` | `PreToolUse` | **closed** (exit 2) |
 | `guard-review-target` | `UserPromptExpansion` | **closed** (exit 2) |
-| `warn-stale-worktree` | `SessionStart` | open (exit 0), loud on stderr |
-| `track-steps` | `PostToolUse` | open (exit 0), loud on stderr |
+| `warn-stale-worktree` | `SessionStart` | open (exit 1) |
+| `track-steps` | `PostToolUse` | open (exit 1) |
 
-The two `open` rows are a real gap, not an oversight: nothing detects a telemetry hook that quietly
-stopped recording. Treat "are my hooks actually wired and running?" as a question needing its own
-check, not an assumption.
+**Why 1 and not 0.** Exit 0 is *success*, and its stderr is not surfaced; a non-zero, non-2 exit is a
+non-blocking *error*, and its stderr **is**. Exiting 0 would therefore make a dead reporter quieter
+than no launcher at all — an unlaunched broken hook exits 1 and is at least visible. 1 keeps it
+non-blocking and visible.
 
-**Verify by removing the checkout, not by reading the config.** Move the development checkout's
-`hooks/` and `dist/` aside and confirm the guards still block, still allow on a feature branch, and
-the MCP server still answers. If anything changes, the machine was still depending on that tree.
+Two honest limits on that table:
+
+- It describes what happens when a hook cannot **load**. It is not a claim about each hook's internal
+  behaviour: `guard-bash`, once loaded, deliberately exits 0 on a payload it cannot parse, and only
+  its unresolvable-branch rule fails closed. `guard-ticket` and `guard-review-target` do fail closed
+  internally.
+- The `open` rows are a genuine gap. Nothing here detects a reporter that stopped recording; the
+  stderr is visible only if someone is looking. Treat "are my hooks actually running?" as a question
+  needing its own check.
+
+**Wiring at user scope does not replace project scope — the two are additive.** Duplicate *guards*
+are harmless (they decide identically), but a duplicate **writer** is not: two `track-steps` hooks
+append to the same `events/<id>.jsonl` and double-log every milestone. If you wire `track-steps` at
+user scope, remove any per-repo `PostToolUse` copy.
+
+**Verify by removing things, not by reading the config** — and remove *both*, because they fail
+differently:
+
+1. Move the development checkout's `hooks/` and `dist/` aside. The guards must still block, still
+   allow on a feature branch, and the MCP server must still answer. Anything that changes means the
+   machine was still depending on that tree.
+2. Move the **install** aside. Each `closed` row must exit 2 and each `open` row exit 1. This is the
+   only step that exercises the launcher's reason to exist — with the install present, a mistyped
+   fail direction is never even read, so step 1 alone would pass with the guard disarmed.
 
 ## Development
 
