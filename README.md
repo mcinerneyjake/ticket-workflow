@@ -316,6 +316,43 @@ server is not observable from another process — so it answers the weaker, chec
 whether a new session's server would start. And a `hook-wiring` OK means the wired files match what
 this package ships, not that the guards are correct; that is what their own suites are for.
 
+## `verify` — checking a ticket's claims against the record
+
+Every ticket ends with an agent-authored `## Implementation summary` asserting `Tests: N added` and a
+green gate. Nothing checks that assertion. The events log **can**: it is written by a `PostToolUse`
+hook that fires on actual command execution, so an agent cannot produce a `test: passed` event by
+claiming tests passed. That makes it testimony from a process outside the agent's control.
+
+```bash
+npx ticket-workflow verify                       # all closed tickets
+npx ticket-workflow verify <id>                  # one ticket, whatever its status
+npx ticket-workflow verify --project <name>      # one project
+npx ticket-workflow verify --all --json          # every status, as data
+```
+
+It does not ask "did the gate run". It asks the narrower, answerable question: **does what the ticket
+says match what was observed?**
+
+| outcome | meaning |
+|---|---|
+| `ok` | claim and record agree — including `Tests: none — …`, which asserts nothing the record can contradict |
+| `violation` | the summary claims tests, and no passing test milestone was recorded, *while telemetry was demonstrably live for that ticket* |
+| `unknown` | not judgeable: telemetry never observed it, its log lost lines, or it carries no `Tests:` line |
+
+**Report-only, and exit 0 even with violations.** A violation is a *discrepancy*, not proof of
+misconduct — the gate may have run under a command the hook does not recognise. Until that rate is
+known and defensible, failing a build on it would assert more than the data carries.
+
+**The coverage line comes first, always.** A findings list printed above its own coverage invites
+reading absence-of-findings as compliance, and an empty run is reported as *"not a clean result — it
+is an empty one"* rather than as zero violations. What this offers is a stated boundary on what it
+vouches for, so that boundary is the headline.
+
+Scope, plainly: this raises confidence in **process claims** only — whether the gate ran, in what
+order, on a branch, before the PR. It cannot establish that the code is correct, that the tests were
+meaningful, that a bug repro was written first, or that the reasoning was sound. Never sell it as
+more than that.
+
 ## Development
 
 ```bash
