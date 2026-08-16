@@ -4,8 +4,9 @@ import globals from 'globals';
 
 export default tseslint.config(
   // Generated/build output — gitignored, but flat config does not read .gitignore, so every
-  // generated dir `eslint .` could traverse must be listed here explicitly.
-  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', '.claude/worktrees/**'] },
+  // generated dir `eslint .` could traverse must be listed. templates/ is DATA this package ships,
+  // not code it runs; .claude/worktrees/ holds full second checkouts.
+  { ignores: ['dist/**', 'node_modules/**', 'coverage/**', 'templates/**', '.claude/worktrees/**'] },
   js.configs.recommended,
   tseslint.configs.recommended,
   {

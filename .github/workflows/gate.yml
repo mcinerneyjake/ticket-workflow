@@ -39,7 +39,15 @@ jobs:
 
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      - run: npm run lint
+      # Coverage variant so the per-file thresholds in vitest.config.ts are enforced, not just run.
+      - run: npm run test:coverage
+      # Dogfood: the package that defines the guardrail standard must pass it. `npm ci` already
+      # built dist via prepare. GH_TOKEN lets the branch-protection check ask the API — without it
+      # that check reports BLOCKED and the audit exits 1.
+      - run: node dist/cli/index.js audit .
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   # `gate` is the required status check on main, so it must keep that exact name
   # and must FAIL — not skip — when a suite leg fails; a skipped required check

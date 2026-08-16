@@ -8,9 +8,25 @@ updates:
     schedule:
       interval: monthly
     groups:
+      # `applies-to` defaults to version-updates, so groups do NOT cover security updates unless
+      # asked — ungrouped security PRs pile up and each lock-file merge forces the rest to rebase.
+      # Same block the shipped template marks "do not drop".
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
       all-deps:
         patterns: ["*"]
     open-pull-requests-limit: 5
+    ignore:
+      # typescript is held at ^6: typescript-eslint's peer range (<6.1.0) does not admit 7 yet.
+      # Without this the TS 7 major returns every cycle and gets re-litigated. Lift it when
+      # typescript-eslint peers allow, bumping both in the same change.
+      - dependency-name: 'typescript'
+        update-types: [version-update:semver-major]
+      # @types/node tracks the runtime in `engines`, never ahead of it — types for a newer Node
+      # let typecheck pass code the runtime cannot execute. Bump with `engines`.
+      - dependency-name: '@types/node'
+        update-types: [version-update:semver-major]
 
   - package-ecosystem: github-actions
     directory: /

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -130,6 +130,19 @@ describe('guardrailTemplates', () => {
     const packed = new Set(parsed[0].files.map((f) => f.path));
     for (const t of guardrailTemplates()) {
       expect(packed, `templates/${t.source} missing from npm pack`).toContain(`templates/${t.source}`);
+    }
+  });
+
+  it('this repo executes its intended-identical guardrail files byte-for-byte from the templates', () => {
+    // The standard-bearer must not drift from its own standard: every audit check is deliberately
+    // semantic, so a template hardening that ships to consumers while this repo keeps the stale
+    // copy is invisible to the dogfood audit. Reasoned divergences (eslint.config.js, CLAUDE.md,
+    // dependabot.yml, tsconfig, vitest config, ci.yml vs gate.yml) are simply not in this list.
+    const IDENTICAL = ['.claude/settings.json', '.claude/hooks/guard-bash.mjs', '.husky/pre-commit', '.github/workflows/pr-branch-name.yml'];
+    const repoRoot = fileURLToPath(new URL('..', import.meta.url));
+    for (const t of guardrailTemplates()) {
+      if (!IDENTICAL.includes(t.targetPath)) continue;
+      expect(readFileSync(path.join(repoRoot, t.targetPath), 'utf8'), `${t.targetPath} drifted from its template`).toBe(t.contents);
     }
   });
 

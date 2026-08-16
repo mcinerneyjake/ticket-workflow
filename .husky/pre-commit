@@ -1,0 +1,7 @@
+# Git exports its repo context (GIT_DIR — absolute in a worktree) into hook environments, and every
+# child inherits it. That points suites driving temp git repos at the REAL repo and recursively
+# re-triggers this hook, so the gate fails from a worktree but passes from the main checkout, where
+# GIT_DIR is the relative `.git`. The suites may scrub it too; this is the root fix.
+unset GIT_DIR GIT_INDEX_FILE GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_PREFIX
+
+npm run typecheck && npm run lint && npm test

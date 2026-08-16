@@ -89,9 +89,21 @@ export const branchProtection: AuditCheck = {
       const rs = ctx.exec('gh', ['api', `repos/${nameWithOwner}/rulesets/${id}`], { cwd: ctx.repoDir });
       if (rs.kind !== 'ran' || !rs.ok) return makeResult(this, 'blocked', `ruleset ${id} could not be read to verify bypass`);
       const parsed = parseJson(rs.stdout);
+      // bypass_actors is the primary authority: it is identity-INDEPENDENT (empty list = nobody can
+      // bypass, for anyone), while current_user_can_bypass is serialized conditionally per caller —
+      // verified absent for anonymous reads, and CI's installation token is not the local admin PAT.
+      // Gating on the per-identity field alone turned the CI gate red for the wrong caller.
+      const bypassActors =
+        typeof parsed === 'object' && parsed !== null && 'bypass_actors' in parsed ? parsed.bypass_actors : undefined;
+      if (Array.isArray(bypassActors)) {
+        if (bypassActors.length > 0) {
+          return makeResult(this, 'fail', `ruleset ${id} grants ${bypassActors.length} bypass actor(s) — the floor must have no bypass`);
+        }
+        continue;
+      }
       const bypass =
         typeof parsed === 'object' && parsed !== null && 'current_user_can_bypass' in parsed ? parsed.current_user_can_bypass : undefined;
-      if (bypass === undefined) return makeResult(this, 'blocked', `ruleset ${id} reports no bypass field — cannot assert no-bypass`);
+      if (bypass === undefined) return makeResult(this, 'blocked', `ruleset ${id} reports neither bypass_actors nor current_user_can_bypass — cannot assert no-bypass`);
       if (bypass !== 'never') {
         return makeResult(this, 'fail', `ruleset ${id} is bypassable (current_user_can_bypass: ${String(bypass)}) — the floor must have no bypass`);
       }

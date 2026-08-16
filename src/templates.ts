@@ -70,6 +70,7 @@ export function guardrailTemplates(templatesDir: string = DEFAULT_TEMPLATES_DIR,
       throw new Error(
         `guardrailTemplates: template "${source}" could not be read from ${templatesDir} — ` +
           `the package install is incomplete or the manifest is out of sync (${err instanceof Error ? err.message : String(err)})`,
+        { cause: err },
       );
     }
     if (contents.trim() === '') {

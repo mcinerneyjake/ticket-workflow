@@ -44,6 +44,10 @@ function makeConformingRepo(): string {
     if (t.executable) chmodSync(target, 0o755);
   }
   writeFileSync(path.join(dir, 'package.json'), FIXTURE_PKG);
+  // tsconfig's include:["src"] needs at least one input: TS 6 fails --showConfig with TS18003 on an
+  // empty include (TS 7's native port tolerated it), which BLOCKS the strict probe.
+  mkdirSync(path.join(dir, 'src'), { recursive: true });
+  writeFileSync(path.join(dir, 'src', 'index.ts'), 'export const conforming = true;\n');
   writeFileSync(
     path.join(dir, '.ticket-workflow.json'),
     JSON.stringify({ tier: 'node', exempt: { 'branch-protection': 'fixture repo, no remote' } }),
@@ -356,6 +360,36 @@ describe('audit: branch protection asked of the API', () => {
     const r = statusOf(dir, 'branch-protection', exec);
     expect(r.status).toBe('fail');
     expect(r.detail).toContain('bypassable');
+  });
+
+  it('PASS on empty bypass_actors even when current_user_can_bypass is absent — the CI-identity shape', () => {
+    const dir = makeConformingRepo();
+    unexempt(dir);
+    const exec = withGh((args) => {
+      if (args[0] === 'repo') return { kind: 'ran', ok: true, stdout: REPO_VIEW, stderr: '' };
+      if (String(args[1]).includes('/rules/branches/')) return { kind: 'ran', ok: true, stdout: RULES_OK, stderr: '' };
+      // GitHub serializes current_user_can_bypass conditionally per caller; bypass_actors is stable.
+      if (String(args[1]).includes('/rulesets/')) return { kind: 'ran', ok: true, stdout: JSON.stringify({ bypass_actors: [] }), stderr: '' };
+      return undefined;
+    });
+    const r = statusOf(dir, 'branch-protection', exec);
+    expect(r.status, r.detail).toBe('pass');
+  });
+
+  it('FAIL when bypass_actors is non-empty, regardless of the per-identity field', () => {
+    const dir = makeConformingRepo();
+    unexempt(dir);
+    const exec = withGh((args) => {
+      if (args[0] === 'repo') return { kind: 'ran', ok: true, stdout: REPO_VIEW, stderr: '' };
+      if (String(args[1]).includes('/rules/branches/')) return { kind: 'ran', ok: true, stdout: RULES_OK, stderr: '' };
+      if (String(args[1]).includes('/rulesets/')) {
+        return { kind: 'ran', ok: true, stdout: JSON.stringify({ bypass_actors: [{ actor_type: 'RepositoryRole' }], current_user_can_bypass: 'never' }), stderr: '' };
+      }
+      return undefined;
+    });
+    const r = statusOf(dir, 'branch-protection', exec);
+    expect(r.status).toBe('fail');
+    expect(r.detail).toContain('bypass actor');
   });
 
   it('BLOCKED when gh is absent — never PASS', () => {

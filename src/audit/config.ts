@@ -1,5 +1,5 @@
 import type { GuardrailTier } from '../templates.js';
-import type { AuditContext } from './types.js';
+import { isRecord, type AuditContext } from './types.js';
 
 export const CONFIG_FILE = '.ticket-workflow.json';
 
@@ -13,10 +13,6 @@ export type RepoConfig =
     }
   /** The config exists but cannot be trusted — the whole audit is BLOCKED, not defaulted. */
   | { readonly kind: 'invalid'; readonly detail: string };
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === 'object' && v !== null && !Array.isArray(v);
-}
 
 export function loadRepoConfig(ctx: AuditContext): RepoConfig {
   const file = ctx.read(CONFIG_FILE);
