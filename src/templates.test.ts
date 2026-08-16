@@ -70,7 +70,11 @@ describe('guardrailTemplates', () => {
   });
 
   it('keeps templates user-agnostic and repo-agnostic (no /Users/ paths, no tkt- refs)', () => {
-    for (const t of guardrailTemplates()) {
+    const templates = guardrailTemplates();
+    // Pinned outside the loop: this is a NEGATIVE claim, and an empty manifest satisfies every
+    // "does not contain" below — a clean report that inspected nothing.
+    expect(templates.length).toBeGreaterThanOrEqual(12);
+    for (const t of templates) {
       expect(t.contents, `${t.targetPath} leaks a local path`).not.toContain('/Users/');
       // The branch-name workflow legitimately shows tkt- as the id FORMAT; ban refs elsewhere.
       if (t.targetPath !== '.github/workflows/pr-branch-name.yml') {
@@ -128,7 +132,12 @@ describe('guardrailTemplates', () => {
     });
     const parsed: Array<{ files: Array<{ path: string }> }> = JSON.parse(packJson);
     const packed = new Set(parsed[0].files.map((f) => f.path));
-    for (const t of guardrailTemplates()) {
+    const templates = guardrailTemplates();
+    // Two pins, both outside the loop, because either collection going empty passes this silently:
+    // an empty manifest checks nothing, and an empty pack would only fail while the manifest is not.
+    expect(templates.length).toBeGreaterThanOrEqual(12);
+    expect(packed.size).toBeGreaterThanOrEqual(templates.length);
+    for (const t of templates) {
       expect(packed, `templates/${t.source} missing from npm pack`).toContain(`templates/${t.source}`);
     }
   });
@@ -140,8 +149,12 @@ describe('guardrailTemplates', () => {
     // dependabot.yml, tsconfig, vitest config, ci.yml vs gate.yml) are simply not in this list.
     const IDENTICAL = ['.claude/settings.json', '.claude/hooks/guard-bash.mjs', '.husky/pre-commit', '.github/workflows/pr-branch-name.yml'];
     const repoRoot = fileURLToPath(new URL('..', import.meta.url));
-    for (const t of guardrailTemplates()) {
-      if (!IDENTICAL.includes(t.targetPath)) continue;
+    const checked = guardrailTemplates().filter((t) => IDENTICAL.includes(t.targetPath));
+    // IDENTICAL is matched by targetPath, so renaming any of the four makes this loop match nothing
+    // and the drift check reports clean while comparing no files at all. The count is the guard, and
+    // it must be equality, not a floor: a renamed entry has to fail, not be tolerated.
+    expect(checked.map((t) => t.targetPath).sort(), 'an IDENTICAL entry names no template').toEqual([...IDENTICAL].sort());
+    for (const t of checked) {
       expect(readFileSync(path.join(repoRoot, t.targetPath), 'utf8'), `${t.targetPath} drifted from its template`).toBe(t.contents);
     }
   });
