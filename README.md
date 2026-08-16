@@ -184,6 +184,59 @@ The exported subpaths are exactly the five hook files above. Importing a hook do
 `main()` reads the payload from stdin and ends in `process.exit()`, so it is one hook per process —
 which is how Claude Code invokes them anyway (one process per matcher).
 
+### Installing it once per machine (user scope)
+
+The hooks and MCP server can govern *every* repo on a machine by wiring them at user scope
+(`~/.claude/settings.json`, `~/.claude.json`) instead of per repo. Install to a stable location —
+**not** a working checkout, and not `npm i -g` (`npm root -g` is Node-version-scoped, so the next
+upgrade silently relocates it):
+
+```bash
+npm install --prefix ~/.claude/tools ticket-workflow@github:<owner>/ticket-workflow#<tag>
+```
+
+Wiring a checkout is the trap worth naming: hooks are re-read on **every** invocation, so checking
+out a branch that edits `guard-bash.mjs` re-arms or dis-arms the machine's guard for every running
+session, mid-edit — and `dist/` becomes the MCP server that every newly started session loads.
+
+**Do not point the wiring straight at the installed file either.** Only exit **2** blocks; exit 1 is
+a non-blocking hook *error*. So `node <path-that-no-longer-exists>` exits 1 and reads as **allow** —
+a deleted or half-installed hook silently stops guarding. Wire a tiny launcher that lives *outside*
+`node_modules` (so it survives the install being gone) and converts "cannot load" into the right
+answer for the event:
+
+```js
+// ~/.claude/tools/hooks/run-hook.mjs <hook-name> <closed|open>
+const [name, direction] = process.argv.slice(2);
+try {
+  const { main } = await import(`ticket-workflow/hooks/${name}.mjs`);
+  if (typeof main !== 'function') throw new TypeError('no callable main — stale install?');
+  await main();
+} catch (err) {
+  process.stderr.write(`[${name}] could not run the hook: ${err?.code ?? err?.message}\n`);
+  process.exit(direction === 'closed' ? 2 : 0);
+}
+```
+
+Fail direction is per event, and the split is deliberate — a guard that cannot run must block, but a
+reporter that cannot run has nothing to block and must not wedge the session:
+
+| hook | event | cannot run → |
+|---|---|---|
+| `guard-bash` | `PreToolUse` | **closed** (exit 2) |
+| `guard-ticket` | `PreToolUse` | **closed** (exit 2) |
+| `guard-review-target` | `UserPromptExpansion` | **closed** (exit 2) |
+| `warn-stale-worktree` | `SessionStart` | open (exit 0), loud on stderr |
+| `track-steps` | `PostToolUse` | open (exit 0), loud on stderr |
+
+The two `open` rows are a real gap, not an oversight: nothing detects a telemetry hook that quietly
+stopped recording. Treat "are my hooks actually wired and running?" as a question needing its own
+check, not an assumption.
+
+**Verify by removing the checkout, not by reading the config.** Move the development checkout's
+`hooks/` and `dist/` aside and confirm the guards still block, still allow on a feature branch, and
+the MCP server still answers. If anything changes, the machine was still depending on that tree.
+
 ## Development
 
 ```bash
