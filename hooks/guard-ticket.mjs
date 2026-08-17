@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 // PreToolUse(mcp__kanban__create_ticket) guardrail — wired in .claude/settings.json.
 //
-// Enforces the CLAUDE.md "Ticket creation flow" split (tkt-2492e26a277a): every
-// NEW ticket must be authored by the local intake agent (`npm run agent`), so its
-// title/body/classification is written inside a metered local-LLM run and the
-// ticket carries a real usage record. Claude therefore never calls create_ticket
-// itself — this hook blocks it and points Claude at the agent instead.
+// Enforces the "Ticket creation flow" split (tkt-2492e26a277a): every NEW ticket
+// must be authored by the consumer's configured intake path, so its
+// title/body/classification is written inside a metered run and the ticket
+// carries a real usage record. The agent therefore never calls create_ticket
+// itself — this hook blocks it and points at that path instead.
+//
+// The concrete command lives in TICKET_WORKFLOW_CREATE_REASON, set by the
+// consumer, never here: this guard is wired at USER scope, so it fires in every
+// repo on the machine while any specific command exists in one of them
+// (tkt-0361525dbf9f).
 //
 // SCOPE (deliberately narrow — creation only): this blocks create_ticket and
 // nothing else. Claude keeps update_ticket (implementation summaries, structured
@@ -42,20 +47,37 @@ import { isMain } from './lib/is-main.mjs';
 // documents intent independently of the settings matcher.
 const CREATE_TICKET = /(?:^|__)create_ticket$/;
 
+// The shipped default is deliberately REPO-AGNOSTIC. This guard is wired at user scope, so it fires in
+// every repo on the machine, while a consumer's intake script exists in exactly one of them — a blocked
+// session elsewhere was being handed a command that does not exist there (tkt-0361525dbf9f).
+// It states the POLICY (which is universal) and defers the mechanism to the consumer.
 export const REASON =
-  'create_ticket is authored by the local intake agent, not Claude, so every new ticket ' +
-  'carries a metered local-LLM usage record. Run `npm run agent -- --yes "<report>"` — it ' +
-  'writes the title + body and classifies type/priority/status/project inside a metered run. ' +
-  'If the local model is unavailable (agent exits non-zero / GET /api/intake/health is down), ' +
-  'tell the user the local runtime is unavailable — do NOT author the ticket yourself (that ' +
-  'would create an untracked ticket). update_ticket (summaries, structured fields, edits) and ' +
-  'delete_ticket remain Claude\'s. See CLAUDE.md → Ticket creation flow.';
+  'create_ticket is blocked: new tickets must be authored by this machine\'s configured intake path, ' +
+  'not directly by the agent, so every new ticket carries a real usage record. Ask the user how ' +
+  'tickets are filed in this repo, or read its CLAUDE.md — do NOT author the ticket yourself, which ' +
+  'would create an untracked one. update_ticket (implementation summaries, structured fields, directed ' +
+  'edits) and delete_ticket are unaffected. A consumer can replace this message with its own concrete ' +
+  'command by setting TICKET_WORKFLOW_CREATE_REASON.';
 
-export function decide(payload) {
+/**
+ * The message a blocked session reads. Consumer-specific vocabulary belongs HERE, in the consumer's
+ * environment, not in shipped code — same seam as guard-bash's TICKET_WORKFLOW_PROTECTED_BRANCH.
+ *
+ * Blank/whitespace-only falls through to the default rather than blocking with an empty explanation: a
+ * guard that refuses without saying why is barely better than one that fails open, and an unset-vs-empty
+ * env var is a distinction no caller intends.
+ */
+export function createReason(env = process.env) {
+  const override = env.TICKET_WORKFLOW_CREATE_REASON?.trim();
+  return override || REASON;
+}
+
+export function decide(payload, env = process.env) {
+  const reason = createReason(env);
   const toolName = payload?.tool_name;
   // Fail CLOSED (see header): no readable tool name → treat as the routed create call.
-  if (typeof toolName !== 'string') return { blocked: true, reason: REASON };
-  if (CREATE_TICKET.test(toolName)) return { blocked: true, reason: REASON };
+  if (typeof toolName !== 'string') return { blocked: true, reason };
+  if (CREATE_TICKET.test(toolName)) return { blocked: true, reason };
   return { blocked: false };
 }
 
