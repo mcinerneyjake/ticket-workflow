@@ -325,6 +325,46 @@ server is not observable from another process — so it answers the weaker, chec
 whether a new session's server would start. And a `hook-wiring` OK means the wired files match what
 this package ships, not that the guards are correct; that is what their own suites are for.
 
+## `worktree` — one checkout per session, from any repo
+
+Claude Code's own worktree support isolates only the repo a session was **started in**. Where one
+board serves every repository, sessions start in the board's repo and edit sibling repos — which get
+no isolation at all. That is not theoretical: two sessions shared one checkout, and a branch switch by
+one moved HEAD out from under the other while it held a full ticket's work uncommitted.
+
+```bash
+npx ticket-workflow worktree <ticket-id>                 # branch named from the ticket
+npx ticket-workflow worktree --branch feat/x             # when the board is not reachable from here
+npx ticket-workflow worktree <id> --base origin/release  # explicit base
+npx ticket-workflow worktree <id> --repo ../other-repo   # operate on another checkout
+```
+
+The worktree lands in `.claude/worktrees/<name>`, **inside** the repo. That is load-bearing rather
+than tidy: Node resolves upward, so the gate runs in a fresh worktree with no install. A sibling
+directory would need a full `node_modules` per worktree.
+
+Two refusals worth knowing, both cases where proceeding would be worse than stopping:
+
+- **An unresolvable base is refused, never defaulted.** The ladder is `origin/HEAD`, then
+  `origin/main`, `origin/master`, `main`, `master` — and if none exist it asks for `--base` rather
+  than guessing. Guessing `main` in a `master` repo cuts the branch from the wrong history, and that
+  only surfaces at review.
+- **An existing branch or occupied path is refused before git is asked**, so the message names the
+  situation instead of surfacing git's.
+
+The base ladder is duplicated in `hooks/lib/default-branch.mjs`, which `src` cannot import. A test
+drives the hooks version with a recording double and asserts both probe the same refs in the same
+order, so the copy is held by a failing test rather than by a comment asking someone to keep them in
+sync.
+
+Pair it with the `warn-stale-worktree` SessionStart hook: this command creates worktrees, that hook
+catches the ones left behind — a stale worktree carries its own `CLAUDE.md`, and stale instructions
+on disk still instruct.
+
+The `gitignore` audit check requires `.claude/worktrees/` to be ignored. An unignored worktree shows
+up as a mountain of untracked files in the main checkout, which is exactly when someone reaches for
+`git add -A` and commits another session's in-flight work.
+
 ## `verify` — checking a ticket's claims against the record
 
 Every ticket ends with an agent-authored `## Implementation summary` asserting `Tests: N added` and a

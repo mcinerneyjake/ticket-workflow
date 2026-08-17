@@ -103,6 +103,17 @@ describe('audit: each check goes red on exactly its own broken guardrail', () =>
     { id: 'claude-md', expect: 'fail', mutate: (d) => writeFileSync(path.join(d, 'CLAUDE.md'), '# nothing useful\n') },
     { id: 'gitignore', expect: 'fail', mutate: (d) => rmSync(path.join(d, '.gitignore')) },
     { id: 'gitignore', expect: 'fail', mutate: (d) => writeFileSync(path.join(d, '.gitignore'), '\n') },
+    // A .gitignore that is present and non-empty but does NOT ignore the worktree directory: the
+    // state every repo scaffolded before `worktree` existed is in, and the one where an unignored
+    // worktree shows up as untracked files in the main checkout.
+    {
+      id: 'gitignore',
+      expect: 'fail',
+      mutate: (d) => {
+        const p = path.join(d, '.gitignore');
+        writeFileSync(p, readBack(p).replace(/^\.claude\/worktrees\/$/m, ''));
+      },
+    },
     {
       id: 'ci-gate-job',
       expect: 'fail',

@@ -10,6 +10,7 @@ import { runAudit, auditExitCode, formatAudit } from '../audit/run.js';
 import { runInit } from '../init/run.js';
 import { buildReport, formatReport } from '../verify/rules.js';
 import { gatherTicketFacts } from '../verify/gather.js';
+import { createWorktree, branchName, PREFIX_BY_TYPE } from '../worktree/create.js';
 
 // Lightweight per-repo board viewer. Resolves the board from the cwd/
 // CLAUDE_PROJECT_DIR (see paths.ts), so it shows whichever repo it runs in.
@@ -235,9 +236,96 @@ export async function cmdVerify(args: string[], gather = gatherTicketFacts): Pro
   console.log(formatReport(report, unreadable));
 }
 
+export interface WorktreeArgs {
+  readonly id: string | null;
+  readonly branch: string | null;
+  readonly base: string | null;
+  readonly name: string | null;
+  readonly repoDir: string;
+}
+
+const WORKTREE_VALUE_FLAGS = ['--branch', '--base', '--name', '--repo'] as const;
+
+export function parseWorktreeArgs(args: readonly string[]): WorktreeArgs {
+  const out: { id: string | null; branch: string | null; base: string | null; name: string | null; repoDir: string } = {
+    id: null, branch: null, base: null, name: null, repoDir: '.',
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--branch' || a === '--base' || a === '--name' || a === '--repo') {
+      const v = args[++i];
+      if (v === undefined || v.startsWith('-')) throw new Error(`${a} requires a value`);
+      if (a === '--branch') out.branch = v;
+      else if (a === '--base') out.base = v;
+      else if (a === '--name') out.name = v;
+      else out.repoDir = v;
+    } else if (a.startsWith('-')) {
+      // Rejected, never ignored — same reasoning as audit and verify. A typo'd flag that silently
+      // does nothing here would cut the branch from the wrong base.
+      throw new Error(`unknown option for worktree: ${a} (accepts ${WORKTREE_VALUE_FLAGS.join(', ')})`);
+    } else if (out.id === null) {
+      out.id = a;
+    } else {
+      throw new Error(`worktree takes at most one ticket id (got "${out.id}" and "${a}")`);
+    }
+  }
+  if (out.id === null && out.branch === null) {
+    throw new Error('usage: ticket-workflow worktree <ticket-id> [--branch <name>] [--base <ref>] [--name <dir>] [--repo <path>]');
+  }
+  return out;
+}
+
+/**
+ * Isolate a session in its own worktree, from ANY repo on the machine (`tkt-d330a4b106b9`).
+ *
+ * The branch name comes from the ticket when the board is reachable, and the command REFUSES with
+ * an instruction rather than inventing one when it is not: this package ships to every repo, and
+ * the board it resolves depends on where it was run from.
+ */
+export interface WorktreeDeps {
+  readonly fetchTicket: typeof getTicket;
+  readonly create: typeof createWorktree;
+}
+
+export async function cmdWorktree(
+  args: string[],
+  deps: WorktreeDeps = { fetchTicket: getTicket, create: createWorktree },
+): Promise<void> {
+  const { id, branch, base, name, repoDir } = parseWorktreeArgs(args);
+  let finalBranch = branch;
+  if (finalBranch === null && id !== null) {
+    try {
+      const t = await deps.fetchTicket(id);
+      finalBranch = branchName(PREFIX_BY_TYPE[t.type] ?? 'task', t.id, t.title);
+    } catch {
+      throw new Error(
+        `could not read ticket ${id} from the board reachable from ${repoDir} — pass --branch <name> explicitly`,
+      );
+    }
+  }
+  if (finalBranch === null) throw new Error('no branch could be determined');
+
+  const result = deps.create({ repoDir, branch: finalBranch, ...(base ? { base } : {}), ...(name ? { name } : {}) });
+  if (result.kind === 'refused') {
+    console.error(`refused: ${result.reason}`);
+    process.exitCode = 1;
+    return;
+  }
+  console.log(`created    ${result.path}`);
+  console.log(`branch     ${result.branch}  (from ${result.base})`);
+  console.log('\nNext:');
+  console.log(`  cd ${result.path}`);
+  console.log('\nWhen the ticket is merged, remove it — a stale worktree carries its own copy of');
+  console.log('CLAUDE.md, and stale instructions on disk keep turning up in greps:');
+  console.log(`  git worktree remove ${result.path}`);
+}
+
 export async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
+    case 'worktree':
+      await cmdWorktree(rest);
+      break;
     case 'list':
       await cmdList(parseStatus(rest));
       break;
@@ -262,7 +350,8 @@ export async function main(): Promise<void> {
     default:
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
-          'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json]>',
+          'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json] | ' +
+          'worktree <ticket-id> [--branch <name>] [--base <ref>] [--name <dir>] [--repo <path>]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;
   }

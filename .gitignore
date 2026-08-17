@@ -5,3 +5,6 @@ events/
 *.tsbuildinfo
 coverage/
 .DS_Store
+
+# Claude Code per-session worktrees — checkouts, never sources (tkt-d330a4b106b9).
+.claude/worktrees/

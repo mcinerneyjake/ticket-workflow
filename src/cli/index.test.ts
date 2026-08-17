@@ -1,9 +1,10 @@
+import type { Ticket } from '../shared/constants.js';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain } from './index.js';
+import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain, parseWorktreeArgs, cmdWorktree} from './index.js';
 import { createTicket, HttpError } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import { STATUS_IDS } from '../shared/constants.js';
@@ -439,5 +440,81 @@ describe('isMain', () => {
     } finally {
       errSpy.mockRestore();
     }
+  });
+});
+
+describe('parseWorktreeArgs', () => {
+  it('takes a bare ticket id', () => {
+    expect(parseWorktreeArgs(['tkt-1'])).toEqual({ id: 'tkt-1', branch: null, base: null, name: null, repoDir: '.' });
+  });
+
+  it('accepts --branch with no ticket id, since the board may be unreachable from this repo', () => {
+    expect(parseWorktreeArgs(['--branch', 'feat/x']).branch).toBe('feat/x');
+  });
+
+  it('rejects an unknown flag rather than ignoring it', () => {
+    // A typo'd --bse silently ignored would cut the branch from the wrong base.
+    expect(() => parseWorktreeArgs(['tkt-1', '--bse', 'origin/main'])).toThrow(/unknown option for worktree/);
+  });
+
+  it('rejects a flag whose value is missing', () => {
+    expect(() => parseWorktreeArgs(['tkt-1', '--base'])).toThrow(/--base requires a value/);
+  });
+
+  it('rejects a second positional', () => {
+    expect(() => parseWorktreeArgs(['tkt-1', 'tkt-2'])).toThrow(/at most one ticket id/);
+  });
+
+  it('refuses when given neither an id nor a branch', () => {
+    expect(() => parseWorktreeArgs([])).toThrow(/usage: ticket-workflow worktree/);
+  });
+});
+
+describe('cmdWorktree', () => {
+  const ticket: Ticket = {
+    id: 'tkt-1', title: 'Fix the broken thing now', type: 'bug', priority: 'high', status: 'todo',
+    order: 1, created: '2026-01-01T00:00:00.000Z', updated: '2026-01-01T00:00:00.000Z', body: '',
+    project: null, blockers: [], parent: null, dueDate: null, assignee: null,
+  };
+  const created = { kind: 'created' as const, path: '.claude/worktrees/tkt-1-fix', branch: 'fix/tkt-1-fix', base: 'origin/main' };
+
+  it('derives the branch from the ticket type and title when the board is reachable', async () => {
+    const seen: Array<{ branch: string }> = [];
+    await cmdWorktree(['tkt-1'], {
+      fetchTicket: async () => ticket,
+      create: (o) => { seen.push({ branch: o.branch }); return created; },
+    });
+    // bug → fix, and the slug comes from the title — not a convention hardcoded per repo.
+    expect(seen).toEqual([{ branch: 'fix/tkt-1-fix-the-broken-thing-now' }]);
+  });
+
+  it('refuses with an instruction when the board cannot be read from this repo', async () => {
+    // The board resolves from where the command RAN, so a sibling repo often cannot see it. Inventing
+    // a branch name there would be worse than stopping.
+    await expect(
+      cmdWorktree(['tkt-1'], {
+        fetchTicket: async () => { throw new Error('404'); },
+        create: () => created,
+      }),
+    ).rejects.toThrow(/could not read ticket tkt-1.*pass --branch/s);
+  });
+
+  it('does not consult the board at all when --branch is given', async () => {
+    let asked = false;
+    await cmdWorktree(['--branch', 'feat/x'], {
+      fetchTicket: async () => { asked = true; return ticket; },
+      create: () => created,
+    });
+    expect(asked).toBe(false);
+  });
+
+  it('sets a non-zero exit code when creation is refused', async () => {
+    const before = process.exitCode;
+    await cmdWorktree(['--branch', 'feat/x'], {
+      fetchTicket: async () => ticket,
+      create: () => ({ kind: 'refused', reason: 'branch feat/x already exists' }),
+    });
+    expect(process.exitCode).toBe(1);
+    process.exitCode = before;
   });
 });
