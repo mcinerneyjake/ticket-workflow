@@ -19,12 +19,22 @@
 // intake from a report; it can't summarize work Claude just did, nor target a
 // specific ticket). See CLAUDE.md → Ticket creation flow.
 //
-// REACH (best-effort, like guard-bash — not an adversarial sandbox): this guards
-// the MCP tool create_ticket in THIS repo's project scope only. A direct
-// POST /api/tickets or a service-layer createTicket script bypasses it, and
-// sessions in other repos driving the central board via the user-scope server
-// aren't guarded until it's wired there too. See CLAUDE.md → Ticket creation
-// flow (Scope of enforcement).
+// REACH (best-effort, like guard-bash — not an adversarial sandbox): wired at
+// USER scope, this guards the MCP tool create_ticket in EVERY repo the session
+// touches, not just the one it was installed from (tkt-80e348e4ff22). Two limits
+// remain, and both are real:
+//
+//   1. It guards the MCP TOOL, not the data. An HTTP POST to the board's create
+//      route, or a script calling the service layer directly, never reaches a
+//      PreToolUse hook at all. Rejecting un-metered creates server-side is the
+//      only thing that would close that.
+//   2. The user-scope wiring is MACHINE-LOCAL and unversioned. A fresh clone on
+//      another machine, a container, or CI has no guard whatsoever, and nothing
+//      in this package or its consumers can detect the absence — the same caveat
+//      that applies to the track-steps writer and guard-subagent-gates.
+//
+// So "guarded everywhere" is true of this machine, not of this repository
+// (tkt-05ebe3a365cf).
 //
 // CONTRAST with guard-bash: guard-bash matches ALL Bash and fails OPEN on a
 // parse error (most Bash is legitimate — a guardrail must never wedge real work).
