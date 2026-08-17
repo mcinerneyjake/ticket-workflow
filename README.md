@@ -333,11 +333,24 @@ no isolation at all. That is not theoretical: two sessions shared one checkout, 
 one moved HEAD out from under the other while it held a full ticket's work uncommitted.
 
 ```bash
+# From a repo that HAS this package installed:
 npx ticket-workflow worktree <ticket-id>                 # branch named from the ticket
 npx ticket-workflow worktree --branch feat/x             # when the board is not reachable from here
 npx ticket-workflow worktree <id> --base origin/release  # explicit base
-npx ticket-workflow worktree <id> --repo ../other-repo   # operate on another checkout
+npx ticket-workflow worktree <id> --repo ../other-repo   # operate on ANOTHER checkout
+
+# From a repo that does not depend on it — including non-Node repos:
+npx -y github:mcinerneyjake/ticket-workflow#<tag> worktree <id> --repo .
 ```
+
+**Use the git spec, not the bare name, from a repo that does not have this installed.** This package
+is **not published to npm** — consumers depend on it by git tag — so `npx ticket-workflow` cannot
+resolve there. Worse, the bare name is a namespace someone else could take: if a package called
+`ticket-workflow` is ever published, `npx` would silently run *theirs*. (`tkt-bd0b84d61db0` tracks
+publishing, which would change this; until then the git spec is the only correct remote form.)
+
+The `--repo` flag is the other answer, and usually the better one: run it from the repo that already
+has the package and point it at whichever checkout needs the worktree.
 
 The worktree lands in `.claude/worktrees/<name>`, **inside** the repo. That is load-bearing rather
 than tidy: Node resolves upward, so the gate runs in a fresh worktree with no install. A sibling
