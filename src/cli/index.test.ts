@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain } from './index.js';
+import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain, parseWorktreeArgs} from './index.js';
 import { createTicket, HttpError } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import { STATUS_IDS } from '../shared/constants.js';
@@ -439,5 +439,32 @@ describe('isMain', () => {
     } finally {
       errSpy.mockRestore();
     }
+  });
+});
+
+describe('parseWorktreeArgs', () => {
+  it('takes a bare ticket id', () => {
+    expect(parseWorktreeArgs(['tkt-1'])).toEqual({ id: 'tkt-1', branch: null, base: null, name: null, repoDir: '.' });
+  });
+
+  it('accepts --branch with no ticket id, since the board may be unreachable from this repo', () => {
+    expect(parseWorktreeArgs(['--branch', 'feat/x']).branch).toBe('feat/x');
+  });
+
+  it('rejects an unknown flag rather than ignoring it', () => {
+    // A typo'd --bse silently ignored would cut the branch from the wrong base.
+    expect(() => parseWorktreeArgs(['tkt-1', '--bse', 'origin/main'])).toThrow(/unknown option for worktree/);
+  });
+
+  it('rejects a flag whose value is missing', () => {
+    expect(() => parseWorktreeArgs(['tkt-1', '--base'])).toThrow(/--base requires a value/);
+  });
+
+  it('rejects a second positional', () => {
+    expect(() => parseWorktreeArgs(['tkt-1', 'tkt-2'])).toThrow(/at most one ticket id/);
+  });
+
+  it('refuses when given neither an id nor a branch', () => {
+    expect(() => parseWorktreeArgs([])).toThrow(/usage: ticket-workflow worktree/);
   });
 });
