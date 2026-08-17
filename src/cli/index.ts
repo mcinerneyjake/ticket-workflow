@@ -282,12 +282,20 @@ export function parseWorktreeArgs(args: readonly string[]): WorktreeArgs {
  * an instruction rather than inventing one when it is not: this package ships to every repo, and
  * the board it resolves depends on where it was run from.
  */
-export async function cmdWorktree(args: string[], fetchTicket = getTicket): Promise<void> {
+export interface WorktreeDeps {
+  readonly fetchTicket: typeof getTicket;
+  readonly create: typeof createWorktree;
+}
+
+export async function cmdWorktree(
+  args: string[],
+  deps: WorktreeDeps = { fetchTicket: getTicket, create: createWorktree },
+): Promise<void> {
   const { id, branch, base, name, repoDir } = parseWorktreeArgs(args);
   let finalBranch = branch;
   if (finalBranch === null && id !== null) {
     try {
-      const t = await fetchTicket(id);
+      const t = await deps.fetchTicket(id);
       finalBranch = branchName(PREFIX_BY_TYPE[t.type] ?? 'task', t.id, t.title);
     } catch {
       throw new Error(
@@ -297,7 +305,7 @@ export async function cmdWorktree(args: string[], fetchTicket = getTicket): Prom
   }
   if (finalBranch === null) throw new Error('no branch could be determined');
 
-  const result = createWorktree({ repoDir, branch: finalBranch, ...(base ? { base } : {}), ...(name ? { name } : {}) });
+  const result = deps.create({ repoDir, branch: finalBranch, ...(base ? { base } : {}), ...(name ? { name } : {}) });
   if (result.kind === 'refused') {
     console.error(`refused: ${result.reason}`);
     process.exitCode = 1;
