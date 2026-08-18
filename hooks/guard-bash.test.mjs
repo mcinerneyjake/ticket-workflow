@@ -65,7 +65,7 @@ describe('cdTarget', () => {
     expect(cdTarget('cd -', KANBAN)).toBeNull();
     expect(cdTarget('cd', KANBAN)).toBeNull();
     expect(cdTarget('cd $SOMEWHERE', KANBAN)).toBeNull();
-    expect(cdTarget('cd ~jake/repo', KANBAN)).toBeNull();
+    expect(cdTarget('cd ~someuser/repo', KANBAN)).toBeNull();
   });
 
   it('returns null for a quoted path with a space rather than a truncated one', () => {
@@ -474,8 +474,8 @@ describe('main-branch rules: remote-gated, default-branch-aware', () => {
   const verdict = (cmd, branch, over) => decide(cmd, onBranch(branch), undefined, repo(over));
 
   it('allows a commit on main in a repo with NO remote', () => {
-    // "lands on main via a squash-merged PR" is meaningless with nowhere to push. Hit live in
-    // level-up/job-hunt, which has no remote.
+    // "lands on main via a squash-merged PR" is meaningless with nowhere to push. Hit live in a
+    // local-only repo that has no remote at all.
     expect(verdict('git commit -m x', 'main', { hasRemote: false }).blocked).toBe(false);
   });
 

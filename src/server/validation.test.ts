@@ -39,14 +39,14 @@ describe('extractTicketFields', () => {
       {
         title: 'Fix export', type: 'bug', priority: 'high', status: 'todo',
         body: 'details', project: 'kanban', parent: 'tkt-1', dueDate: '2026-08-01',
-        assignee: 'jake', blockers: ['tkt-2', 'tkt-3'],
+        assignee: 'someone', blockers: ['tkt-2', 'tkt-3'],
       },
       CREATE_STATUS_ENUM,
     );
     expect(out).toEqual({
       title: 'Fix export', type: 'bug', priority: 'high', status: 'todo',
       body: 'details', project: 'kanban', parent: 'tkt-1', dueDate: '2026-08-01',
-      assignee: 'jake', blockers: ['tkt-2', 'tkt-3'],
+      assignee: 'someone', blockers: ['tkt-2', 'tkt-3'],
     });
   });
 
