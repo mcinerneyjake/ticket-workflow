@@ -12,11 +12,32 @@ reaches them only through a tag cut plus their own pin bump.
 
 ## Public and user-agnostic — hard rule
 
-This is a public repo. **Never commit a local identifier**: no `/Users/…` paths, no machine-local
-board paths, no private hostnames. The template contents are test-enforced
-(`src/templates.test.ts`, user-agnosticism case); for everything else, before any commit:
-`git grep '/Users/' -- ':!src/templates.test.ts' ':!CLAUDE.md'` must return nothing — the two
-excluded files are the enforcement and this rule, whose own text names the pattern.
+This is a public repo. **Never commit a local identifier**: no home-directory path naming a real
+account, no machine-local board paths, no private hostnames.
+
+**Enforced in the gate, not by a grep you have to remember.** `src/repoHygiene.test.ts` scans the
+**index** — the snapshot that will actually commit — for `~user/`, `/Users/user` and `/home/user`,
+failing unless the owner is an obvious placeholder (`someuser`, `x`, `runner`, …). The consequence
+to know when running it locally: **an unstaged edit is not scanned.** `git add` first, or the run
+reports on a file you have already changed. `src/templates.test.ts` holds template contents to the
+same standard separately.
+
+This replaced a hand-run `git grep` with a hardcoded exclusion list, which rotted the worst way: the
+list went stale, so it reported a hit on **every clean run** while the identifier that was actually
+committed — a real account name in a `~user/` path — sat in a shape it never matched. A check that
+always fires is a check people stop reading (`tkt-3a91af2aa6d9`).
+
+**What it cannot catch.** Three gaps, all deliberate and all measured:
+
+1. **A bare tilde account with no path after it** — `cd ~user` is invisible, because `~word` is
+   ordinary prose (`~two hours`, `~40 lines`) and matching it would fire on documentation forever.
+   Only the `~user/` form is caught. A test pins this so it cannot later be mistaken for coverage.
+2. **Anything that is not a path shape.** A probe cannot name the identifiers it hunts without
+   committing them, so a bare first name in fixture data is invisible to it.
+3. **Another repo's on-disk directory named in a comment**, unless it sits under a home path.
+
+Gaps 2 and 3 were both found by hand in the same pass and stay convention plus review: give fixtures
+placeholder names, and describe another repo by what it is, never by where it sits on disk.
 
 ## Quality gate
 
