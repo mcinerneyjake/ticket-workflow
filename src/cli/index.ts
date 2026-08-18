@@ -11,6 +11,8 @@ import { runInit } from '../init/run.js';
 import { buildReport, formatReport } from '../verify/rules.js';
 import { gatherTicketFacts } from '../verify/gather.js';
 import { createWorktree, branchName, PREFIX_BY_TYPE } from '../worktree/create.js';
+import { sweep } from '../vacuous/probe.js';
+import { checkRoot, vacuousExitCode, EXIT as VACUOUS_EXIT } from '../vacuous/ratchet.js';
 
 // Lightweight per-repo board viewer. Resolves the board from the cwd/
 // CLAUDE_PROJECT_DIR (see paths.ts), so it shows whichever repo it runs in.
@@ -133,6 +135,36 @@ export function cmdAudit(args: string[], stat: (p: string) => { isDirectory(): b
   const report = runAudit(repoDir);
   console.log(json ? JSON.stringify(report, null, 2) : formatAudit(report));
   process.exitCode = auditExitCode(report);
+}
+
+/**
+ * `vacuous <path>` sweeps and prints candidates as JSON; `--check` ratchets against the repo's own
+ * `vacuous-baseline.json`. Usage errors are handled HERE (not thrown) because this subcommand's
+ * exit codes are a contract — 1 breach / 2 usage / 3 probe error — and the thrown-error path exits
+ * 1, which would make a typo'd flag indistinguishable from a real finding.
+ */
+export function cmdVacuous(args: string[]): void {
+  // A single-dash typo (`-check`) must be a usage error, not a path that fails as exit-3.
+  const flags = args.filter((a) => a.startsWith('-'));
+  const paths = args.filter((a) => !a.startsWith('-'));
+  if (flags.some((f) => f !== '--check') || paths.length !== 1) {
+    console.error('usage: ticket-workflow vacuous <path> [--check]');
+    process.exitCode = VACUOUS_EXIT.USAGE;
+    return;
+  }
+  if (flags.includes('--check')) {
+    const result = checkRoot(paths[0]);
+    console.log(result.message);
+    process.exitCode = vacuousExitCode(result);
+    return;
+  }
+  try {
+    console.log(JSON.stringify(sweep(paths[0]), null, 2));
+  } catch (e) {
+    // A broken instrument or an empty tree is a probe error, never a clean sweep.
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exitCode = VACUOUS_EXIT.PROBE_ERROR;
+  }
 }
 
 export function parseInitArgs(args: readonly string[]): { targetDir: string; tier: 'core' | 'node'; force: boolean } {
@@ -341,6 +373,9 @@ export async function main(): Promise<void> {
     case 'verify':
       await cmdVerify(rest);
       break;
+    case 'vacuous':
+      cmdVacuous(rest);
+      break;
     case 'show': {
       const id = rest[0];
       if (id === undefined) throw new Error('usage: ticket-workflow show <id>');
@@ -351,6 +386,7 @@ export async function main(): Promise<void> {
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
           'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json] | ' +
+          'vacuous <path> [--check] | ' +
           'worktree <ticket-id> [--branch <name>] [--base <ref>] [--name <dir>] [--repo <path>]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;
