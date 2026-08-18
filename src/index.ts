@@ -12,3 +12,7 @@ export { runInit } from './init/run.js';
 export type { InitResult } from './init/run.js';
 export type { AuditReport } from './audit/run.js';
 export type { AuditResult, AuditStatus, AuditCheck, AuditContext, Exec, ExecResult, ReadResult } from './audit/types.js';
+export { sweep, testBlocks, screenBlock, assertInstruments, controlFailures, CONTROLS, HITS } from './vacuous/probe.js';
+export type { SweepResult, Candidate, TestBlock } from './vacuous/probe.js';
+export { checkRoot, compareToBaseline, vacuousExitCode, BASELINE_NAME, BREADTH_FLOOR, EXIT as VACUOUS_EXIT } from './vacuous/ratchet.js';
+export type { CheckResult, BaselineRow } from './vacuous/ratchet.js';

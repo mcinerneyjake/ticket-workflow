@@ -1,0 +1,8 @@
+{
+  "max": 0,
+  "files": 27,
+  "blocks": 787,
+  "asOf": "2026-08-18",
+  "_comment": "Ceiling for THIS repo, checked by src/vacuous/ratchet.test.ts against the repo root. Counts are a breadth floor for the sweep-collapse guard. Regenerate with the _regenerate command.",
+  "_regenerate": "node dist/cli/index.js vacuous ."
+}
