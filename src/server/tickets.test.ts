@@ -1239,3 +1239,128 @@ describe('backup-on-write history snapshots (tkt-18d53c0c7cd8)', () => {
     expect(all[0].id).toBe(t.id);
   });
 });
+
+// ---------------------------------------------------------------------------
+
+// tkt-5b2a1fbd011b. A NUL makes the .md file classify as binary, so every binary-skipping tool
+// silently drops the ticket while the board still reads it and reports nothing wrong — the write
+// succeeds, `unreadable` stays empty, and a count is quietly short. Both real occurrences arrived
+// through appendBody, in prose that meant the two-character escape and emitted the byte.
+// Written as one case per DIMENSION of the state the guard lives in: entry path, field type,
+// position/count, effect on disk, pre-existing state, and the escape that must NOT trip it.
+const NUL = '\0'; // spelled as an escape on purpose — a raw byte here would be invisible
+
+describe('NUL bytes are rejected at the write boundary (tkt-5b2a1fbd011b)', () => {
+  it('rejects a NUL in the body on create', async () => {
+    const err = await httpError(createTicket({ title: 'A', body: `as a \`${NUL}\` escape` }));
+    expect(err.status).toBe(400);
+    expect(err.message).toMatch(/body/);
+    expect(err.message).toMatch(/NUL/);
+  });
+
+  it('rejects a NUL in the title on create', async () => {
+    const err = await httpError(createTicket({ title: `A${NUL}B` }));
+    expect(err.status).toBe(400);
+    expect(err.message).toMatch(/title/);
+  });
+
+  it('rejects a NUL in the body on update', async () => {
+    const t = await createTicket({ title: 'A' });
+    const err = await httpError(updateTicket(t.id, { body: `x${NUL}y` }));
+    expect(err.status).toBe(400);
+    expect(err.message).toMatch(/body/);
+  });
+
+  // The path BOTH real incidents used — a guard on create alone would have caught neither.
+  it('rejects a NUL in appendBody on update', async () => {
+    const t = await createTicket({ title: 'A', body: 'original' });
+    const err = await httpError(updateTicket(t.id, { appendBody: `see \`${NUL}\`` }));
+    expect(err.status).toBe(400);
+    expect(err.message).toMatch(/appendBody/);
+  });
+
+  it('rejects a NUL in a structured string field', async () => {
+    const t = await createTicket({ title: 'A' });
+    const err = await httpError(updateTicket(t.id, { project: `proj${NUL}` }));
+    expect(err.status).toBe(400);
+    expect(err.message).toMatch(/project/);
+  });
+
+  it('rejects a NUL inside blockers and names which element', async () => {
+    const t = await createTicket({ title: 'A' });
+    const err = await httpError(updateTicket(t.id, { blockers: ['tkt-ok', `tkt-${NUL}bad`] }));
+    expect(err.status).toBe(400);
+    expect(err.message).toMatch(/blockers\[1\]/);
+  });
+
+  it('rejects a NUL at the start and at the end, not only mid-string', async () => {
+    const lead = await httpError(createTicket({ title: 'A', body: `${NUL}leading` }));
+    const trail = await httpError(createTicket({ title: 'A', body: `trailing${NUL}` }));
+    expect(lead.status).toBe(400);
+    expect(trail.status).toBe(400);
+  });
+
+  // Effect, not just the throw: a rejected write must leave the board untouched.
+  it('writes no file when a create is rejected', async () => {
+    const before = (await listTickets()).length;
+    await httpError(createTicket({ title: 'A', body: NUL }));
+    expect((await listTickets()).length).toBe(before);
+  });
+
+  it('leaves the existing file byte-identical when an update is rejected', async () => {
+    const t = await createTicket({ title: 'A', body: 'original' });
+    const file = path.join(dirs.tickets, `${t.id}.md`);
+    const before = await fs.readFile(file);
+    await httpError(updateTicket(t.id, { body: `new${NUL}` }));
+    expect(await fs.readFile(file)).toEqual(before);
+  });
+
+  // Negative controls: the guard must not fire on the thing the author actually meant.
+  it('accepts the two-character \\0 escape, which is what the prose intends', async () => {
+    const t = await createTicket({ title: 'A', body: 'the header is `SQLite format 3\\0`' });
+    expect((await getTicket(t.id)).body).toContain('\\0');
+  });
+
+  it('accepts ordinary text, unicode and newlines', async () => {
+    const t = await createTicket({ title: 'Café ✅', body: 'line one\nline two — dash\ttab' });
+    expect((await getTicket(t.id)).title).toBe('Café ✅');
+  });
+
+  // Pre-existing state: a ticket whose file ALREADY holds a NUL (the state the live board was in)
+  // must stay editable on unrelated fields. Guarding the merged result instead of the input would
+  // wedge every such ticket, including the edit that repairs it.
+  it('still allows an unrelated update to a ticket whose stored body already holds a NUL', async () => {
+    await writeRaw('tkt-legacynul', `${makeRaw('Legacy', 900)}before${NUL}after\n`);
+    const updated = await updateTicket('tkt-legacynul', { status: 'todo' });
+    expect(updated.status).toBe('todo');
+    expect(updated.body).toContain(NUL);
+  });
+});
+
+// Review findings, 2026-08-17. Both were measured before being pinned here.
+describe('NUL guard scope and wording (tkt-5b2a1fbd011b review)', () => {
+  // An unknown key is dropped by the merge, so rejecting the whole patch over one discarded the
+  // legitimate part — while the SAME key without a NUL was silently ignored. Reachable only from
+  // the raw Express path, which is exactly what validateWritableTypes exists for.
+  it('ignores a NUL in a key the write never persists, and still applies the rest', async () => {
+    const t = await createTicket({ title: 'A' });
+    // Attached via Object.assign, not a cast: the raw Express path carries keys TicketPatch does
+    // not declare, and this repo bans type assertions.
+    const patch = { title: 'ok' };
+    Object.assign(patch, { note: `x${NUL}` });
+    const updated = await updateTicket(t.id, patch);
+    expect(updated.title).toBe('ok');
+    expect(await fs.readFile(path.join(dirs.tickets, `${t.id}.md`), 'utf8')).not.toContain(NUL);
+  });
+
+  // js-yaml escapes control characters in dumped scalars, so a frontmatter NUL round-trips as
+  // "a\0b" and never lands as a raw byte — only body/appendBody can actually corrupt the file.
+  // The message must not tell a title-field caller their file would go binary.
+  it('gives the file-corruption reason for body but not for a frontmatter field', async () => {
+    const bodyErr = await httpError(createTicket({ title: 'A', body: NUL }));
+    const titleErr = await httpError(createTicket({ title: `A${NUL}` }));
+    expect(bodyErr.message).toMatch(/binary/);
+    expect(titleErr.message).not.toMatch(/binary/);
+    expect(titleErr.message).toMatch(/must not contain a raw NUL byte/);
+  });
+});

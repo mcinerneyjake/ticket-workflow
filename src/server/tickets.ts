@@ -221,6 +221,50 @@ function validateWritableTypes(patch: TicketPatch) {
   if (patch.blockers != null &&
       (!Array.isArray(patch.blockers) || !patch.blockers.every((b) => typeof b === 'string')))
     throw new HttpError(400, 'blockers must be an array of strings');
+  assertNoNulBytes(patch);
+}
+
+// A NUL makes the persisted .md classify as binary, so binary-skipping tools drop the ticket while
+// the board still parses it happily — the write reports success, `unreadable` stays empty, and a
+// count is quietly short (tkt-5b2a1fbd011b: 745 archived vs a true 746). Both real occurrences came
+// through appendBody, in prose that meant the two-character escape and emitted the byte.
+//
+// REJECTED, not stripped: silently rewriting a body someone authored is its own surprise, and a raw
+// NUL in markdown is always a mistake worth surfacing.
+//
+// Checked on the INPUT rather than the merged ticket, deliberately. A ticket whose stored body
+// already holds a NUL — the state the live board was in — must stay editable on unrelated fields,
+// including the edit that repairs it; guarding the serialized result would wedge exactly those.
+//
+// Scoped to the fields a write actually persists, NOT every own key of the raw object. The merge is
+// an explicit field-by-field list that drops unknown keys, so rejecting the whole patch over a NUL
+// in one would fail a request whose legitimate part would otherwise apply — while that same key
+// without a NUL is silently ignored. Every entry here is string | string[]; nothing recurses, so an
+// object-valued field added later would NOT be covered.
+const NUL_CHECKED_FIELDS = new Set(['title', 'body', 'appendBody', 'project', 'parent', 'dueDate', 'assignee', 'blockers']);
+
+// Only body/appendBody can put a raw byte on disk: js-yaml escapes control characters in dumped
+// scalars, so a frontmatter NUL round-trips as "a\0b" and never lands as binary (measured against
+// gray-matter). The rest are rejected too — a NUL is never intended in ticket content — but telling
+// a caller their title would corrupt the file would be a confidently wrong claim.
+const NUL_CORRUPTS_FILE = new Set(['body', 'appendBody']);
+
+function assertNoNulBytes(patch: object): void {
+  const reject = (label: string, field: string): never => {
+    const why = NUL_CORRUPTS_FILE.has(field) ? ' — it would make the ticket file binary and invisible to text tooling' : '';
+    throw new HttpError(400, `${label} must not contain a raw NUL byte${why}. Write the two-character escape \\0 instead.`);
+  };
+  for (const [field, raw] of Object.entries(patch)) {
+    if (!NUL_CHECKED_FIELDS.has(field)) continue;
+    const value: unknown = raw;
+    if (typeof value === 'string') {
+      if (value.includes('\0')) reject(field, field);
+    } else if (Array.isArray(value)) {
+      value.forEach((element: unknown, index) => {
+        if (typeof element === 'string' && element.includes('\0')) reject(`${field}[${index}]`, field);
+      });
+    }
+  }
 }
 
 const DUE_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
