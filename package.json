@@ -31,6 +31,7 @@
     "templates",
     "hooks/lib/default-branch.mjs",
     "hooks/lib/is-main.mjs",
+    "hooks/lib/shell.mjs",
     "hooks/guard-bash.mjs",
     "hooks/guard-review-target.mjs",
     "hooks/guard-subagent-gates.mjs",
