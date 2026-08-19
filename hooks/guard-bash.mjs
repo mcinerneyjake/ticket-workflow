@@ -37,8 +37,7 @@ import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { isMain } from './lib/is-main.mjs';
 import { hasRemote, protectedBranches } from './lib/default-branch.mjs';
-import { isAbsolute, join, resolve } from 'node:path';
-import { homedir } from 'node:os';
+import { cdTarget, resolveDir, splitSegments } from './lib/shell.mjs';
 
 // Pull the git subcommand + its args out of a single shell segment. The command
 // WORD must be `git` (after stripping leading subshell/group punctuation and
@@ -62,32 +61,10 @@ export function parseGit(segment) {
   return { sub: tokens[i], args: tokens.slice(i + 1), repoDir };
 }
 
-// null rather than a guess — a wrong dir judges one repo by another's branch.
-function resolveDir(dir, target) {
-  const quoted = /^["']/.test(target);
-  const balanced = quoted && target.length > 1 && target.at(-1) === target[0];
-  if (quoted && !balanced) return null; // whitespace-split upstream truncated a quoted path
-  const t = balanced ? target.slice(1, -1) : target;
-  if (!t || t.includes('$') || t.includes('*')) return null;
-  if (t === '~') return homedir();
-  if (t.startsWith('~/')) return join(homedir(), t.slice(2));
-  if (t.startsWith('~')) return null; // ~user
-  if (isAbsolute(t)) return t;
-  return dir ? resolve(dir, t) : null;
-}
-
-// undefined = not a cd; null = unresolvable (`cd -`, bare `cd`) → currentBranch
-// falls back to the hook's cwd rather than giving up.
-export function cdTarget(segment, dir) {
-  const stripped = segment.trim().replace(/^[({\s]+/, '').replace(/[)}\s]+$/, '');
-  const tokens = stripped.split(/\s+/);
-  let cmd = 0;
-  while (cmd < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[cmd])) cmd++;
-  if (tokens[cmd] !== 'cd') return undefined;
-  const target = tokens[cmd + 1];
-  if (!target || target.startsWith('-')) return null; // `cd`, `cd -`, `cd -P …`
-  return resolveDir(dir, target);
-}
+// resolveDir/cdTarget/splitSegments live in lib/shell.mjs — track-steps needs the same parsing to
+// decide which repo a milestone belongs to. Re-exported so this hook's public surface is unchanged
+// (guard-subagent-gates.mjs imports splitSegments from here).
+export { cdTarget, splitSegments };
 
 // Args that stage the whole working tree rather than named paths.
 function stagesEverything(args) {
@@ -186,38 +163,6 @@ export function destructiveGitReason(sub, args) {
     default:
       return null;
   }
-}
-
-// Split a compound command into top-level segments on && || ; and newline —
-// but NOT inside single/double quotes or $( … ) command substitutions. So data
-// (a commit-message heredoc body, a quoted JS string that happens to contain
-// `&&` or git verbs) is never mis-parsed as a separate command. Not a full shell
-// parser — it covers the shapes the workflow actually produces; a stray
-// unbalanced `)` inside a heredoc body is the known residual.
-export function splitSegments(command) {
-  const segments = [];
-  let buf = '';
-  let sq = false;   // inside '...'
-  let dq = false;   // inside "..."
-  let subst = 0;    // depth of $( … )
-  for (let i = 0; i < command.length; i++) {
-    const c = command[i];
-    const next = command[i + 1];
-    if (sq) { buf += c; if (c === "'") sq = false; continue; }
-    if (c === "'" && !dq) { buf += c; sq = true; continue; }
-    if (c === '"' && subst === 0) { buf += c; dq = !dq; continue; }
-    if (c === '$' && next === '(') { buf += '$('; subst++; i++; continue; }
-    if (subst > 0 && c === '(') { buf += c; subst++; continue; }
-    if (subst > 0 && c === ')') { buf += c; subst--; continue; }
-    if (!dq && subst === 0) {
-      if (c === '&' && next === '&') { segments.push(buf); buf = ''; i++; continue; }
-      if (c === '|' && next === '|') { segments.push(buf); buf = ''; i++; continue; }
-      if (c === ';' || c === '\n') { segments.push(buf); buf = ''; continue; }
-    }
-    buf += c;
-  }
-  segments.push(buf);
-  return segments.map((s) => s.trim()).filter(Boolean);
 }
 
 // `getBranch(dir)` is injected so the logic stays pure and testable. Branch state is
