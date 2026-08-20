@@ -292,6 +292,166 @@ describe('decide — the command target picks the repo (tkt-74bc8f9b6ba5)', () =
   });
 });
 
+// The guard half of tkt-2734584f8715's defect (tkt-3006d09810f7). decide() restored a subshell's
+// directory with a regex on the raw segment, and looked for a `cd` in a segment's FIRST word only.
+// Both miss a move, and a missed move is judged against the SESSION's branch — which while working a
+// ticket is a feature branch, i.e. allowed. So each miss is a never-commit-to-main bypass, and the
+// session state that reaches it is the ordinary one.
+describe('decide — a cd the parser missed must not exempt a commit (tkt-3006d09810f7)', () => {
+  // Session sits on OTHER (feat/x); every command below acts on KANBAN, which is on main.
+  //
+  // The resolver MUST fall back to the session's branch for a dir it does not know, because that is
+  // what the real one does (currentBranch(dir, fallbackDir)). A stub returning null for an unknown
+  // dir models a contract the code does not have, and the pre-existing branch===null rule then
+  // satisfies every case here whether or not the new guard exists — verified by deleting the guard
+  // and watching all of them stay green. That is the hazard the `end to end` suite below names.
+  const sessionAt = (home) => (d) => twoRepos(d) ?? twoRepos(home);
+  const from = (cmd) => decide(cmd, sessionAt(OTHER), OTHER).blocked;
+  const fromMain = (cmd) => decide(cmd, sessionAt(KANBAN), KANBAN).blocked;
+
+  it('blocks a commit after a segment that ends in a command substitution', () => {
+    // `export SHA=$(date)` ends in a `)` that closes no subshell — counting it popped a frame
+    // nothing pushed, silently restoring the pre-`cd` directory.
+    expect(from(`(cd ${KANBAN} && export SHA=$(date) && git commit -m x)`)).toBe(true);
+  });
+
+  it('blocks a commit after a cd hidden behind a pipeline or a command word', () => {
+    expect(from(`echo x | (cd ${KANBAN} && git commit -m y)`)).toBe(true);
+    expect(from(`time (cd ${KANBAN} && git commit -m x)`)).toBe(true);
+    expect(from(`for d in a; do (cd ${KANBAN} && git commit -m x); done`)).toBe(true);
+  });
+
+  it('blocks a push the same way — the push rule reads the same directory', () => {
+    expect(from(`(cd ${KANBAN} && export SHA=$(date) && git push origin main)`)).toBe(true);
+    expect(from(`echo x | (cd ${KANBAN} && git push)`)).toBe(true);
+  });
+
+  // Controls. A guard that blocks everything is not a fix, so the rows that were already correct
+  // must still be correct — and still for the right reason, not because everything now blocks.
+  it('still blocks the plain forms it always blocked', () => {
+    expect(from(`cd ${KANBAN} && git commit -m x`)).toBe(true);
+    expect(from(`(cd ${KANBAN} && git commit -m x)`)).toBe(true);
+    expect(from(`(cd ${KANBAN} && echo "oops :)" && git commit -m x)`)).toBe(true);
+  });
+
+  it('sees a hidden cd even when the segment is led by a git command word', () => {
+    // Single `|` is not a split point, so this is ONE segment whose command word is `git`. While the
+    // hidden-move check sat in the `else` of `if (git)`, swapping `echo` for `git` reopened the whole
+    // bypass — the suite's own control passed and this did not.
+    expect(from(`git log | (cd ${KANBAN} && git commit -m x)`)).toBe(true);
+    expect(from(`git status | (cd ${KANBAN} && git push origin main)`)).toBe(true);
+  });
+
+  it('judges a commit where it commits, not where a later hidden cd goes', () => {
+    // The `cd` runs after the segment's first command, so applying the move before the rules would
+    // let a trailing `cd` into a feature repo excuse a commit that lands on main.
+    expect(fromMain(`git commit -m x | (cd ${OTHER})`)).toBe(true);
+  });
+
+  it('leaves an EXPLICIT unresolvable cd falling back to the session, as before', () => {
+    // Deliberately unchanged, and pinned so the scope of this fix stays legible. An explicit
+    // `cd <unparseable>` keeps the documented fall-back-to-session residual; only a move hidden
+    // behind a pipeline or compound statement latches unknownDir. Latching both also refuses
+    // `cd "<path with a space>"`, a nameable directory this parser simply cannot read.
+    expect(from('cd $D && git commit -m x')).toBe(false);
+    expect(from('cd "/repos/my repo" && git commit -m x')).toBe(false);
+  });
+
+  it('still follows a cd into a feature branch from a session on main', () => {
+    // kanban's .claude/settings.audit.test.mjs pins this direction against the pinned build, so
+    // over-blocking the plain form breaks a consumer's gate.
+    expect(fromMain(`cd ${OTHER} && git commit -m x`)).toBe(false);
+    expect(fromMain(`(cd ${OTHER} && export SHA=$(date) && git commit -m x)`)).toBe(false);
+  });
+
+  it('allows a hidden cd whose target it can name, in either direction', () => {
+    // A hidden move is only unknowable when its TARGET is. Blocking on the mere fact of one refused
+    // a commit into a repo the command names perfectly well — including the session's own.
+    expect(fromMain(`echo x | (cd ${OTHER} && git commit -m x)`)).toBe(false);
+    expect(from(`time (cd ${OTHER} && git commit -m x)`)).toBe(false);
+    expect(from(`for d in a; do (cd ${OTHER} && git commit -m x); done`)).toBe(false);
+    // ...and still blocks when that named target is the one on main.
+    expect(fromMain(`echo x | (cd ${KANBAN} && git commit -m x)`)).toBe(true);
+  });
+
+  it('does not read a quoted cd in a commit message as a move', () => {
+    // hiddenDirTarget tokenizes on whitespace, so without masking an `&& cd` inside a message reads
+    // as a move. The first two only prove it does not BLOCK — the resolver falls back to the
+    // session's own branch either way, so they pass with masking disabled. The third is the one that
+    // binds it: from a session on main, a quoted path naming the feature repo would repoint the
+    // guard and let a commit on main through.
+    expect(from(`git commit -m "fix && cd handling"`)).toBe(false);
+    expect(from(`echo "run && cd /elsewhere" && git commit -m x`)).toBe(false);
+    expect(fromMain(`echo "a && cd ${OTHER} && b" && git commit -m x`)).toBe(true);
+  });
+
+  it('does not block reads or non-branch rules after an unresolvable move', () => {
+    // Fail-closed is scoped to commit/push, exactly as the branch===null rule is: an unknown
+    // directory must not wedge ordinary work.
+    expect(from(`echo x | (cd $D && git status)`)).toBe(false);
+    expect(from(`echo x | (cd $D && npm test)`)).toBe(false);
+  });
+
+  it('restores the unknown-directory latch when a subshell closes, not just the directory', () => {
+    // The `outer` frame carries [dir, unknownDir] as a PAIR. Saving only dir lets an inner subshell
+    // that cd-ed somewhere nameable clear the latch on its way out, and the commit after it is then
+    // judged against the session repo — the same fail-open, laundered through a nested subshell.
+    expect(from(`echo x | (cd $D && (cd /tmp && ls) && git commit -m y)`)).toBe(true);
+  });
+
+  it('re-pins the directory when an absolute cd follows the hidden one', () => {
+    expect(from(`echo x | (cd ${KANBAN} && cd ${OTHER} && git commit -m x)`)).toBe(false);
+    expect(fromMain(`echo x | (cd ${OTHER} && cd ${KANBAN} && git commit -m x)`)).toBe(true);
+  });
+
+  it('honors an absolute -C through an unresolvable move, and refuses a relative one', () => {
+    expect(from(`echo x | (cd $D && git -C ${OTHER} commit -m x)`)).toBe(false);
+    expect(from(`echo x | (cd $D && git -C ../other commit -m x)`)).toBe(true);
+  });
+
+  // One case per guard line added by this fix. Six of them bound nothing when first written — the
+  // repair for a guard that shipped untested must not itself ship untested (~/.claude/CLAUDE.md →
+  // "A guarantee needs an adversary list before the code").
+
+  it('slices a raw target at offsets the mask preserves', () => {
+    // maskData maps `$(` to TWO characters for exactly this reason: hiddenDirTarget recovers the raw
+    // token by offset, so a one-character shift silently yields a different directory — one the
+    // guard then resolves and judges with full confidence.
+    expect(from(`echo $(date) | (cd ${KANBAN} && git commit -m x)`)).toBe(true);
+    expect(fromMain(`echo $(date) | (cd ${OTHER} && git commit -m x)`)).toBe(false);
+    // And the token itself must come from the RAW text, not the mask. A quoted target masks to
+    // underscores, which resolve as a plausible RELATIVE path instead of the absolute one written —
+    // so the guard would follow the command to a directory nobody named.
+    expect(from(`echo x | (cd "${KANBAN}" && git commit -m x)`)).toBe(true);
+  });
+
+  it('treats a hidden bare cd, cd - and popd as moves it cannot name', () => {
+    expect(from('echo x | (cd && git commit -m y)')).toBe(true);
+    expect(from('echo x | (cd - && git commit -m y)')).toBe(true);
+    expect(from('echo x | (popd && git commit -m y)')).toBe(true);
+    // `popd` returns to a stack this cannot see, so its next token is never a target. Without a
+    // token after it the `!next` guard answers first, which is why this case carries one: read as a
+    // target it resolves to a real-looking directory, and a real-looking directory is never refused.
+    expect(from('echo x | (popd /tmp && git commit -m y)')).toBe(true);
+  });
+
+  it('does not read cd as a move when it is an ordinary argument', () => {
+    // Only the command position counts. Without that check this repoints the guard at the feature
+    // repo and a commit landing on main walks.
+    expect(fromMain(`ls cd ${OTHER} && git commit -m x`)).toBe(true);
+  });
+
+  it('opens a subshell frame for a paren that does not start the segment', () => {
+    // `echo x | (cd …` — the old `/^\(+/` missed it, so the matching close popped a frame nothing
+    // pushed and the move leaked out of the subshell it belonged to.
+    expect(from(`echo x | (cd ${KANBAN} && git status) && git commit -m x`)).toBe(false);
+  });
+
+  it('sees a hidden cd even when the segment also opens with an explicit one', () => {
+    expect(from(`cd /tmp | (cd ${KANBAN} && git commit -m y)`)).toBe(true);
+  });
+});
+
 // Every other suite stubs getBranch. A stub can model a contract the real resolver
 // doesn't honor — which is exactly how the cd-to-nowhere fail-open shipped green.
 // This drives the real hook binary against real repos.

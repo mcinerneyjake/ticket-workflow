@@ -290,6 +290,9 @@ describe('commandToMilestones — directory-target attribution guard (tkt-273458
       // the keyword list nor the connector pattern, so only the fused-token check catches it.
       'time (cd /repos/other && npm test)',
       'nohup (cd /repos/other && npm test)',
+      // A RELATIVE hidden target resolves to null, and an unresolvable resolution is still a MOVE.
+      // Reading null as "no move" would admit this milestone as the session's (tkt-3006d09810f7).
+      'echo x | (cd ../other && npm test)',
     ]) expect(commandToMilestones(cmd, SESSION, inSession), cmd).toEqual([]);
   });
 

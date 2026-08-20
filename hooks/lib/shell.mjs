@@ -21,6 +21,13 @@ export function resolveDir(dir, target) {
 }
 
 // The directory builtin a segment invokes, if any, plus its raw target token.
+//
+// Deliberately NOT substitution-aware: `SHA=$( cd /x && … )` — one space — reads as a move of the
+// caller here, and the spelling `$(cd` does not. That inconsistency is real and pre-dates
+// tkt-3006d09810f7, which reverted its own fix for it: identifying the name on masked text while
+// returning a masked target dropped the `$` resolveDir refuses on, and identifying it on tokens
+// rather than the whole string lost the `^[({\s]+` strip that lets `( FOO=bar cd /x` reach `cd`.
+// Both regressions were fail-opens. Fixing it needs its own adversary list, not a rider on this one.
 function dirBuiltin(segment) {
   const stripped = segment.trim().replace(/^[({\s]+/, '').replace(/[)}\s]+$/, '');
   const tokens = stripped.split(/\s+/);
@@ -41,9 +48,11 @@ export function cdTarget(segment, dir) {
 }
 
 // As cdTarget, but also `pushd`/`popd`. track-steps needs the wider net because a move it misses
-// MISFILES a milestone onto a real ticket, where the same miss only skips a check in guard-bash
-// (whose header already names pushd as a known residual). `popd` returns to a stack this does not
-// track, so it reports unresolvable rather than guessing — the fail-closed reading.
+// MISFILES a milestone onto a real ticket. guard-bash calls cdTarget, so a SEGMENT-INITIAL `pushd`
+// is invisible to it — a gap, not a documented residual: its header names neither this nor `pushd`
+// (measured, zero occurrences), and mid-segment `pushd` does reach it through hiddenDirTarget, so
+// the two positions disagree. `popd` returns to a stack this does not track, so it reports
+// unresolvable rather than guessing — the fail-closed reading.
 export function dirTarget(segment, dir) {
   const { name, target } = dirBuiltin(segment);
   if (name === 'popd') return null;
@@ -112,15 +121,70 @@ export function subshellParens(segment) {
 // must treat this as unresolvable rather than as no move.
 const DIR_BUILTINS = new Set(['cd', 'pushd', 'popd']);
 const COMMAND_POSITION = new Set(['|', '||', '&', '&&', ';', '{', '(', 'then', 'do', 'else', 'elif']);
-export function hiddenDirMove(segment) {
-  const tokens = segment.trim().split(/\s+/).filter(Boolean);
-  for (let i = 1; i < tokens.length; i++) {
-    const bare = tokens[i].replace(/^[({]+/, '');
+
+// Text that is DATA rather than this segment's command: a `cd` in a commit message moved nothing,
+// and one inside `$( … )` moves a subshell that exits before the next command runs. Masked to a
+// filler rather than deleted, and LENGTH-PRESERVING, for two reasons: the check below reads the
+// PREVIOUS token to decide whether a `cd` sits in command position, so collapsing a span would fuse
+// its neighbours and invent one; and callers recover a raw token by slicing the original at the
+// masked offsets. guard-bash refuses a commit on these answers, so a false positive blocks a
+// legitimate commit whose message merely contains `&& cd` (tkt-3006d09810f7).
+//
+function maskData(segment) {
+  let out = '';
+  let sq = false, dq = false, subst = 0;
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i];
+    if (sq) { out += '_'; if (c === "'") sq = false; continue; }
+    if (c === "'" && !dq) { out += '_'; sq = true; continue; }
+    if (c === '"' && subst === 0) { out += '_'; dq = !dq; continue; }
+    // Two characters for two, because hiddenDirTarget recovers a raw token by slicing the ORIGINAL
+    // at these offsets: a one-character shift yields a different, real-looking directory.
+    if (c === '$' && segment[i + 1] === '(') { out += '__'; subst++; i++; continue; }
+    if (subst > 0) {
+      if (c === '(') subst++;
+      else if (c === ')') subst--;
+      out += '_';
+      continue;
+    }
+    out += dq ? '_' : c;
+  }
+  return out;
+}
+
+// Tokens of `masked`, each carrying the offsets that locate it in the ORIGINAL string.
+function tokensWithIndex(masked) {
+  const out = [];
+  for (const m of masked.matchAll(/\S+/g)) out.push({ text: m[0], start: m.index, end: m.index + m[0].length });
+  return out;
+}
+
+// The directory a hidden move lands in: undefined = no hidden move, null = one we cannot name.
+// Returning the TARGET rather than a boolean is what keeps this from wedging legitimate work —
+// guard-bash blocks on an unnameable directory, and `echo x | (cd /some/repo && …)` names one
+// perfectly well (tkt-3006d09810f7).
+export function hiddenDirTarget(segment, dir) {
+  const toks = tokensWithIndex(maskData(segment));
+  for (let i = 1; i < toks.length; i++) {
+    const bare = toks[i].text.replace(/^[({]+/, '');
     if (!DIR_BUILTINS.has(bare)) continue;
     // Grouping punctuation fused to the word (`(cd`) is itself the command position. Otherwise the
     // previous token must be one — so `git commit -m "x cd y"` stays a commit, not a move.
-    if (tokens[i] !== bare) return true;
-    if (COMMAND_POSITION.has(tokens[i - 1]) || /[|&;({]$/.test(tokens[i - 1])) return true;
+    const fused = toks[i].text !== bare;
+    if (!fused && !(COMMAND_POSITION.has(toks[i - 1].text) || /[|&;({]$/.test(toks[i - 1].text))) continue;
+    if (bare === 'popd') return null; // returns to a stack this does not track
+    const next = toks[i + 1];
+    if (!next) return null;
+    // The raw token, not the masked one: a quoted path must reach resolveDir with its quotes.
+    const target = segment.slice(next.start, next.end).replace(/[)}]+$/, '');
+    if (!target || target.startsWith('-')) return null;
+    return resolveDir(dir, target);
   }
-  return false;
+  return undefined;
+}
+
+// One implementation, so the two cannot drift: any resolution — including an unresolvable one — is
+// still a move, and only `undefined` means there was none.
+export function hiddenDirMove(segment) {
+  return hiddenDirTarget(segment, null) !== undefined;
 }
