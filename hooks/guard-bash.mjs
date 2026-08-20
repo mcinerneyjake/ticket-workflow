@@ -37,7 +37,7 @@ import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { isMain } from './lib/is-main.mjs';
 import { hasRemote, protectedBranches } from './lib/default-branch.mjs';
-import { cdTarget, resolveDir, splitSegments } from './lib/shell.mjs';
+import { cdTarget, hiddenDirTarget, resolveDir, splitSegments, subshellParens } from './lib/shell.mjs';
 
 // Pull the git subcommand + its args out of a single shell segment. The command
 // WORD must be `git` (after stripping leading subshell/group punctuation and
@@ -173,6 +173,9 @@ export function destructiveGitReason(sub, args) {
 // supply it gets today's semantics rather than a silently relaxed guard. main() injects the real one.
 const DEFAULT_REPO = () => ({ hasRemote: true, protectedBranches: ['main'] });
 
+const UNRESOLVABLE_MOVE =
+  'A `cd` behind a pipeline or compound statement moves somewhere this guard cannot name, so the commit/push after it cannot be checked against the never-commit-to-main rule. Refusing rather than guessing: a move it cannot follow would otherwise be judged against the session repo, which is a feature branch while a ticket is being worked — i.e. allowed. Re-run it as a plain `cd <dir> && git …` chain, so the directory the commit lands in is the one this guard reads.';
+
 export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
   if (typeof command !== 'string' || !command.trim()) return { blocked: false };
 
@@ -182,7 +185,11 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
   const segments = splitSegments(command);
 
   let dir = startDir ?? null;
-  const outer = []; // dirs saved at `(` — a real shell restores cwd when the subshell exits
+  // Tracked separately from `dir`, never inferred from it: a null `dir` alone falls back to the
+  // SESSION repo, which while a ticket is being worked is a feature branch — the permissive answer.
+  // So "moved somewhere I cannot name" and "never moved" must not compare equal (tkt-3006d09810f7).
+  let unknownDir = false;
+  const outer = []; // [dir, unknownDir] saved at `(` — a real shell restores cwd when the subshell exits
   const branches = new Map(); // dir -> effective branch; memoized, so one lookup per repo
   const branchFor = (d) => {
     if (!branches.has(d)) branches.set(d, getBranch(d));
@@ -195,16 +202,30 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
   };
 
   for (const segment of segments) {
-    for (let i = (segment.match(/^\(+/)?.[0].length) ?? 0; i > 0; i--) outer.push(dir);
+    // Counted quote- and substitution-aware, never regex-matched: splitSegments keeps a `$( … )`
+    // intact, so a segment can END in a `)` that closes no subshell (`export SHA=$(date)`). Popping
+    // on it restored the pre-`cd` directory, and the commit after it was judged against the session.
+    const parens = subshellParens(segment);
+    for (let i = parens.open; i > 0; i--) outer.push([dir, unknownDir]);
 
     const moved = cdTarget(segment, dir);
     if (moved !== undefined) {
+      // An unresolvable explicit cd deliberately does NOT set unknownDir: that keeps the
+      // fall-back-to-session behaviour this hook's header calls a known residual and kanban's
+      // settings.audit.test.mjs pins. Latching it here would also refuse `cd "<path with a space>"
+      // && git commit` — a directory that is perfectly nameable and merely unparsed. Only a move
+      // this parser cannot even locate (below) latches (tkt-3006d09810f7).
       dir = moved;
     } else {
       const git = parseGit(segment);
       if (git) {
         const { sub, args, repoDir } = git;
         const gitDir = repoDir ? resolveDir(dir, repoDir) : dir; // -C acts on that repo, whatever the cwd
+        // Scoped to commit/push and checked before the rules, like the branch===null refusal they
+        // share a reason with: an unknown directory must not wedge `git status`, but it must never
+        // buy a commit an exemption. An absolute `-C` still names its repo, so it is unaffected.
+        if (unknownDir && gitDir === null && (sub === 'commit' || sub === 'push'))
+          return { blocked: true, reason: UNRESOLVABLE_MOVE };
         const verdict = ruleFor(sub, args, branchFor(gitDir), () => repoFor(gitDir));
         if (verdict) return { blocked: true, reason: verdict };
         // Only switch/checkout needs the repo shape here; computing it for every segment would put
@@ -216,7 +237,19 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
       }
     }
 
-    for (let i = (segment.match(/\)+$/)?.[0].length) ?? 0; i > 0 && outer.length; i--) dir = outer.pop();
+    // A `cd` that is not the segment's first word — behind a pipeline, a `do`/`then`, or a command
+    // word like `time (cd …`. Runs for EVERY segment, outside both branches above: an `else` on the
+    // git branch hid it behind a `git`-led segment, and an `else` on the cd branch hid it behind a
+    // leading one (`cd /tmp | (cd <repo-on-main> && git commit)`). Applied after the rules, never
+    // instead of them — it follows that first word's command, so `git commit -m x | (cd /elsewhere)`
+    // is still judged where it commits.
+    const hidden = hiddenDirTarget(segment, dir);
+    if (hidden !== undefined) {
+      dir = hidden;
+      unknownDir = hidden === null;
+    }
+
+    for (let i = parens.close; i > 0 && outer.length; i--) [dir, unknownDir] = outer.pop();
   }
 
   return { blocked: false };
