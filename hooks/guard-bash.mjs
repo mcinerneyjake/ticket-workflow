@@ -25,10 +25,14 @@
 //
 // Protocol: read the hook payload as JSON on stdin, inspect
 // `tool_input.command`. Exit 0 to allow; exit 2 to block (stderr is surfaced to
-// Claude so it can self-correct). Anything unexpected → allow (fail open: a
-// guardrail must never wedge legitimate work) — EXCEPT an unresolvable branch on
-// commit/push, which fails CLOSED, because that is the one unknown that silently
-// disables the rule it guards (tkt-fbc74a3252fe). The decision logic
+// Claude so it can self-correct). An unparseable PAYLOAD → allow (fail open: a
+// guardrail must never wedge legitimate work). Several individual rules go the
+// other way, failing CLOSED wherever an unknown would silently disable the rule
+// it guards: the current BRANCH (tkt-fbc74a3252fe), which branch this repo
+// PROTECTS, a DIRECTORY move this parser located but could not name
+// (tkt-3006d09810f7), and `git switch -`, whose destination is unknowable and is
+// therefore assumed protected. Do NOT restate that as a count — the README said
+// one, then three, and review found each an undercount. The decision logic
 // (parseGit / decide) is exported and pure so it can be unit-tested without
 // spawning a subprocess; the stdin/exit wiring runs only when this file is
 // executed directly as the hook entrypoint.

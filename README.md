@@ -267,8 +267,16 @@ non-blocking and visible.
 Two honest limits on that table:
 
 - It describes what happens when a hook cannot **load**. It is not a claim about each hook's internal
-  behaviour: `guard-bash`, once loaded, deliberately exits 0 on a payload it cannot parse, and only
-  its unresolvable-branch rule fails closed. `guard-ticket` and `guard-review-target` do fail closed
+  behaviour: `guard-bash`, once loaded, deliberately exits 0 on a payload it cannot **parse** — but
+  several of its own rules then fail **closed**, wherever an unknown would otherwise silently disable
+  the rule it guards. An unresolvable current branch, a protected branch it cannot identify, a
+  directory move it located but could not name, and `git switch -`, whose destination is unknowable
+  so it is assumed protected. **Read that as a design principle, not a closed list, and never as a
+  count** — this sentence has claimed one, then three, and each was an undercount found by review
+  (`tkt-3006d09810f7`). "Anything unexpected fails open" is not a safe reading either: `hasRemote`
+  returns true on any error, and an unreadable directory falls back to the *session* repo's branch,
+  which can block a commit that was never going near a protected branch. Check the code.
+  `guard-ticket` and `guard-review-target` do fail closed
   internally. `guard-subagent-gates` is split: it fails **closed** when it knows the rule applies (a
   subagent whose command it cannot read) and **exits 1** when it cannot even establish that (an
   unparseable payload) — blocking there would wedge every main-thread command over a case the rule
