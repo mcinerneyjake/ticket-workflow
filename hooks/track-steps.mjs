@@ -96,39 +96,48 @@ function matchStep(t) {
   return null;
 }
 
-// Every milestone a command records for the SESSION's repo, in first-seen order.
+// Every milestone a command records, in first-seen order, each paired with the directory it acted
+// on: a resolved absolute path, or `undefined` when the command neither moved nor named one and so
+// acts on the caller's own cwd by construction.
 //
-// This hook attributes by the session's branch, so a milestone from a command that ran somewhere
-// else would be filed under whatever ticket that branch names — a real ticket showing a pipeline it
-// never ran (tkt-2734584f8715). A segment that moved, or that named a directory, therefore records
-// NOTHING unless that directory is proven to be the session's: a gap reads as a gap, while a
-// misfiled row is false evidence indistinguishable from a real one. "Unproven" covers an
-// unresolvable target, an absent or non-boolean predicate, and a target that resolves elsewhere —
-// "can't tell" must never take the permissive branch. A segment that neither moved nor named a
-// directory needs no proof and consults nothing: it is the session's cwd by construction.
+// A milestone belongs to the ticket named by the branch of the repo it RAN IN — not the session's.
+// Attributing by the session's branch filed foreign work under whatever ticket that branch happened
+// to name: a real ticket showing a pipeline it never ran (tkt-2734584f8715). Refusing those closed
+// the corruption but left a gap, since the work did happen and does belong somewhere; resolving the
+// directory here lets the caller find that somewhere (tkt-8ada0242e94e).
+//
+// An UNRESOLVABLE directory records nothing, and is dropped here rather than returned: a caller
+// that received it could only guess, and the one guess available — the session — is the original
+// bug. "Can't tell" must never take the permissive branch. Unresolvable covers `cd -`, `popd`, a
+// quoted or whitespace-split path, a variable, and a move hidden behind a pipeline.
+//
+// WHAT THAT LIST DOES NOT COVER, and it is a real cost of attributing rather than refusing: a `cd`
+// that is DATA still parses as a move, and is now credited to the directory it names instead of
+// being dropped. Two spellings do it — `VAR=$( cd /x && … )` (the space matters; `$(cd` and
+// `export VAR=$( cd` both read correctly), because dirBuiltin is deliberately not
+// substitution-aware; and a heredoc body line, because splitSegments splits on newline. Under the
+// refuse-everything predecessor both merely dropped. The root cause is shared with guard-bash via
+// dirTarget and is tkt-b9c0eda6c630, whose two previous fixes were reverted as fail-opens — so it
+// is not a rider on this. A wrongly-named directory only misfiles if it is a real repo whose
+// branch names a real ticket; otherwise it still drops.
 //
 // Segment splitting, directory tracking and subshell restore are guard-bash's, via lib/shell.mjs:
-// the naive split let quoted data (`echo "x && cd <session> && npm test"`) forge a segment that
-// cleared the guard, and without the `outer` stack a subshell that cd'd home stayed home after it
-// exited. `dirTarget` widens guard-bash's `cd` to `pushd`/`popd` — see its comment for why the two
-// hooks need different nets.
+// the naive split let quoted data (`echo "x && cd /elsewhere && npm test"`) forge a segment, and
+// without the `outer` stack a subshell that cd'd away stayed away after it exited. `dirTarget`
+// widens guard-bash's `cd` to `pushd`/`popd` — see its comment for why the two hooks differ.
 //
 // KNOWN RESIDUAL: the Bash tool's cwd can persist ACROSS tool calls, and `payload.cwd` is the
 // project dir (guard-bash.mjs says so, verified 2026-07-15), so a `cd` in one call followed by a
-// bare `npm test` in the next arrives here with no directory segment at all and is admitted. That
-// shape is invisible in the payload; nothing below can close it.
-//
-// `isSessionRepo` is injected to keep this pure, and is consulted ONLY for a segment that produced
-// a milestone AND either moved or named a directory — so an ordinary `npm test`, and a
-// non-milestone `cd sub && ls`, still reach no git subprocess at all.
-export function commandToMilestones(command, startDir, isSessionRepo) {
+// bare `npm test` in the next arrives here with no directory segment at all and is attributed to
+// the session. That shape is invisible in the payload; nothing below can close it.
+export function commandToMilestones(command, startDir) {
   if (typeof command !== 'string' || !command.trim()) return [];
 
-  const candidates = [];
+  const found = [];
   let dir = typeof startDir === 'string' ? startDir : null;
   // Tracked SEPARATELY from `dir`, never inferred from it: with `cd -` (unresolvable -> null) and a
-  // null startDir, a `dir === startDir` test reads as "never moved" and admits the segment with no
-  // check at all. Two different unknowns must not compare equal.
+  // null startDir, a `dir === startDir` test reads as "never moved" and would report the session.
+  // Two different unknowns must not compare equal.
   let moved = false;
   const outer = []; // [dir, moved] saved at `(` — a real shell restores cwd when the subshell exits
   for (const segment of splitSegments(command)) {
@@ -146,32 +155,28 @@ export function commandToMilestones(command, startDir, isSessionRepo) {
       const hit = matchStep(tokenize(segment));
       if (hit) {
         const named = hit.dirToken !== undefined;
-        const actsOn = !named ? dir : (hit.dirToken === null ? null : resolveDir(dir, hit.dirToken));
-        // A named directory always needs proving, even from an unmoved cwd: `npm test --prefix
-        // <other>` never moved the shell, yet it ran in another repo.
-        candidates.push({ step: hit.step, actsOn, needsProof: moved || named });
+        // A named directory is resolved even from an unmoved cwd: `npm test --prefix <other>` never
+        // moved the shell, yet it ran in another repo.
+        if (!moved && !named) found.push({ step: hit.step, dir: undefined });
+        else {
+          const actsOn = !named ? dir : (hit.dirToken === null ? null : resolveDir(dir, hit.dirToken));
+          if (actsOn !== null) found.push({ step: hit.step, dir: actsOn });
+        }
       }
     }
 
     for (let i = parens.close; i > 0 && outer.length; i--) [dir, moved] = outer.pop();
   }
-  if (candidates.length === 0) return [];
 
-  const known = new Map(); // dir -> ours?; memoized, so one lookup per repo however long the chain
-  const ours = (d) => {
-    if (typeof d !== 'string' || typeof isSessionRepo !== 'function') return false;
-    if (!known.has(d)) known.set(d, isSessionRepo(d) === true); // non-boolean = can't tell = no
-    return known.get(d);
-  };
-
-  const steps = [];
-  for (const { step, actsOn, needsProof } of candidates) {
-    // Nothing moved and nothing was named => the session's cwd by construction, which is what keeps
-    // the common command free of git subprocesses.
-    if (needsProof && !ours(actsOn)) continue;
-    if (!steps.includes(step)) steps.push(step);
-  }
-  return steps;
+  // Deduped per directory, not globally: the same step in two repos is two milestones, and only the
+  // caller can tell whether two directories are one repo.
+  const seen = new Set();
+  return found.filter(({ step, dir: d }) => {
+    const key = `${d ?? ''}\u0000${step}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 // The ticket id embedded in a <type>/<id>-<slug> branch name, or null when the
@@ -221,21 +226,6 @@ function currentBranch(cwd) {
   }
 }
 
-// The repo root of `dir`, or null when it is not a repo / cannot be read. Two
-// dirs are the same repo when their roots match — compared by ROOT, not by
-// path, so a `cd` into a subdirectory is still the session's repo.
-function repoRoot(dir) {
-  try {
-    return execSync('git rev-parse --show-toplevel', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      ...(dir ? { cwd: dir } : {}),
-    }).trim() || null;
-  } catch {
-    return null;
-  }
-}
-
 // Mirror server/paths.ts precedence so the hook and the MCP service write to the
 // same per-repo events/ dir (BOARD_DIR_OVERRIDE ?? CLAUDE_PROJECT_DIR ?? cwd).
 function eventsDir() {
@@ -264,22 +254,33 @@ export function main() {
     // Cheap match FIRST so non-milestone commands short-circuit before the
     // git subprocess — no per-command latency for the 99% that aren't gates.
     const startDir = payload?.cwd ?? process.cwd();
-    // Lazy + memoized: the predicate is reached only by a milestone that moved or named a
-    // directory, so an ordinary command still spawns no git subprocess at all.
-    let sessionRoot;
-    const isSessionRepo = (d) => {
-      if (sessionRoot === undefined) sessionRoot = repoRoot(startDir);
-      return sessionRoot !== null && repoRoot(d) === sessionRoot;
-    };
-    const steps = commandToMilestones(payload?.tool_input?.command, startDir, isSessionRepo);
-    if (steps.length > 0) {
-      const ticketId = extractTicketId(currentBranch(startDir));
-      if (ticketId) {
-        const exitCode = payload?.tool_response?.exit_code;
-        const state = stateFromExit(typeof exitCode === 'number' ? exitCode : 0);
-        const at = new Date().toISOString();
-        for (const r of recordsFor(steps, state)) record(ticketId, r.step, r.state, at);
+    const milestones = commandToMilestones(payload?.tool_input?.command, startDir);
+    if (milestones.length > 0) {
+      const exitCode = payload?.tool_response?.exit_code;
+      const state = stateFromExit(typeof exitCode === 'number' ? exitCode : 0);
+      const at = new Date().toISOString();
+      // Resolved PER milestone, not once for the command: one compound command can legitimately
+      // touch two repos, and each half belongs to its own repo's ticket (tkt-8ada0242e94e).
+      // Memoized by directory, so the ordinary single-directory command still spawns one git.
+      const branchTicket = new Map();
+      const ticketFor = (d) => {
+        const from = d ?? startDir; // `undefined` => the session's cwd, by construction
+        if (!branchTicket.has(from)) branchTicket.set(from, extractTicketId(currentBranch(from)));
+        return branchTicket.get(from);
+      };
+      // Grouped so recordsFor sees each ticket's own steps in order — it inserts `review` before a
+      // passing `commit`, which must land on the ticket that was committed, not the session's.
+      const byTicket = new Map();
+      for (const { step, dir } of milestones) {
+        const ticketId = ticketFor(dir);
+        if (!ticketId) continue; // no repo, or a branch naming no ticket => nothing to attribute to
+        const steps = byTicket.get(ticketId) ?? [];
+        // Two directories can be one repo (a subdirectory), so the same step can arrive twice.
+        if (!steps.includes(step)) steps.push(step);
+        byTicket.set(ticketId, steps);
       }
+      for (const [ticketId, steps] of byTicket)
+        for (const r of recordsFor(steps, state)) record(ticketId, r.step, r.state, at);
     }
   } catch {
     // best-effort: telemetry must never disrupt the tool
