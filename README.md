@@ -19,10 +19,18 @@ It ships three pieces:
 - **Hooks** (`hooks/`) — a `PreToolUse` **guard** (`guard-bash.mjs`) that blocks
   whole-tree staging and commits/pushes to `main`; a `PostToolUse` **tracker**
   (`track-steps.mjs`) that records pipeline milestones (branch, typecheck, lint,
-  test, commit, PR) by watching the commands you run; and an opt-in `PreToolUse`
-  guard (`guard-ticket.mjs`) that blocks `create_ticket` so new tickets are
-  authored by a metered local-LLM intake agent instead of by the model driving
-  the session; and a `SessionStart` **staleness warning**
+  test, commit, PR) by watching the commands you run — each attributed to the
+  ticket named by the branch of the repo the command *actually ran in*, so a
+  `cd` or `--prefix` into another repo is credited to that repo's ticket rather
+  than the session's, and a directory it cannot resolve records nothing at all.
+  The events *directory* is still resolved once from the hook's own environment,
+  never per milestone, so that attribution is end-to-end only on a shared board
+  (`BOARD_DIR_OVERRIDE`); with a board per repo the row lands in the session's
+  `events/` under the other repo's ticket id, where nothing joins to it;
+  and an opt-in `PreToolUse` guard (`guard-ticket.mjs`) that blocks
+  `create_ticket` so new tickets are authored by a metered local-LLM intake
+  agent instead of by the model driving the session; and a `SessionStart`
+  **staleness warning**
   (`warn-stale-worktree.mjs`) that reports when the session opened in a git
   worktree whose `CLAUDE.md` / `AGENTS.md` / `.cursorrules` has since changed on
   the base branch — a stale instruction file does not fail, it *instructs*. It
