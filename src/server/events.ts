@@ -39,6 +39,9 @@ export async function appendEvent(event: {
   state: string
   at?: string
   detail?: string
+  /** Only a writer that derived `state` from a delivered hook event may set this; `verify` reads it
+   *  as provenance. The service's own status milestones carry no outcome and must leave it unset. */
+  outcomeFrom?: 'event'
 }): Promise<void> {
   const file = eventsPath(event.ticketId);
   if (!isStepId(event.step)) throw new HttpError(400, `Invalid step: ${event.step}`);
@@ -49,6 +52,7 @@ export async function appendEvent(event: {
     state: event.state,
     at: event.at ?? new Date().toISOString(),
     ...(event.detail ? { detail: event.detail } : {}),
+    ...(event.outcomeFrom === 'event' ? { outcomeFrom: 'event' as const } : {}),
   };
   await fs.mkdir(getEventsDir(), { recursive: true });
   // flag 'a' = O_APPEND: line-atomic across the two writer processes.
@@ -56,7 +60,7 @@ export async function appendEvent(event: {
 }
 
 // A JSONL line with keys present but not type-checked; in-narrowed, no cast.
-type RawEvent = { ticketId: unknown; step: unknown; state: unknown; at: unknown; detail?: unknown }
+type RawEvent = { ticketId: unknown; step: unknown; state: unknown; at: unknown; detail?: unknown; outcomeFrom?: unknown }
 
 function asRawEvent(v: unknown): RawEvent | null {
   if (typeof v !== 'object' || v === null) return null;
@@ -94,6 +98,10 @@ function parseEventLine(line: string): ParsedLine {
       state: raw.state,
       at: raw.at,
       ...(typeof raw.detail === 'string' ? { detail: raw.detail } : {}),
+      // Whitelisted through deliberately: this is what lets `verify` tell a row whose state was
+      // derived from the delivered event from a pre-fix row that said `passed` regardless. Any
+      // other value is dropped, so a forged or unknown marker reads as absent — untrusted.
+      ...(raw.outcomeFrom === 'event' ? { outcomeFrom: 'event' as const } : {}),
     },
   };
 }

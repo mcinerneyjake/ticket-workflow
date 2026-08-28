@@ -7,7 +7,7 @@
 
 import { listBoard, HttpError } from '../server/tickets.js';
 import { readEvents, REVIEW_CLEARED } from '../server/events.js';
-import { parseTestsClaim, type TicketFacts } from './rules.js';
+import { HOOK_ONLY_STEPS, parseTestsClaim, type TicketFacts } from './rules.js';
 
 export interface GatherOptions {
   /**
@@ -64,15 +64,22 @@ export async function gatherTicketFacts(opts: GatherOptions = {}): Promise<Gathe
       // Caught PER TICKET, and turned into an honest UNKNOWN rather than swallowed. Letting it
       // propagate discards the finished report for every other ticket on a 700-ticket board because
       // one log was unreadable — while pretending the log was empty would be the permissive answer.
-      facts.push({ ...base, steps: {}, skippedLines: 0, unrecognizedLines: 0, unreadableLog: true });
+      facts.push({ ...base, steps: {}, skippedLines: 0, unrecognizedLines: 0, unreadableLog: true, trustedSteps: {} });
       continue;
     }
+    // Trust is recorded PER STEP and read from the same event that supplied the step's state, so
+    // the two can never come from different rows. Only hook-written steps carry an outcome at all;
+    // the service writes started/qa/done, which assert nothing about how a command went.
+    const trustedSteps: Record<string, boolean> = {};
     const steps: Record<string, string> = {};
     // Last write wins, and a `cleared` marker reverts the step — mirroring reducePipeline, so this
     // predicate and the pipeline the board renders can never disagree about what a step's state is.
-    for (const e of events) steps[e.step] = e.detail === REVIEW_CLEARED ? '' : e.state;
-    for (const [k, v] of Object.entries(steps)) if (v === '') delete steps[k];
-    facts.push({ ...base, steps, skippedLines: skipped, unrecognizedLines: unrecognized, unreadableLog: false });
+    for (const e of events) {
+      steps[e.step] = e.detail === REVIEW_CLEARED ? '' : e.state;
+      if (HOOK_ONLY_STEPS.some((s) => s === e.step)) trustedSteps[e.step] = e.outcomeFrom === 'event';
+    }
+    for (const [k, v] of Object.entries(steps)) if (v === '') { delete steps[k]; delete trustedSteps[k]; }
+    facts.push({ ...base, steps, skippedLines: skipped, unrecognizedLines: unrecognized, unreadableLog: false, trustedSteps });
   }
   return { facts, unreadable: unreadable.length };
 }

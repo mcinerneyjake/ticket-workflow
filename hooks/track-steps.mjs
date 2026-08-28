@@ -18,16 +18,20 @@
 // branch-correlation this hook relies on wouldn't resolve the ticket anyway.
 //
 // Protocol: read the hook payload as JSON on stdin; map tool_input.command to
-// milestone(s) and tool_response.exit_code to pass/fail. The mapping functions
-// (commandToMilestones / extractTicketId / stateFromExit) are exported and pure
-// so they can be unit-tested without spawning a subprocess; the stdin/append
-// wiring runs only when this file is executed directly as the hook entrypoint.
+// milestone(s) and the DELIVERED EVENT to pass/fail. `tool_response` carries no
+// exit status of any kind — `PostToolUse` fires only when a tool call succeeds
+// and a failed one is dispatched to `PostToolUseFailure`, a separate
+// subscription, so the event name is the whole outcome signal (tkt-31f693ac8bb0).
+// The mapping functions (commandToMilestones / extractTicketId / stateFromEvent)
+// are exported and pure so they can be unit-tested without spawning a
+// subprocess; the stdin/append wiring runs only when this file is executed
+// directly as the hook entrypoint.
 
 import { readFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import path from 'node:path';
 import { isMain } from './lib/is-main.mjs';
-import { dirTarget, hiddenDirMove, resolveDir, splitSegments, subshellParens } from './lib/shell.mjs';
+import { dirTarget, hasTopLevelBackground, hasTopLevelPipe, hiddenDirMove, resolveDir, splitSegmentsWithOps, subshellParens } from './lib/shell.mjs';
 
 // The milestones this hook can emit. MUST stay a subset of shared/constants.ts
 // STEP_IDS — track-steps.test.mjs asserts parity so the two can't drift.
@@ -133,6 +137,29 @@ function matchStep(t) {
 export function commandToMilestones(command, startDir) {
   if (typeof command !== 'string' || !command.trim()) return [];
 
+  const segs = splitSegmentsWithOps(command);
+  // Whether each segment's OWN exit status reaches the tool call. The last segment's does; an
+  // earlier one's does only through an unbroken `&&` chain to it, because `;` and `||` both run what
+  // follows regardless of how it went. Kept separate from the pipe/background test below because a
+  // masked segment still passes the chain on: in `a && (b | c)` the command succeeding still proves
+  // `a` exited 0, even though it was c's exit the tool reported (tkt-31f693ac8bb0).
+  //
+  // Two ways a segment's status fails to reach the caller even so, both of which record `passed`
+  // for work that never happened if ignored:
+  //   - it sits after `||`, so it runs only when its predecessor FAILED. `gh pr view || gh pr
+  //     create` exits 0 with `gh pr create` never executed.
+  //   - anything in the command backgrounds. A bare `&` backgrounds the whole AND-OR list it
+  //     terminates, not merely the segment holding it, so `npm run lint && npm test &` returns 0
+  //     before `lint` has finished. Disqualifying the entire command is deliberately broader than
+  //     the shell's own scoping: it drops telemetry, which is the recoverable direction.
+  const backgrounded = segs.some((seg) => hasTopLevelBackground(seg.text));
+  const chainToEnd = new Array(segs.length).fill(false);
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const ranUnconditionally = i === 0 || segs[i - 1].opAfter !== '||';
+    const reachesEnd = i === segs.length - 1 || (segs[i].opAfter === '&&' && chainToEnd[i + 1]);
+    chainToEnd[i] = !backgrounded && ranUnconditionally && reachesEnd;
+  }
+
   const found = [];
   let dir = typeof startDir === 'string' ? startDir : null;
   // Tracked SEPARATELY from `dir`, never inferred from it: with `cd -` (unresolvable -> null) and a
@@ -140,7 +167,9 @@ export function commandToMilestones(command, startDir) {
   // Two different unknowns must not compare equal.
   let moved = false;
   const outer = []; // [dir, moved] saved at `(` — a real shell restores cwd when the subshell exits
-  for (const segment of splitSegments(command)) {
+  for (let si = 0; si < segs.length; si++) {
+    const segment = segs[si].text;
+    const exitObservable = chainToEnd[si] && !hasTopLevelPipe(segment);
     const parens = subshellParens(segment);
     for (let i = parens.open; i > 0; i--) outer.push([dir, moved]);
 
@@ -157,10 +186,10 @@ export function commandToMilestones(command, startDir) {
         const named = hit.dirToken !== undefined;
         // A named directory is resolved even from an unmoved cwd: `npm test --prefix <other>` never
         // moved the shell, yet it ran in another repo.
-        if (!moved && !named) found.push({ step: hit.step, dir: undefined });
+        if (!moved && !named) found.push({ step: hit.step, dir: undefined, exitObservable });
         else {
           const actsOn = !named ? dir : (hit.dirToken === null ? null : resolveDir(dir, hit.dirToken));
-          if (actsOn !== null) found.push({ step: hit.step, dir: actsOn });
+          if (actsOn !== null) found.push({ step: hit.step, dir: actsOn, exitObservable });
         }
       }
     }
@@ -170,13 +199,41 @@ export function commandToMilestones(command, startDir) {
 
   // Deduped per directory, not globally: the same step in two repos is two milestones, and only the
   // caller can tell whether two directories are one repo.
-  const seen = new Set();
-  return found.filter(({ step, dir: d }) => {
-    const key = `${d ?? ''}\u0000${step}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+  // Observability is OR'd across duplicates rather than taken from the first: in
+  // `npm test | tail && npm test` the same step is masked once and observable once, and the second
+  // run really did exit 0.
+  const seen = new Map();
+  const deduped = [];
+  for (const m of found) {
+    const key = `${m.dir ?? ''}\u0000${m.step}`;
+    const prev = seen.get(key);
+    if (prev) {
+      if (m.exitObservable) prev.exitObservable = true;
+      continue;
+    }
+    const rec = { ...m };
+    seen.set(key, rec);
+    deduped.push(rec);
+  }
+  return deduped;
+}
+
+// Segments that are neither a directory move nor a recognised milestone. On a FAILED event these
+// are candidates the failure could belong to and that nothing in the payload can name, so their
+// presence makes the failure unattributable: `npm ci && npm test` carries ONE milestone, and
+// crediting `test: failed` to it when `npm ci` was what broke accuses a gate that never ran
+// (tkt-31f693ac8bb0). A directory builtin is excluded because `cd <target> && npm test` is the
+// workflow's own foreign-mode form; a failing `cd` misattributes, which is the fail-closed
+// direction and is the price of recording that shape at all.
+export function opaqueSegments(command) {
+  if (typeof command !== 'string') return 0;
+  let n = 0;
+  for (const { text } of splitSegmentsWithOps(command)) {
+    if (dirTarget(text, null) !== undefined || hiddenDirMove(text)) continue;
+    if (matchStep(tokenize(text))) continue;
+    n++;
+  }
+  return n;
 }
 
 // The ticket id embedded in a <type>/<id>-<slug> branch name, or null when the
@@ -188,9 +245,14 @@ export function extractTicketId(branch) {
   return m ? m[0] : null;
 }
 
-// A completed command's exit code -> milestone state.
-export function stateFromExit(exitCode) {
-  return exitCode === 0 ? 'passed' : 'failed';
+// The delivered hook event -> milestone state, or null when this hook cannot know the outcome.
+// `null` is the whole point: the payload carries no exit status, so an unrecognised event has no
+// outcome to report, and `passed` is the permissive answer that produced 4,635 command milestones
+// with zero failures among them (tkt-31f693ac8bb0).
+export function stateFromEvent(eventName) {
+  if (eventName === 'PostToolUse') return 'passed';
+  if (eventName === 'PostToolUseFailure') return 'failed';
+  return null;
 }
 
 // The milestone records to append for a completed command. A successful
@@ -239,7 +301,11 @@ function record(ticketId, step, state, at) {
   if (!ID_RE.test(ticketId)) return;
   const dir = eventsDir();
   mkdirSync(dir, { recursive: true });
-  const line = `${JSON.stringify({ ticketId, step, state, at })}\n`;
+  // Provenance, not decoration: `verify` must be able to tell a row whose state came from the
+  // delivered event from the pre-fix rows that said `passed` regardless. A DATE cannot do it — the
+  // writer is per-machine and unversioned, so a machine that never bumps its pin keeps writing
+  // success-only rows that a cutover date would start trusting (tkt-31f693ac8bb0).
+  const line = `${JSON.stringify({ ticketId, step, state, at, outcomeFrom: 'event' })}\n`;
   appendFileSync(path.join(dir, `${ticketId}.jsonl`), line, { encoding: 'utf8', flag: 'a' });
 }
 
@@ -254,10 +320,16 @@ export function main() {
     // Cheap match FIRST so non-milestone commands short-circuit before the
     // git subprocess — no per-command latency for the 99% that aren't gates.
     const startDir = payload?.cwd ?? process.cwd();
-    const milestones = commandToMilestones(payload?.tool_input?.command, startDir);
-    if (milestones.length > 0) {
-      const exitCode = payload?.tool_response?.exit_code;
-      const state = stateFromExit(typeof exitCode === 'number' ? exitCode : 0);
+    const state = stateFromEvent(payload?.hook_event_name);
+    const milestones = state === null ? [] : commandToMilestones(payload?.tool_input?.command, startDir);
+    // On failure the shell stopped at SOME command and nothing in the payload says which, so the
+    // failure is attributable only when the command carries exactly one milestone to attribute it
+    // to. On success an unbroken `&&` chain proves every link exited 0, so each is recorded.
+    const command = payload?.tool_input?.command;
+    const unattributableFailure =
+      state === 'failed' && (milestones.length !== 1 || opaqueSegments(command) > 0);
+    const attributable = unattributableFailure ? [] : milestones.filter((m) => m.exitObservable);
+    if (attributable.length > 0) {
       const at = new Date().toISOString();
       // Resolved PER milestone, not once for the command: one compound command can legitimately
       // touch two repos, and each half belongs to its own repo's ticket (tkt-8ada0242e94e).
@@ -271,7 +343,7 @@ export function main() {
       // Grouped so recordsFor sees each ticket's own steps in order — it inserts `review` before a
       // passing `commit`, which must land on the ticket that was committed, not the session's.
       const byTicket = new Map();
-      for (const { step, dir } of milestones) {
+      for (const { step, dir } of attributable) {
         const ticketId = ticketFor(dir);
         if (!ticketId) continue; // no repo, or a branch naming no ticket => nothing to attribute to
         const steps = byTicket.get(ticketId) ?? [];

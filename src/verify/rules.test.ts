@@ -20,6 +20,9 @@ const BASE: TicketFacts = {
   skippedLines: 0,
   unrecognizedLines: 0,
   unreadableLog: false,
+  // Written by a fixed writer, so the existing cases keep testing what they were written to test.
+  // The untrusted-record behaviour is its own block below rather than a default nobody states.
+  trustedSteps: { branch: true, commit: true, pr_opened: true, test: true },
   claim: { kind: 'added', text: '3 added — covers the parser' },
 };
 const facts = (over: Partial<TicketFacts> = {}): TicketFacts => ({ ...BASE, ...over });
@@ -223,5 +226,57 @@ describe('the report', () => {
 
   it('says nothing about unparseable files when there are none', () => {
     expect(formatReport(buildReport(mixed), 0)).not.toContain('could not be parsed');
+  });
+});
+
+// Before tkt-31f693ac8bb0 the hook derived a milestone's state from `tool_response.exit_code`, a
+// field that never existed, so every command milestone recorded `passed` and a genuinely failing
+// command recorded nothing at all. Both directions of such a record are uninformative, and rows
+// written by that writer carry no `outcomeFrom` marker.
+describe('records from the pre-fix writer are evidence of nothing (tkt-31f693ac8bb0)', () => {
+  const UNTRUSTED = { branch: false, commit: false, pr_opened: false, test: false };
+
+  it('does not conclude OK from an untrusted passing test milestone', () => {
+    const v = verifyTicket(facts({ trustedSteps: UNTRUSTED }));
+    expect(v.outcome).toBe('unknown');
+    expect(v.reason).toMatch(/before the outcome fix/);
+  });
+
+  // The converse, and the one a naive check gets wrong: an ABSENT test milestone is equally
+  // uninformative, because the pre-fix writer recorded nothing at all for a failing gate. Reporting
+  // a violation there accuses a ticket whose gate ran and went red.
+  it('does not conclude VIOLATION from an untrusted record with no test milestone', () => {
+    const v = verifyTicket(facts({
+      trustedSteps: { branch: false, commit: false },
+      steps: { branch: 'passed', commit: 'passed' },
+    }));
+    expect(v.outcome).toBe('unknown');
+  });
+
+  it('treats a record with no hook-written step at all as untrusted', () => {
+    expect(verifyTicket(facts({ trustedSteps: {}, steps: {} })).outcome).toBe('unknown');
+  });
+
+  // The straddling ticket, which is the common shape across the upgrade and which a ticket-wide
+  // "newest event" test would get wrong: the GATE ran under the old writer and the commit/PR under
+  // the new one. The fresh rows must not vouch for the stale `test` row.
+  it('does not let a trusted commit row vouch for an untrusted test row', () => {
+    const v = verifyTicket(facts({
+      trustedSteps: { test: false, commit: true, pr_opened: true },
+    }));
+    expect(v.outcome).toBe('unknown');
+  });
+
+  // The one conclusion that survives, because it never consults the record: a ticket claiming no
+  // tests has nothing the events could contradict, whatever wrote them.
+  it('still concludes OK for a `Tests: none` claim, whose verdict never reads the record', () => {
+    const v = verifyTicket(facts({ trustedSteps: UNTRUSTED, claim: { kind: 'none', text: 'none — docs only' } }));
+    expect(v.outcome).toBe('ok');
+  });
+
+  // Positive control: the same facts with a trusted test row DO conclude, so the block above is
+  // measuring provenance and not some unrelated reason everything came back unknown.
+  it('concludes OK for the same facts once the test row is trusted', () => {
+    expect(verifyTicket(facts({ trustedSteps: { test: true } })).outcome).toBe('ok');
   });
 });

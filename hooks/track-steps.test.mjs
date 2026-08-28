@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { commandToMilestones, extractTicketId, stateFromExit, recordsFor, HOOK_STEPS } from './track-steps.mjs';
+import { commandToMilestones, extractTicketId, stateFromEvent, recordsFor, HOOK_STEPS } from './track-steps.mjs';
 import { STEP_IDS, BRANCH_TICKET_ID_RE } from '../src/shared/constants.js';
 
 const HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'track-steps.mjs');
@@ -30,15 +30,18 @@ function initRepo(dir, branch) {
 // Drives the real hook once into a fresh events dir and returns that dir. Returning the DIR rather
 // than the file list is what lets a caller assert which ticket's log a row landed in, and what it
 // said — a filename alone cannot distinguish `review`+`commit` from `commit`.
-function runHook({ command, cwd, eventsRoot, exitCode = 0 }) {
+function runHook({ command, cwd, eventsRoot, event = 'PostToolUse' }) {
   const dir = mkdtempSync(path.join(eventsRoot, 'ev-'));
   const env = { ...process.env, EVENTS_DIR_OVERRIDE: dir };
   for (const key of GIT_CONTEXT_VARS) delete env[key];
   spawnSync('node', [HOOK], {
     input: JSON.stringify({
+      // `event: null` omits the key entirely — the shape a non-hook caller sends. Passing
+      // `undefined` here would hit the default parameter above and assert nothing.
+      ...(event === null ? {} : { hook_event_name: event }),
       tool_name: 'Bash',
       tool_input: { command },
-      tool_response: { exit_code: exitCode },
+      tool_response: {},
       cwd,
     }),
     env,
@@ -123,11 +126,20 @@ describe('extractTicketId', () => {
   });
 });
 
-describe('stateFromExit', () => {
-  it('maps exit 0 to passed and any non-zero to failed', () => {
-    expect(stateFromExit(0)).toBe('passed');
-    expect(stateFromExit(1)).toBe('failed');
-    expect(stateFromExit(2)).toBe('failed');
+describe('stateFromEvent', () => {
+  it('maps the success event to passed and the failure event to failed', () => {
+    expect(stateFromEvent('PostToolUse')).toBe('passed');
+    expect(stateFromEvent('PostToolUseFailure')).toBe('failed');
+  });
+
+  // `null`, never 'passed'. An unrecognised event has no outcome to report, and the permissive
+  // answer here is what wrote 4,635 command milestones with zero failures among them.
+  it('returns null for an absent or unrecognised event rather than assuming success', () => {
+    expect(stateFromEvent(undefined)).toBeNull();
+    expect(stateFromEvent(null)).toBeNull();
+    expect(stateFromEvent('PreToolUse')).toBeNull();
+    expect(stateFromEvent('PostToolBatch')).toBeNull();
+    expect(stateFromEvent(0)).toBeNull();
   });
 });
 
@@ -475,7 +487,7 @@ describe('hook boundary — a milestone is attributed to the repo it ran in (tkt
   const B = 'tkt-bbbbbbbbbbbb'; // the TARGET's ticket — where the work actually belongs
   let root, sessionA, sessionMain, target, plainRepo, notARepo, events;
 
-  const fromA = (command, exitCode) => runHook({ command, cwd: sessionA, eventsRoot: events, exitCode });
+  const fromA = (command, event) => runHook({ command, cwd: sessionA, eventsRoot: events, event });
   const fromMain = (command) => runHook({ command, cwd: sessionMain, eventsRoot: events });
 
   beforeAll(() => {
@@ -548,7 +560,7 @@ describe('hook boundary — a milestone is attributed to the repo it ran in (tkt
   // failed commit. Without this, an implementation that emitted `review` unconditionally alongside
   // `commit` would still pass the passing-commit case above.
   it('carries a failing exit state to the target ticket, and derives no review from it', () => {
-    const dir = fromA(`cd ${target} && git commit -m x`, 1);
+    const dir = fromA(`cd ${target} && git commit -m x`, 'PostToolUseFailure');
     expect(filesIn(dir)).toEqual([`${B}.jsonl`]);
     expect(stepsIn(dir, `${B}.jsonl`)).toEqual(['commit']);
     expect(statesIn(dir, `${B}.jsonl`)).toEqual(['failed']);
@@ -569,5 +581,135 @@ describe('hook boundary — a milestone is attributed to the repo it ran in (tkt
     const dir = fromA(`npm test && cd ${path.join(sessionA, 'sub')} && npm test`);
     expect(filesIn(dir)).toEqual([`${A}.jsonl`]);
     expect(stepsIn(dir, `${A}.jsonl`)).toEqual(['test']);
+  });
+});
+
+// `PostToolUse` fires ONLY when a tool call succeeds; a failed one is dispatched to
+// `PostToolUseFailure`, a separate subscription. So the delivered EVENT is the only outcome signal
+// that reaches this hook — `tool_response` carries no exit status at all — and a command whose exit
+// is masked by shell composition has no knowable outcome even when the event says "success"
+// (tkt-31f693ac8bb0). Measured on the live board: `npm test -- <bad filter>; echo` recorded
+// `test: passed` while vitest exited 1.
+describe('hook boundary — outcome comes from the event, and only when the exit is observable (tkt-31f693ac8bb0)', () => {
+  const TICKET = 'tkt-abc123abc123';
+  let root, session, events;
+
+  // "step:state" pairs, so a test can distinguish `passed` from `failed` from recorded-nothing —
+  // a filename alone cannot, and recording the wrong state is this ticket's entire subject.
+  const run = (command, event) => {
+    const dir = runHook({ command, cwd: session, eventsRoot: events, event });
+    const file = `${TICKET}.jsonl`;
+    if (!filesIn(dir).includes(file)) return [];
+    const steps = stepsIn(dir, file);
+    return statesIn(dir, file).map((state, i) => `${steps[i]}:${state}`);
+  };
+
+  beforeAll(() => {
+    root = mkdtempSync(path.join(tmpdir(), 'tw-outcome-'));
+    session = path.join(root, 'session');
+    events = path.join(root, 'events');
+    mkdirSync(events);
+    initRepo(session, `fix/${TICKET}-x`);
+  });
+
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  // Positive control. Without it every "records nothing" case below is satisfied by an inert hook.
+  it('records passed for a bare command on PostToolUse', () => {
+    expect(run('npm run typecheck', 'PostToolUse')).toEqual(['typecheck:passed']);
+  });
+
+  it('records FAILED when the failure event is delivered', () => {
+    expect(run('npm run typecheck', 'PostToolUseFailure')).toEqual(['typecheck:failed']);
+  });
+
+  // The permissive answer is `passed`; an unknown event must never reach it.
+  it('records nothing when the event name is missing or unrecognised', () => {
+    expect(run('npm run typecheck', null)).toEqual([]);
+    expect(run('npm run typecheck', 'PostToolBatch')).toEqual([]);
+  });
+
+  // The three masking shapes, each measured to produce a false pass today. The tool call exits 0
+  // because the LAST stage did; the milestone's own exit never reaches the payload.
+  it('records nothing when a pipe masks the milestone’s exit', () => {
+    expect(run('npm test | tail -5', 'PostToolUse')).toEqual([]);
+  });
+
+  it('records nothing when a sequencing `;` masks the milestone’s exit', () => {
+    expect(run('npm test; echo done', 'PostToolUse')).toEqual([]);
+  });
+
+  it('records nothing when `|| true` masks the milestone’s exit', () => {
+    expect(run('npm test || true', 'PostToolUse')).toEqual([]);
+  });
+
+  it('records nothing for a backgrounded milestone', () => {
+    expect(run('npm test &', 'PostToolUse')).toEqual([]);
+  });
+
+  // Backgrounding applies to the whole AND-OR list, not just the segment holding the `&`: the shell
+  // returns 0 before `lint` has finished, so crediting it is a false pass.
+  it('records nothing for ANY link of a backgrounded `&&` chain', () => {
+    expect(run('npm run lint && npm test &', 'PostToolUse')).toEqual([]);
+  });
+
+  // `&` also SEPARATES commands, and splitSegmentsWithOps does not break on it — so without the
+  // scan, a backgrounded `npm test` is credited with `npm run lint`'s exit status.
+  it('records nothing when `&` separates a backgrounded milestone from a foreground command', () => {
+    expect(run('npm test & npm run lint', 'PostToolUse')).toEqual([]);
+  });
+
+  // A trailing-anchored test is defeated by grouping; both of these background.
+  it('records nothing for a backgrounded milestone inside a group', () => {
+    expect(run('(npm test &)', 'PostToolUse')).toEqual([]);
+    expect(run('{ npm test & }', 'PostToolUse')).toEqual([]);
+  });
+
+  // Redirections contain `&` and are far more common than backgrounding; reading one as a fork
+  // would drop telemetry wholesale. Positive control for the background scan.
+  it('still records a milestone whose command merely redirects with `2>&1`', () => {
+    expect(run('npm run typecheck 2>&1', 'PostToolUse')).toEqual(['typecheck:passed']);
+  });
+
+  // A segment after `||` runs only if its predecessor FAILED, so a command exiting 0 does not mean
+  // it ran at all — `gh pr view || gh pr create` exits 0 with the PR never created.
+  it('records nothing for a milestone that `||` may have skipped', () => {
+    expect(run('git diff --quiet || git commit -m wip', 'PostToolUse')).toEqual([]);
+    expect(run('gh pr view || gh pr create --base main', 'PostToolUse')).toEqual([]);
+  });
+
+  // Same defect mid-chain: `test` is skipped whenever `lint` succeeds, yet it reaches the end
+  // through `&&`. Only `typecheck` is knowable here.
+  it('records only the links a `||` did not make conditional', () => {
+    expect(run('npm run lint || npm test && npm run typecheck', 'PostToolUse')).toEqual(['typecheck:passed']);
+  });
+
+  // The failure count must be over SEGMENTS, not milestones: `npm ci && npm test` carries one
+  // milestone, and blaming it when `npm ci` broke accuses a gate that never ran.
+  it('records nothing when a failing command carries a non-milestone segment that could be the cause', () => {
+    expect(run('npm ci && npm test', 'PostToolUseFailure')).toEqual([]);
+    expect(run('git fetch && npm test', 'PostToolUseFailure')).toEqual([]);
+  });
+
+  // An unbroken `&&` chain to the end of the command is the one compound shape whose success DOES
+  // prove every link exited 0 — the shell would have stopped at the first failure.
+  it('records every link of an `&&` chain on success', () => {
+    expect(run('npm run typecheck && npm run lint && npm test', 'PostToolUse')).toEqual([
+      'typecheck:passed',
+      'lint:passed',
+      'test:passed',
+    ]);
+  });
+
+  // The converse does NOT hold: a failed `&&` chain stopped at SOME link, and nothing in the payload
+  // says which. Attributing the failure to any one milestone would be a guess.
+  it('records nothing when a multi-milestone `&&` chain fails', () => {
+    expect(run('npm run typecheck && npm run lint && npm test', 'PostToolUseFailure')).toEqual([]);
+  });
+
+  // One milestone, so there is nothing to confuse the failure with. This is the workflow's own
+  // foreign-mode form, and dropping it would lose the failure signal it exists to record.
+  it('records FAILED for the single milestone of a `cd … && …` command', () => {
+    expect(run(`cd ${session} && npm test`, 'PostToolUseFailure')).toEqual(['test:failed']);
   });
 });

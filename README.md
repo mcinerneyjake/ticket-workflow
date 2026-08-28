@@ -265,7 +265,7 @@ nothing to block and must not wedge the session — but note it exits **1, not 0
 | `guard-review-target` | `UserPromptExpansion` | **closed** (exit 2) |
 | `guard-subagent-gates` | `PreToolUse` | **closed** (exit 2) |
 | `warn-stale-worktree` | `SessionStart` | open (exit 1) |
-| `track-steps` | `PostToolUse` | open (exit 1) |
+| `track-steps` | `PostToolUse` **and** `PostToolUseFailure` | open (exit 1) |
 
 **Why 1 and not 0.** Exit 0 is *success*, and its stderr is not surfaced; a non-zero, non-2 exit is a
 non-blocking *error*, and its stderr **is**. Exiting 0 would therefore make a dead reporter quieter
@@ -293,10 +293,34 @@ Two honest limits on that table:
   stderr is visible only if someone is looking. Treat "are my hooks actually running?" as a question
   needing its own check.
 
+**`track-steps` must be wired to BOTH events, to the same command.** `PostToolUse` fires only when a
+tool call *succeeds*; a failed one is dispatched to `PostToolUseFailure`. Wire only the first and the
+hook is structurally incapable of ever recording a failure — it will not mislabel them, it will never
+see them, and the log fills with `passed` rows that look like a clean record rather than a partial
+one (`tkt-31f693ac8bb0`; 4,635 command milestones with zero failures among them). The outcome comes
+from which event was delivered, so no other configuration expresses this.
+
+```json
+"PostToolUse":        [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "<writer>" }] }],
+"PostToolUseFailure": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "<writer>" }] }]
+```
+
+This is **not** the duplicate-writer hazard below: those are two writers racing on one event, whereas
+these are one writer on two disjoint events, and exactly one of them fires per tool call.
+
+**Two shapes still record nothing, by design.** A milestone whose exit is hidden from the tool call —
+`npm test | tail`, `npm test; echo done`, `npm test || true`, `npm test &` — has no knowable outcome,
+because the delivered event describes the command as a whole, and the shell discarded the
+milestone's own status before the tool call ever ended. (The payload carries no exit status at
+all — that is the original defect.) The
+hook records nothing there rather than guessing `passed`. An unbroken `&&` chain is the exception and
+is recorded in full: if the whole command succeeded, every link in it exited 0. Likewise a *failing*
+command carrying several milestones records nothing, since nothing says which link failed.
+
 **Wiring at user scope does not replace project scope — the two are additive.** Duplicate *guards*
 are harmless (they decide identically), but a duplicate **writer** is not: two `track-steps` hooks
 append to the same `events/<id>.jsonl` and double-log every milestone. If you wire `track-steps` at
-user scope, remove any per-repo `PostToolUse` copy.
+user scope, remove any per-repo `PostToolUse` / `PostToolUseFailure` copy.
 
 **Verify by removing things, not by reading the config** — and remove *both*, because they fail
 differently:
@@ -323,6 +347,10 @@ npx ticket-workflow doctor --no-mcp   # skip starting the MCP server
 | check | what it answers |
 |---|---|
 | `writer-uniqueness` | how many `PostToolUse` telemetry writers are wired — two double-log every milestone |
+
+`writer-uniqueness` counts `PostToolUse` writers **only**. It does not check that
+`PostToolUseFailure` is wired, so a machine missing that subscription is reported `ok` while being
+structurally incapable of recording a failure. Verify that half by hand until a check exists.
 | `hook-wiring` | does any **vendored** hook copy differ from the one this package ships |
 | `pin` | is more than one version of this package live at once |
 | `mcp` | does the configured server start and answer `initialize`, at what version |
@@ -401,6 +429,14 @@ green gate. Nothing checks that assertion. The events log **can**: it is written
 hook that fires on actual command execution, so an agent cannot produce a `test: passed` event by
 claiming tests passed. That makes it testimony from a process outside the agent's control.
 
+**Read that narrowly.** A `test: passed` row witnesses that a test COMMAND RAN and the tool call
+succeeded — never that the tests themselves passed, and it is testimony only about the command the
+shell actually reported on. Rows written before `tkt-31f693ac8bb0` witness even less: the writer
+derived every outcome from a field that did not exist, so a failing gate recorded nothing and a
+masked one recorded `passed`. `verify` reports those as `unknown` rather than reading them, keyed on
+an `outcomeFrom` marker the fixed writer stamps on each row — not on a date, which would start
+trusting a machine that never upgraded.
+
 ```bash
 npx ticket-workflow verify                       # all closed tickets
 npx ticket-workflow verify <id>                  # one ticket, whatever its status
@@ -415,7 +451,7 @@ says match what was observed?**
 |---|---|
 | `ok` | claim and record agree — including `Tests: none — …`, which asserts nothing the record can contradict |
 | `violation` | the summary claims tests, and no passing test milestone was recorded, *while telemetry was demonstrably live for that ticket* |
-| `unknown` | not judgeable: telemetry never observed it, its log lost lines, or it carries no `Tests:` line |
+| `unknown` | not judgeable: telemetry never observed it, its log lost lines, it carries no `Tests:` line, or its milestones predate the outcome fix |
 
 **Report-only, and exit 0 even with violations.** A violation is a *discrepancy*, not proof of
 misconduct — the gate may have run under a command the hook does not recognise. Until that rate is
