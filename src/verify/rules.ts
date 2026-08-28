@@ -3,8 +3,16 @@
  *
  * The idea, and the reason this is worth having at all: every ticket ends with an agent-authored
  * `## Implementation summary` asserting `Tests: N added` and a green gate. Nothing checks that
- * assertion. The events log **can** — it is written by a PostToolUse hook that fires on actual
- * command execution, so an agent cannot produce a `test: passed` event by claiming tests passed.
+ * assertion. The events log **can** — it is written by a hook that fires on actual command
+ * execution, so an agent cannot produce a `test: passed` event by claiming tests passed.
+ *
+ * That is the limit of what the record witnesses, and this note previously overstated it: a
+ * `test: passed` event means a test COMMAND RAN and the tool call exited 0 — never that the tests
+ * themselves passed. Until tkt-31f693ac8bb0 it did not even mean that. `PostToolUse` fires only on
+ * success and the hook subscribed to nothing else, so a failing command wrote no event at all, while
+ * one whose exit was masked by shell composition (`npm test | tail`) wrote `passed`. Every command
+ * milestone on record before the cutover below is therefore `passed` by construction — 4,635 of
+ * them, with zero failures among them — and is evidence of nothing in either direction.
  *
  * So this does not ask "did the gate run". It asks the narrower, answerable question: **does what the
  * ticket SAYS match what was OBSERVED?** Measured on this board, that is the difference between 4
@@ -49,6 +57,17 @@ export interface TicketFacts {
   /** This ticket's log could not be read at all (EACCES/EIO). Distinct from "no events": one means
    *  nothing happened, the other means we could not look, and only the second must never be judged. */
   readonly unreadableLog: boolean;
+  /**
+   * Per hook-written step, whether the event carrying its latest state was written by a writer that
+   * derived that state from the delivered hook event (`outcomeFrom: 'event'`).
+   *
+   * PER STEP, not per ticket, and that is the whole point: a ticket worked across the upgrade has
+   * its gate recorded by the old writer and its commit/PR by the new one, so any ticket-wide
+   * "newest event" test would let the fresh `commit` row vouch for a stale `test` row — the exact
+   * vouching this exists to prevent. Absent for a step means untrusted: pre-fix rows carry no
+   * marker, and neither would a forged one (tkt-31f693ac8bb0).
+   */
+  readonly trustedSteps: Readonly<Record<string, boolean>>;
   readonly claim: TestsClaim;
 }
 
@@ -152,6 +171,25 @@ export function verifyTicket(facts: TicketFacts): Verdict {
     // for skipping a gate the workflow explicitly excuses them from — the single change that takes
     // the finding set from ~20 mostly-false to 4 precise ones.
     return { id, outcome: 'ok', reason: `claims no tests ("${clip(facts.claim.text)}"); nothing in the record contradicts it` };
+  }
+  // Placed AFTER the `claim.kind === 'none'` branch on purpose: that one concludes without
+  // consulting the record at all, so it stays valid however untrustworthy the record is. Everything
+  // below this line reads the record, and must not.
+  //
+  // Which step's trust is required depends on which way the verdict would go. Concluding OK reads
+  // `steps.test`, so THAT row must be trusted. Concluding VIOLATION reads the ABSENCE of a passing
+  // test, which the pre-fix writer produced for every failing gate — so with no test row at all,
+  // any untrusted hook row is enough to make the absence uninformative.
+  const testTrusted = facts.trustedSteps.test === true;
+  const anyTrusted = Object.values(facts.trustedSteps).some(Boolean);
+  if (facts.steps.test !== undefined ? !testTrusted : !anyTrusted) {
+    return {
+      id,
+      outcome: 'unknown',
+      reason:
+        'this ticket\'s milestones were written before the outcome fix (tkt-31f693ac8bb0), when every ' +
+        'command recorded `passed` and failures recorded nothing — so the record can neither support nor contradict the claim',
+    };
   }
   if (facts.steps.test === 'passed') {
     return { id, outcome: 'ok', reason: 'claims tests were added, and a passing test milestone was recorded' };

@@ -67,7 +67,7 @@ export function dirTarget(segment, dir) {
 // `&&` or git verbs) is never mis-parsed as a separate command. Not a full shell
 // parser — it covers the shapes the workflow actually produces; a stray
 // unbalanced `)` inside a heredoc body is the known residual.
-export function splitSegments(command) {
+export function splitSegmentsWithOps(command) {
   const segments = [];
   let buf = '';
   let sq = false;   // inside '...'
@@ -83,14 +83,73 @@ export function splitSegments(command) {
     if (subst > 0 && c === '(') { buf += c; subst++; continue; }
     if (subst > 0 && c === ')') { buf += c; subst--; continue; }
     if (!dq && subst === 0) {
-      if (c === '&' && next === '&') { segments.push(buf); buf = ''; i++; continue; }
-      if (c === '|' && next === '|') { segments.push(buf); buf = ''; i++; continue; }
-      if (c === ';' || c === '\n') { segments.push(buf); buf = ''; continue; }
+      if (c === '&' && next === '&') { segments.push({ text: buf, opAfter: '&&' }); buf = ''; i++; continue; }
+      if (c === '|' && next === '|') { segments.push({ text: buf, opAfter: '||' }); buf = ''; i++; continue; }
+      if (c === ';' || c === '\n') { segments.push({ text: buf, opAfter: ';' }); buf = ''; continue; }
     }
     buf += c;
   }
-  segments.push(buf);
-  return segments.map((s) => s.trim()).filter(Boolean);
+  segments.push({ text: buf, opAfter: null });
+  return segments.map((s) => ({ text: s.text.trim(), opAfter: s.opAfter })).filter((s) => s.text);
+}
+
+// The operators are what splitSegments discards, and exit-status reachability needs them: when the
+// whole command succeeded, `a && b` proves a exited 0, while `a; b` and `a || b` prove nothing about
+// a (tkt-31f693ac8bb0). Derived from the one scanner above rather than a second pass, so the two can
+// never disagree about where a segment ends — the desync hazard tkt-ad984b09945b records.
+export function splitSegments(command) {
+  return splitSegmentsWithOps(command).map((s) => s.text);
+}
+
+// A top-level `|` INSIDE one segment. splitSegments deliberately never breaks a pipeline — `cd x |
+// tee` runs in a subshell and must not read as a directory move (see hiddenDirMove) — so the pipe
+// survives inside the segment, where it still hides the head command's exit status behind the last
+// stage's. matchStep reads the segment's first token, so a milestone found in a piped segment is
+// always the masked head.
+export function hasTopLevelPipe(segment) {
+  let sq = false, dq = false, subst = 0;
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i];
+    if (sq) { if (c === "'") sq = false; continue; }
+    if (c === "'" && !dq) { sq = true; continue; }
+    if (c === '"' && subst === 0) { dq = !dq; continue; }
+    if (c === '$' && segment[i + 1] === '(') { subst++; i++; continue; }
+    if (subst > 0) { if (c === '(') subst++; else if (c === ')') subst--; continue; }
+    if (dq) continue;
+    if (c === '|') {
+      if (segment[i + 1] === '|') { i++; continue; } // `||` separates; splitSegments already consumed it
+      return true;
+    }
+  }
+  return false;
+}
+
+// A bare `&` at top level backgrounds what precedes it: the shell returns 0 immediately, so the
+// tool call's exit status describes the fork, not the work. Scanned rather than matched at the end
+// of the segment, because a trailing-anchored test is defeated by grouping — `(npm test &)` and
+// `{ npm test & }` both background, and both end in punctuation — and because `&` also SEPARATES
+// commands (`npm test & npm run lint`), which splitSegmentsWithOps deliberately does not break on.
+//
+// Redirections are the reason this is not a bare indexOf: `2>&1` and `&>out` are far more common in
+// real commands than backgrounding is, and reading either as a fork would drop telemetry wholesale.
+export function hasTopLevelBackground(segment) {
+  let sq = false, dq = false, subst = 0;
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i];
+    if (sq) { if (c === "'") sq = false; continue; }
+    if (c === "'" && !dq) { sq = true; continue; }
+    if (c === '"' && subst === 0) { dq = !dq; continue; }
+    if (c === '$' && segment[i + 1] === '(') { subst++; i++; continue; }
+    if (subst > 0) { if (c === '(') subst++; else if (c === ')') subst--; continue; }
+    if (dq || c !== '&') continue;
+    const prev = segment[i - 1];
+    const next = segment[i + 1];
+    if (next === '&') { i++; continue; }                 // `&&`, a separator this scanner already split on
+    if (prev === '>' || prev === '<') continue;          // `2>&1`, `1<&0` — a redirection
+    if (next === '>') continue;                          // `&>out` — a redirection
+    return true;
+  }
+  return false;
 }
 
 // The subshell parens a segment really opens and closes — those outside quotes and outside a

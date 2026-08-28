@@ -19,12 +19,16 @@ async function seed(opts: {
   project?: string | null;
   summary?: string;
   steps?: [string, string][];
+  /** Whether the seeded command milestones carry the fixed writer's provenance marker. Defaults to
+   *  true so a case that is not ABOUT provenance still reaches the verdict it was written for. */
+  trusted?: boolean;
 }) {
   const t = await createTicket({ title: opts.title, type: 'task', priority: 'low', status: 'todo' });
   if (opts.summary !== undefined) await updateTicket(t.id, { appendBody: opts.summary });
   if (opts.project !== undefined) await updateTicket(t.id, { project: opts.project });
   if (opts.status) await updateTicket(t.id, { status: opts.status });
-  for (const [step, state] of opts.steps ?? []) await appendEvent({ ticketId: t.id, step, state });
+  for (const [step, state] of opts.steps ?? [])
+    await appendEvent({ ticketId: t.id, step, state, ...(opts.trusted === false ? {} : { outcomeFrom: 'event' as const }) });
   return t.id;
 }
 
@@ -83,6 +87,39 @@ describe('reading the record', () => {
     });
     const { facts } = await gatherTicketFacts({ id });
     expect(facts[0].steps.test).toBe('passed');
+    expect(buildReport(facts).ok).toBe(1);
+  });
+
+  // The round trip for tkt-31f693ac8bb0: a record written by the PRE-FIX writer carries no
+  // provenance marker, and must reach an `unknown` verdict through the real chain — event file,
+  // readEvents, gather, verifyTicket — not merely in a unit fixture.
+  it('reports UNKNOWN for a record with no provenance marker, however green it looks', async () => {
+    const id = await seed({
+      title: 'Pre-fix',
+      status: 'done',
+      summary: 'Tests: 2 added — x',
+      steps: [['branch', 'passed'], ['test', 'passed']],
+      trusted: false,
+    });
+    const { facts } = await gatherTicketFacts({ id });
+    expect(facts[0].steps.test).toBe('passed');       // the state is still read
+    expect(facts[0].trustedSteps.test).toBe(false);   // but it is not evidence
+    const report = buildReport(facts);
+    expect(report.ok).toBe(0);
+    expect(report.unknown).toBe(1);
+  });
+
+  // Positive control on the same path: identical facts WITH the marker do conclude, so the case
+  // above is measuring provenance and not some unrelated reason the verdict came back unknown.
+  it('reports OK for the same record once it carries the marker', async () => {
+    const id = await seed({
+      title: 'Post-fix',
+      status: 'done',
+      summary: 'Tests: 2 added — x',
+      steps: [['branch', 'passed'], ['test', 'passed']],
+    });
+    const { facts } = await gatherTicketFacts({ id });
+    expect(facts[0].trustedSteps.test).toBe(true);
     expect(buildReport(facts).ok).toBe(1);
   });
 

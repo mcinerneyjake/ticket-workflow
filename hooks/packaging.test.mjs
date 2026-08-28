@@ -66,9 +66,10 @@ const PROBES = {
   }),
   'track-steps.mjs': () => ({
     payload: {
+      hook_event_name: 'PostToolUse',
       tool_name: 'Bash',
       tool_input: { command: 'npm run typecheck' },
-      tool_response: { exit_code: 0 },
+      tool_response: {},
       cwd: fixtures.repo,
     },
     env: { EVENTS_DIR_OVERRIDE: mkdtempSync(path.join(tmpdir(), 'tw-events-')) },

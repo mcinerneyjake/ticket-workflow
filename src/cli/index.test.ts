@@ -327,6 +327,7 @@ describe('main', () => {
         facts: [{
           id: 'tkt-x', title: 'T', status: 'done', steps: { branch: 'passed' },
           skippedLines: 0, unrecognizedLines: 0, unreadableLog: false,
+          trustedSteps: { branch: true },
           claim: { kind: 'added' as const, text: '3 added — x' },
         }],
         unreadable: 0,

@@ -126,6 +126,10 @@ export type TicketEvent = {
   state: StepState
   at: string
   detail?: string
+  /** `'event'` when the writer derived `state` from the delivered hook event. Absent on rows written
+   *  before tkt-31f693ac8bb0, whose state was `passed` regardless of how the command went, and on
+   *  service-written status milestones, which carry no outcome at all. */
+  outcomeFrom?: 'event'
 }
 
 // A reduced pipeline node: latest state per step, or pending if none arrived.
