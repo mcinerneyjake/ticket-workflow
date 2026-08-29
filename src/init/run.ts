@@ -18,9 +18,15 @@ export interface InitResult {
   readonly humanSteps: readonly string[];
 }
 
-/** The BLOCKEDs a correct fresh scaffold produces: no node_modules yet (eslint, tsc) and no remote
- *  yet (branch protection). An allowlist by id — anything else BLOCKED moves init's exit code. */
-export const EXPECTED_FRESH_BLOCKED: ReadonlySet<string> = new Set(['eslint-rules', 'tsconfig-strict', 'branch-protection']);
+/** The BLOCKEDs a correct fresh scaffold produces: no node_modules yet (eslint, tsc, and the guard
+ *  the launcher imports) and no remote yet (branch protection). An allowlist by id — anything else
+ *  BLOCKED moves init's exit code. `hook-launcher` is here because the audit now EXECUTES the
+ *  launcher: before `npm install` it correctly blocks everything, which is unverifiable rather than
+ *  conformant, and must not read as a PASS. */
+export const EXPECTED_FRESH_BLOCKED: ReadonlySet<string> = new Set(['eslint-rules', 'tsconfig-strict', 'branch-protection', 'hook-launcher']);
+
+/** See the tolerance narrowing in runInit. Pinned against the check's own details by init.test.ts. */
+export const LAUNCHER_ENV_NOT_READY: readonly string[] = ['cannot load the guard', 'node is not on PATH'];
 
 export const GATE_SCRIPTS = {
   typecheck: 'tsc -p tsconfig.json',
@@ -150,6 +156,16 @@ export function runInit(
   }
 
   const report = runAudit(targetDir, exec);
+  // Tolerance for `hook-launcher` is narrowed from its id to the two ENVIRONMENT-not-ready reasons:
+  // the launcher cannot load its guard yet, or node is not on PATH. Everything else that blocks it —
+  // a spawn error, no exit code, or a launcher init JUST WROTE that cannot be read — says something
+  // is wrong with the scaffold itself, and exiting 0 there reports a repo verified that never was.
+  // The phrasings are coupling, so init.test.ts pins them against the check's real output.
+  const tolerable = new Set(EXPECTED_FRESH_BLOCKED);
+  const launcher = report.results.find((r) => r.id === 'hook-launcher');
+  if (launcher?.status === 'blocked' && !LAUNCHER_ENV_NOT_READY.some((phrase) => launcher.detail.includes(phrase))) {
+    tolerable.delete('hook-launcher');
+  }
   const gating = report.results.filter((r) => !r.advisory);
   const blocked = gating.filter((r) => r.status === 'blocked');
   const isGitRepo = classifyTarget(targetDir, '.git') !== 'missing';
@@ -173,6 +189,9 @@ export function runInit(
   } else {
     humanSteps.push(
       'edit .github/workflows/ci.yml — its `gate` job runs the npm toolchain; replace those steps with your stack\'s gate commands BEFORE requiring the check, or every PR wedges on a check that can never pass',
+      // A core repo has no package.json, so the `npm install` remediation the audit prints for a
+      // blocked launcher has no route here: the machine-local install is the only one.
+      'install the guard machine-locally (`~/.claude/tools`, holding the ticket-workflow package) — the core launcher\'s second candidate reads it, and at this tier there is no repo-local `npm install` to satisfy the first',
     );
   }
   humanSteps.push(
@@ -181,5 +200,5 @@ export function runInit(
   );
   for (const b of blocked) humanSteps.push(`unblock \`${b.id}\`: ${b.detail}`);
 
-  return { targetDir, tier, wrote, preserved, report, exitCode: auditExitCode(report, EXPECTED_FRESH_BLOCKED), humanSteps };
+  return { targetDir, tier, wrote, preserved, report, exitCode: auditExitCode(report, tolerable), humanSteps };
 }

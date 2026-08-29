@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardrailTemplates } from '../templates.js';
-import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS } from './run.js';
+import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS, LAUNCHER_ENV_NOT_READY } from './run.js';
 import { parseInitArgs, cmdInit } from '../cli/index.js';
 import type { Exec } from '../audit/types.js';
 
@@ -222,5 +222,77 @@ describe('parseInitArgs', () => {
     expect(() => parseInitArgs(['--tier', 'python'])).toThrow(/core|node/);
     expect(() => parseInitArgs(['--froce'])).toThrow(/unknown option/);
     expect(() => parseInitArgs(['/a', '/b'])).toThrow(/at most one path/);
+  });
+});
+
+/**
+ * tkt-c4a4a79bec8a. `init --tier core` scaffolded the launcher whose only resolution path is a bare
+ * specifier needing node_modules — which the core tier, by definition, never provides. Every core
+ * repo was wedged, and the text-reading audit called it a PASS.
+ */
+describe('init --tier core scaffolds a launcher that tier can satisfy', () => {
+  it('writes the two-candidate core launcher, not the node one', () => {
+    const dir = tempDir();
+    runInit(dir, { tier: 'core' });
+    const launcher = readFileSync(path.join(dir, '.claude', 'hooks', 'guard-bash.mjs'), 'utf8');
+    // Assert what only the CORE launcher has. Every earlier version of this test passed against the
+    // node launcher too — it also contains '.claude', the marker and the bare specifier — so
+    // repointing the core manifest entry at the node source, the exact regression this ticket
+    // fixes, left the block green (tkt-c4a4a79bec8a review).
+    expect(launcher, 'core launcher has no machine-local candidate').toContain('homedir');
+    expect(launcher).toContain('.claude');
+    expect(launcher).toContain('tools');
+    expect(launcher).toContain("import('ticket-workflow/hooks/guard-bash.mjs')");
+    const nodeLauncher = guardrailTemplates(undefined, 'node').find((t) => t.targetPath === '.claude/hooks/guard-bash.mjs');
+    expect(launcher, 'core scaffold got the NODE launcher').not.toBe(nodeLauncher?.contents);
+  });
+
+  it('the scaffolded core repo is never INERT, and init exits 0 without hand-editing', () => {
+    const dir = tempDir();
+    const result = runInit(dir, { tier: 'core' });
+    const launcher = result.report.results.find((r) => r.id === 'hook-launcher');
+    // pass or blocked, never fail — and which one is a property of the MACHINE, not of the scaffold:
+    // it passes where ~/.claude/tools holds the package and is blocked where it does not. Asserting
+    // `pass` here would bind the suite to this machine's install; templates.test.ts proves the
+    // discrimination deterministically instead, with HOME pinned.
+    expect(['pass', 'blocked'], `core scaffold is inert: ${launcher?.detail}`).toContain(launcher?.status);
+    expect(result.exitCode).toBe(0);
+  });
+
+  it('a core scaffold writes no node-tier template', () => {
+    const dir = tempDir();
+    runInit(dir, { tier: 'core' });
+    for (const nodeOnly of ['.husky/pre-commit', 'eslint.config.js', 'tsconfig.json', 'vitest.config.ts', '.nvmrc']) {
+      expect(existsSync(path.join(dir, nodeOnly)), `${nodeOnly} is node-tier and must not be scaffolded at core`).toBe(false);
+    }
+  });
+});
+
+/** tkt-c4a4a79bec8a review, finding 10: tolerance was by check id, so init exited 0 on BLOCKEDs that
+ *  had nothing to do with a fresh scaffold. */
+describe('init tolerates hook-launcher BLOCKED only when the environment is not ready', () => {
+  it('the tolerated phrases are the ones the check actually emits — not prose that drifted', () => {
+    // Coupling asserted, not commented: runInit matches these substrings against hookLauncher's
+    // details, so a reworded detail must redden here rather than silently stop being tolerated.
+    const dir = tempDir();
+    const noNode: Exec = (cmd) => (cmd === 'node' ? { kind: 'absent' } : { kind: 'absent' });
+    const blocked = runInit(dir, {}, noNode).report.results.find((r) => r.id === 'hook-launcher');
+    expect(blocked?.status).toBe('blocked');
+    expect(LAUNCHER_ENV_NOT_READY.some((p) => blocked?.detail.includes(p)), `untolerated detail: ${blocked?.detail}`).toBe(true);
+  });
+
+  it('a spawn ERROR is not fresh-scaffold state — init exits non-zero rather than reporting success', () => {
+    const dir = tempDir();
+    const spawnErr: Exec = (cmd) => (cmd === 'node' ? { kind: 'error', message: 'EACCES' } : { kind: 'absent' });
+    const result = runInit(dir, {}, spawnErr);
+    const blocked = result.report.results.find((r) => r.id === 'hook-launcher');
+    expect(blocked?.status).toBe('blocked');
+    expect(result.exitCode, 'a launcher that could not be spawned must not read as a healthy scaffold').toBe(1);
+  });
+
+  it('control: the ordinary fresh scaffold still exits 0 with the launcher blocked', () => {
+    const dir = tempDir();
+    const result = runInit(dir, {}, () => ({ kind: 'absent' }));
+    expect(result.exitCode).toBe(0);
   });
 });

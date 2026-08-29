@@ -54,6 +54,10 @@ function makeConformingRepo(): string {
   );
   mkdirSync(path.join(dir, 'node_modules', '.bin'), { recursive: true });
   symlinkSync(path.join(PKG_ROOT, 'node_modules', '.bin', 'tsc'), path.join(dir, 'node_modules', '.bin', 'tsc'));
+  // hook-launcher EXECUTES the launcher, and the launcher imports the package by bare specifier. A
+  // fixture without this resolves nothing, so the guard blocks every command and the "conforming"
+  // repo could never reach PASS — the check would be green only where it could not run.
+  symlinkSync(PKG_ROOT, path.join(dir, 'node_modules', 'ticket-workflow'));
   return dir;
 }
 
@@ -505,5 +509,152 @@ describe('audit: exit codes', () => {
     expect(bp?.status).toBe('blocked');
     expect(bp?.detail).toContain('crashed');
     expect(report.results.length).toBe(AUDIT_CHECKS.length);
+  });
+});
+
+/**
+ * tkt-c4a4a79bec8a. The check classified on three TEXTUAL properties, all satisfiable by a file that
+ * cannot run — so it returned PASS in both states of the same launcher: resolving-and-discriminating,
+ * and throwing ERR_MODULE_NOT_FOUND while blocking every command (the hardpack-consulting incident,
+ * tkt-beffa7b73df5). Same verdict, opposite realities. These drive the launcher for real.
+ */
+describe('audit: hook-launcher runs the launcher rather than reading it', () => {
+  const launcherAt = (dir: string): string => path.join(dir, '.claude', 'hooks', 'guard-bash.mjs');
+
+  it('the conforming fixture discriminates: dangerous blocked, ordinary allowed', () => {
+    const r = statusOf(makeConformingRepo(), 'hook-launcher');
+    expect(r.status, r.detail).toBe('pass');
+  });
+
+  it('a textually perfect launcher that cannot RESOLVE the package is never a pass', () => {
+    const dir = makeConformingRepo();
+    rmSync(path.join(dir, 'node_modules', 'ticket-workflow'), { recursive: true, force: true });
+    const r = statusOf(dir, 'hook-launcher');
+    // 'blocked' specifically, not merely not-pass: the pre-existing vendored-copy branch also
+    // satisfies not-pass, so the weaker assertion could not tell an execution-derived verdict from
+    // a text-derived one — and execution is the whole point of this check.
+    expect(r.status, r.detail).toBe('blocked');
+    expect(r.detail).toContain('cannot load the guard');
+  });
+
+  it('the hardpack-consulting pre-fix shape — imports, exits 2, blocks EVERYTHING — is red', () => {
+    const dir = makeConformingRepo();
+    rmSync(path.join(dir, 'node_modules', 'ticket-workflow'), { recursive: true, force: true });
+    const report = runAudit(dir, execWithEslint);
+    expect(auditExitCode(report), 'a wedged launcher must move the exit code').not.toBe(0);
+  });
+
+  it('a launcher that blocks everything with no load diagnostic is INERT — fail, not blocked', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(launcherAt(dir), "await import('ticket-workflow/hooks/guard-bash.mjs');\nprocess.exit(2);\n");
+    const r = statusOf(dir, 'hook-launcher');
+    expect(r.status, r.detail).toBe('fail');
+  });
+
+  it('a launcher that allows the dangerous command is a fail-open — fail', () => {
+    const dir = makeConformingRepo();
+    // The literal exit(2) is present so the TEXT pre-filter passes and the verdict comes from
+    // running it: without that this test would be answered by the vendored-copy branch instead.
+    writeFileSync(
+      launcherAt(dir),
+      "await import('ticket-workflow/hooks/guard-bash.mjs');\nif (process.env.NEVER) process.exit(2);\nprocess.exit(0);\n",
+    );
+    const r = statusOf(dir, 'hook-launcher');
+    expect(r.status, r.detail).toBe('fail');
+  });
+
+  it('an INVERTED launcher — allows the dangerous, blocks the ordinary — is a fail', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(
+      launcherAt(dir),
+      "await import('ticket-workflow/hooks/guard-bash.mjs');\n" +
+        "const { readFileSync } = await import('node:fs');\n" +
+        "const p = JSON.parse(readFileSync(0, 'utf8'));\n" +
+        // A literal exit(2) so the TEXT pre-filter passes and EXECUTION decides the verdict.
+        "if (process.env.NEVER) process.exit(2);\n" +
+        "process.exit(p.tool_input.command.startsWith('git add') ? 0 : 2);\n",
+    );
+    const r = statusOf(dir, 'hook-launcher');
+    expect(r.status, r.detail).toBe('fail');
+  });
+
+  it('node absent is BLOCKED, never a pass — "could not check" is not conformance', () => {
+    const dir = makeConformingRepo();
+    const noNode: Exec = (cmd, args, opts) => {
+      if (cmd === 'node') return { kind: 'absent' };
+      if (cmd.endsWith('eslint')) return { kind: 'ran', ok: true, stdout: ESLINT_CONFORMING, stderr: '' };
+      return defaultExec(cmd, args, opts);
+    };
+    const r = statusOf(dir, 'hook-launcher', noNode);
+    expect(r.status, r.detail).toBe('blocked');
+  });
+
+  it('an exec that reports NO exit code is blocked — an unknown verdict is not the allowing one', () => {
+    const dir = makeConformingRepo();
+    // The shape an injected or exotic exec produces: it ran, but no status came back. Reading that
+    // as anything but undetermined would rebuild the fail-open this check exists to remove.
+    const noStatus: Exec = (cmd, args, opts) => {
+      if (cmd === 'node') return { kind: 'ran', ok: false, stdout: '', stderr: '' };
+      if (cmd.endsWith('eslint')) return { kind: 'ran', ok: true, stdout: ESLINT_CONFORMING, stderr: '' };
+      return defaultExec(cmd, args, opts);
+    };
+    const r = statusOf(dir, 'hook-launcher', noStatus);
+    expect(r.status, r.detail).toBe('blocked');
+  });
+
+  it('exit 1 on the dangerous command is a FAIL — only exit 2 blocks, 1 runs the command', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(
+      path.join(dir, '.claude', 'hooks', 'guard-bash.mjs'),
+      "await import('ticket-workflow/hooks/guard-bash.mjs');\nprocess.exit(2);\n",
+    );
+    const exitOne: Exec = (cmd, args, opts) => {
+      if (cmd === 'node') return { kind: 'ran', ok: false, status: 1, stdout: '', stderr: '' };
+      if (cmd.endsWith('eslint')) return { kind: 'ran', ok: true, stdout: ESLINT_CONFORMING, stderr: '' };
+      return defaultExec(cmd, args, opts);
+    };
+    const r = statusOf(dir, 'hook-launcher', exitOne);
+    expect(r.status, r.detail).toBe('fail');
+  });
+
+  it('still rejects a vendored copy before ever executing it', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(launcherAt(dir), `// vendored from ticket-workflow/hooks/guard-bash.mjs\n${'const RULES = [];\n'.repeat(80)}process.exit(2);\n`);
+    const r = statusOf(dir, 'hook-launcher');
+    expect(r.status, r.detail).toBe('fail');
+  });
+});
+
+/**
+ * tkt-c4a4a79bec8a review, finding 2. The marker was introduced by that fix, so keying only on it
+ * reported every launcher scaffolded BEFORE it — correct, fail-closed, marker-less — as
+ * `fail: it is inert, wedging the repo`, on any machine without the toolchain installed. Measured
+ * against four repos. A hardening that condemns the repos it was meant to protect is not a hardening.
+ */
+describe('audit: hook-launcher accepts pre-marker launchers as blocked, not inert', () => {
+  const LEGACY_WORDINGS = [
+    'could not run the guard from ticket-workflow',
+    'no usable ticket-workflow guard could be loaded',
+  ];
+
+  it.each(LEGACY_WORDINGS)('a marker-less launcher saying %s is BLOCKED, not FAIL', (wording) => {
+    const dir = makeConformingRepo();
+    rmSync(path.join(dir, 'node_modules', 'ticket-workflow'), { recursive: true, force: true });
+    writeFileSync(
+      path.join(dir, '.claude', 'hooks', 'guard-bash.mjs'),
+      `try {\n  await import('ticket-workflow/hooks/guard-bash.mjs');\n} catch {\n  process.stderr.write('[guard-bash] BLOCKED: ${wording} (ERR_MODULE_NOT_FOUND).\\n');\n  process.exit(2);\n}\n`,
+    );
+    const r = statusOf(dir, 'hook-launcher');
+    expect(r.status, r.detail).toBe('blocked');
+  });
+
+  it('control: blocking everything with an UNRELATED message is still FAIL', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(
+      path.join(dir, '.claude', 'hooks', 'guard-bash.mjs'),
+      "await import('ticket-workflow/hooks/guard-bash.mjs');\nprocess.stderr.write('nope\\n');\nprocess.exit(2);\n",
+    );
+    const r = statusOf(dir, 'hook-launcher');
+    expect(r.status, r.detail).toBe('fail');
   });
 });
