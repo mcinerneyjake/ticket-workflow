@@ -115,7 +115,17 @@ describe('audit: each check goes red on exactly its own broken guardrail', () =>
       expect: 'fail',
       mutate: (d) => {
         const p = path.join(d, '.gitignore');
-        writeFileSync(p, readBack(p).replace(/^\.claude\/worktrees\/$/m, ''));
+        writeFileSync(p, readBack(p).replace(/^\.claude\/worktrees$/m, ''));
+      },
+    },
+    // tkt-45ddb02e4280: a trailing slash matches directories only, so the rule misses a SYMLINKED
+    // worktree — present, plausible, and not ignoring the thing it names.
+    {
+      id: 'gitignore',
+      expect: 'fail',
+      mutate: (d) => {
+        const p = path.join(d, '.gitignore');
+        writeFileSync(p, readBack(p).replace(/^\.claude\/worktrees$/m, '.claude/worktrees/'));
       },
     },
     {
