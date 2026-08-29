@@ -26,13 +26,19 @@ export type ReadResult =
   | { readonly kind: 'error'; readonly message: string };
 
 export type ExecResult =
-  /** The command ran; `ok` mirrors exit status 0. */
-  | { readonly kind: 'ran'; readonly ok: boolean; readonly stdout: string; readonly stderr: string }
+  /**
+   * The command ran; `ok` mirrors exit status 0. `status` is the raw exit code, which callers that
+   * must tell one non-zero code from another need: the hook protocol reads exit 2 as BLOCK and exit
+   * 1 as a non-blocking error, i.e. ALLOW, so collapsing both into `ok: false` would read a crashing
+   * guard as a blocking one. It is optional because an injected test exec may omit it — and a caller
+   * that cannot read an exit code must treat that as undetermined, never as the permissive answer.
+   */
+  | { readonly kind: 'ran'; readonly ok: boolean; readonly status?: number | null; readonly stdout: string; readonly stderr: string }
   /** The binary is not there (spawn ENOENT) — a BLOCKED answer, never a fail-open one. */
   | { readonly kind: 'absent' }
   | { readonly kind: 'error'; readonly message: string };
 
-export type Exec = (cmd: string, args: readonly string[], opts?: { cwd?: string }) => ExecResult;
+export type Exec = (cmd: string, args: readonly string[], opts?: { cwd?: string; input?: string }) => ExecResult;
 
 export interface AuditContext {
   readonly repoDir: string;
@@ -70,11 +76,11 @@ export function readRepoFile(repoDir: string, relPath: string): ReadResult {
   }
 }
 
-export function defaultExec(cmd: string, args: readonly string[], opts?: { cwd?: string }): ExecResult {
-  const r = spawnSync(cmd, [...args], { cwd: opts?.cwd, encoding: 'utf8', timeout: 60_000 });
+export function defaultExec(cmd: string, args: readonly string[], opts?: { cwd?: string; input?: string }): ExecResult {
+  const r = spawnSync(cmd, [...args], { cwd: opts?.cwd, input: opts?.input, encoding: 'utf8', timeout: 60_000 });
   if (r.error) {
     if ('code' in r.error && r.error.code === 'ENOENT') return { kind: 'absent' };
     return { kind: 'error', message: r.error.message };
   }
-  return { kind: 'ran', ok: r.status === 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+  return { kind: 'ran', ok: r.status === 0, status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
 }
