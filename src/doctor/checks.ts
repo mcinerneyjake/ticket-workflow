@@ -56,6 +56,7 @@ export interface DoctorFacts {
     readonly probed: boolean;
     readonly configured: boolean;
     readonly resolved: boolean;
+    readonly timedOut: boolean;
     readonly version: string | null;
   } | null;
   /**
@@ -232,6 +233,18 @@ export function checkMcp(f: DoctorFacts): CheckResult {
   if (!f.mcp.probed) return { id, status: 'unknown', detail: 'not probed (--no-mcp)' };
   if (!f.mcp.configured) {
     return { id, status: 'unknown', detail: 'no ticket-workflow MCP server is configured for this user' };
+  }
+  // MISMATCH, deliberately, even though the budget expiring is genuinely ambiguous: an MCP server is
+  // long-lived, so one that boots and never answers stays alive and lands here — that is the ORDINARY
+  // shape of a broken server, not a rare one. UNKNOWN is exit 0 outside --strict, so routing this
+  // there would let the commonest breakage exit clean. The wording carries the ambiguity instead
+  // (tkt-38391beace3e).
+  if (f.mcp.timedOut) {
+    return {
+      id,
+      status: 'mismatch',
+      detail: 'the configured MCP server did not answer initialize within the probe budget — it is either broken or this machine is too loaded to judge; re-run on an idle machine to tell them apart',
+    };
   }
   if (!f.mcp.resolved) {
     return {

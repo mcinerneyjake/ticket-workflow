@@ -207,7 +207,7 @@ const ALL_OK_FACTS: DoctorFacts = {
   canonicalShas: {},
   installs: [{ root: '/tools', version: '9.9.9' }],
   selfVersion: '9.9.9',
-  mcp: { probed: true, configured: true, resolved: true, version: '9.9.9' },
+  mcp: { probed: true, configured: true, resolved: true, timedOut: false, version: '9.9.9' },
   board: { root: '/b', via: 'writer wiring', ticketsDir: '/b/tickets', ticketsDirExists: true, targets: [{ source: 'w', root: '/b' }] },
   protectedBranch: { current: 'feat/x', protects: ['main'], existing: ['main'], hasRemote: true },
   lastHookEventAt: '2026-08-16T00:00:00.000Z',

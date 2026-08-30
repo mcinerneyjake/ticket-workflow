@@ -28,7 +28,7 @@ const HEALTHY: DoctorFacts = {
   canonicalShas: { 'guard-bash': 'aaa', 'guard-ticket': 'bbb' },
   installs: [{ root: '/tools', version: '0.13.0' }],
   selfVersion: '0.13.0',
-  mcp: { probed: true, configured: true, resolved: true, version: '0.13.0' },
+  mcp: { probed: true, configured: true, resolved: true, timedOut: false, version: '0.13.0' },
   board: {
     root: '/board',
     via: 'BOARD_DIR_OVERRIDE',
@@ -217,16 +217,29 @@ describe('pin', () => {
 
 describe('mcp / board', () => {
   it('MISMATCHes when the configured MCP binary does not answer', () => {
-    expect(checkMcp(facts({ mcp: { probed: true, configured: true, resolved: false, version: null } })).status).toBe('mismatch');
+    expect(checkMcp(facts({ mcp: { probed: true, configured: true, resolved: false, timedOut: false, version: null } })).status).toBe('mismatch');
   });
 
   it('is UNKNOWN when no MCP server is configured, and when the config is unreadable', () => {
-    expect(checkMcp(facts({ mcp: { probed: true, configured: false, resolved: false, version: null } })).status).toBe('unknown');
+    expect(checkMcp(facts({ mcp: { probed: true, configured: false, resolved: false, timedOut: false, version: null } })).status).toBe('unknown');
     expect(checkMcp(facts({ mcp: null })).status).toBe('unknown');
   });
 
+  it('keeps a timed-out probe at MISMATCH, so it cannot exit 0 outside --strict', () => {
+    // The tempting reading is UNKNOWN ("I could not tell"). It is wrong where it costs most: an MCP
+    // server is long-lived, so one that boots and never answers times out rather than dying — the
+    // ORDINARY broken shape. UNKNOWN is exit 0 without --strict, so that reading would let the
+    // commonest breakage exit clean. The exit-code assertion is the point of this test, not the
+    // status (tkt-38391beace3e).
+    const f = facts({ mcp: { probed: true, configured: true, resolved: false, timedOut: true, version: null } });
+    const r = checkMcp(f);
+    expect(r.status).toBe('mismatch');
+    expect(r.detail).toContain('did not answer initialize within');
+    expect(exitCodeFor([r], false)).toBe(2);
+  });
+
   it('says "not probed" rather than "could not be read" under --no-mcp', () => {
-    const r = checkMcp(facts({ mcp: { probed: false, configured: false, resolved: false, version: null } }));
+    const r = checkMcp(facts({ mcp: { probed: false, configured: false, resolved: false, timedOut: false, version: null } }));
     expect(r.status).toBe('unknown');
     expect(r.detail).toContain('not probed');
   });
