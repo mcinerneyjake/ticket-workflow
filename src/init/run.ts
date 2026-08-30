@@ -23,10 +23,14 @@ export interface InitResult {
  *  BLOCKED moves init's exit code. `hook-launcher` is here because the audit now EXECUTES the
  *  launcher: before `npm install` it correctly blocks everything, which is unverifiable rather than
  *  conformant, and must not read as a PASS. */
-export const EXPECTED_FRESH_BLOCKED: ReadonlySet<string> = new Set(['eslint-rules', 'tsconfig-strict', 'branch-protection', 'hook-launcher']);
+export const EXPECTED_FRESH_BLOCKED: ReadonlySet<string> = new Set(['eslint-rules', 'tsconfig-strict', 'branch-protection', 'hook-launcher', 'gitignore']);
 
 /** See the tolerance narrowing in runInit. Pinned against the check's own details by init.test.ts. */
 export const LAUNCHER_ENV_NOT_READY: readonly string[] = ['cannot load the guard', 'node is not on PATH'];
+
+/** Same narrowing, for the gitignore check: it evaluates the rules by asking git, so a machine
+ *  without git cannot answer. Any OTHER blocked reason means the probe ran and went wrong. */
+export const GITIGNORE_ENV_NOT_READY: readonly string[] = ['git is not on PATH'];
 
 export const GATE_SCRIPTS = {
   typecheck: 'tsc -p tsconfig.json',
@@ -165,6 +169,10 @@ export function runInit(
   const launcher = report.results.find((r) => r.id === 'hook-launcher');
   if (launcher?.status === 'blocked' && !LAUNCHER_ENV_NOT_READY.some((phrase) => launcher.detail.includes(phrase))) {
     tolerable.delete('hook-launcher');
+  }
+  const ignoreRules = report.results.find((r) => r.id === 'gitignore');
+  if (ignoreRules?.status === 'blocked' && !GITIGNORE_ENV_NOT_READY.some((phrase) => ignoreRules.detail.includes(phrase))) {
+    tolerable.delete('gitignore');
   }
   const gating = report.results.filter((r) => !r.advisory);
   const blocked = gating.filter((r) => r.status === 'blocked');

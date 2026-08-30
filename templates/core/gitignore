@@ -14,4 +14,4 @@ tickets/
 events/
 
 # Claude Code per-session worktrees — checkouts, never sources.
-.claude/worktrees/
+.claude/worktrees

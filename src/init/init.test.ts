@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardrailTemplates } from '../templates.js';
-import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS, LAUNCHER_ENV_NOT_READY } from './run.js';
+import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS, GITIGNORE_ENV_NOT_READY, LAUNCHER_ENV_NOT_READY } from './run.js';
 import { parseInitArgs, cmdInit } from '../cli/index.js';
 import type { Exec } from '../audit/types.js';
 
@@ -279,6 +279,29 @@ describe('init tolerates hook-launcher BLOCKED only when the environment is not 
     const blocked = runInit(dir, {}, noNode).report.results.find((r) => r.id === 'hook-launcher');
     expect(blocked?.status).toBe('blocked');
     expect(LAUNCHER_ENV_NOT_READY.some((p) => blocked?.detail.includes(p)), `untolerated detail: ${blocked?.detail}`).toBe(true);
+  });
+
+  it('the tolerated gitignore phrase is the one the check actually emits', () => {
+    // Same coupling as the launcher above: runInit matches this substring against the check's real
+    // detail, so a reworded message must redden here rather than silently stop being tolerated.
+    const dir = tempDir();
+    const blocked = runInit(dir, {}, () => ({ kind: 'absent' })).report.results.find((r) => r.id === 'gitignore');
+    expect(blocked?.status).toBe('blocked');
+    expect(GITIGNORE_ENV_NOT_READY.some((p) => blocked?.detail.includes(p)), `untolerated detail: ${blocked?.detail}`).toBe(true);
+  });
+
+  it('a gitignore probe that RAN and failed is not fresh-scaffold state — init exits non-zero', () => {
+    const dir = tempDir();
+    // git present, but the probe itself goes wrong: nothing about the ignore rules was verified.
+    const badProbe: Exec = (cmd, args) => {
+      if (cmd !== 'git') return { kind: 'absent' };
+      if (args[0] === 'init') return { kind: 'ran', ok: true, status: 0, stdout: '', stderr: '' };
+      if (args.includes('check-ignore')) return { kind: 'error', message: 'EAGAIN' };
+      return { kind: 'absent' };
+    };
+    const result = runInit(dir, {}, badProbe);
+    expect(result.report.results.find((r) => r.id === 'gitignore')?.status).toBe('blocked');
+    expect(result.exitCode, 'ignore rules never checked must not read as a healthy scaffold').toBe(1);
   });
 
   it('a spawn ERROR is not fresh-scaffold state — init exits non-zero rather than reporting success', () => {

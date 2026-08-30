@@ -418,9 +418,13 @@ Pair it with the `warn-stale-worktree` SessionStart hook: this command creates w
 catches the ones left behind — a stale worktree carries its own `CLAUDE.md`, and stale instructions
 on disk still instruct.
 
-The `gitignore` audit check requires `.claude/worktrees/` to be ignored. An unignored worktree shows
-up as a mountain of untracked files in the main checkout, which is exactly when someone reaches for
-`git add -A` and commits another session's in-flight work.
+The `gitignore` audit check requires `.claude/worktrees` to be ignored — **without a trailing
+slash**, which matches directories only and so misses a worktree materialised as a symlink. An
+unignored worktree shows up as a mountain of untracked files in the main checkout, which is exactly
+when someone reaches for `git add -A` and commits another session's in-flight work. The check asks
+git for the ignore effect in a scratch repository holding only this repo's committed ignore files,
+so neither your global ignore file nor a `.claude/worktrees` directory already on disk can change
+the verdict.
 
 ## `verify` — checking a ticket's claims against the record
 
