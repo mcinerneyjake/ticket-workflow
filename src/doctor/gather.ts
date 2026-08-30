@@ -221,10 +221,20 @@ function installRootFor(file: string): { root: string; version: string | null } 
 // MCP
 // ---------------------------------------------------------------------------------------------
 
+/** Interactive-CLI budget. Tests inject their own rather than inherit this one. */
+const DEFAULT_MCP_TIMEOUT_MS = 8000;
+
+function validTimeout(ms: number | undefined): number {
+  return typeof ms === 'number' && Number.isFinite(ms) && ms > 0 ? ms : DEFAULT_MCP_TIMEOUT_MS;
+}
+
 interface McpFact {
   probed: boolean;
   configured: boolean;
   resolved: boolean;
+  /** The budget expired with no reply, rather than the server failing outright. Diagnostic only —
+   *  both are MISMATCH, because this cannot tell a silent server from a slow machine. */
+  timedOut: boolean;
   version: string | null;
   /** Board root pinned in the server's env, so it can be compared with the writer's. */
   boardRoot: string | null;
@@ -235,9 +245,12 @@ interface McpFact {
  *
  * This deliberately does NOT claim to observe a running server — a session's server is not visible
  * from here. It answers the weaker, checkable question: would a new session's server start and
- * speak? A timeout resolves to `resolved: false`, which is a MISMATCH, not a silent pass.
+ * speak? Both a server that cannot start and one that never answers are MISMATCH; `timedOut` only
+ * separates them in the WORDING, never in the verdict. It cannot: a long-lived server that boots and
+ * stays silent is indistinguishable from a machine too slow to boot it, and the permissive reading of
+ * that tie is the one breakage doctor exists to catch.
  */
-async function probeMcp(home: string, root: string, timeoutMs = 8000): Promise<McpFact | null> {
+async function probeMcp(home: string, root: string, timeoutMs = DEFAULT_MCP_TIMEOUT_MS): Promise<McpFact | null> {
   const config = asRecord(readJson(path.join(home, '.claude.json')));
   const projectConfig = asRecord(readJson(path.join(root, '.mcp.json')));
   if (!config && !projectConfig) return null;
@@ -249,7 +262,7 @@ async function probeMcp(home: string, root: string, timeoutMs = 8000): Promise<M
     asRecord(perProject?.mcpServers),
     config ? asRecord(config.mcpServers) : null,
   ];
-  const absent: McpFact = { probed: true, configured: false, resolved: false, version: null, boardRoot: null };
+  const absent: McpFact = { probed: true, configured: false, resolved: false, timedOut: false, version: null, boardRoot: null };
 
   const entry = servers
     .filter((s): s is Record<string, unknown> => s !== null)
@@ -263,7 +276,8 @@ async function probeMcp(home: string, root: string, timeoutMs = 8000): Promise<M
   const extraEnv: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) if (typeof v === 'string') extraEnv[k] = v;
   const boardRoot = extraEnv.BOARD_DIR_OVERRIDE ?? null;
-  const dead: McpFact = { probed: true, configured: true, resolved: false, version: null, boardRoot };
+  const dead: McpFact = { probed: true, configured: true, resolved: false, timedOut: false, version: null, boardRoot };
+  const expired: McpFact = { ...dead, timedOut: true };
 
   return new Promise<McpFact>((resolve) => {
     let child: ReturnType<typeof spawn>;
@@ -285,7 +299,7 @@ async function probeMcp(home: string, root: string, timeoutMs = 8000): Promise<M
       child.kill();
       resolve(fact);
     };
-    const timer = setTimeout(() => done(dead), timeoutMs);
+    const timer = setTimeout(() => done(expired), timeoutMs);
     // A spawn that fails emits 'error', never 'exit'; with no listener the promise would hang until
     // the timeout and report a working server as merely slow.
     child.on('error', () => done(dead));
@@ -299,7 +313,7 @@ async function probeMcp(home: string, root: string, timeoutMs = 8000): Promise<M
         const result = body ? asRecord(body.result) : null;
         const info = result ? asRecord(result.serverInfo) : null;
         if (info) {
-          done({ probed: true, configured: true, resolved: true, version: typeof info.version === 'string' ? info.version : null, boardRoot });
+          done({ probed: true, configured: true, resolved: true, timedOut: false, version: typeof info.version === 'string' ? info.version : null, boardRoot });
         }
       }
     });
@@ -431,6 +445,10 @@ export interface GatherOptions {
   readonly cwd?: string;
   readonly now?: string;
   readonly probeMcpServer?: boolean;
+  /** Probe budget in ms. Injectable so a test is not bound to a wall-clock number chosen for
+   *  interactive CLI use. Non-positive or non-finite falls back to the default: a 0 here would expire
+   *  every probe before the child could answer, turning the check off by way of a wrong value. */
+  readonly mcpTimeoutMs?: number;
   /** Injectable so a test can drive a fixture machine free of the session's own variables. */
   readonly env?: NodeJS.ProcessEnv;
 }
@@ -506,8 +524,8 @@ export async function gatherFacts(opts: GatherOptions = {}): Promise<DoctorFacts
 
   const mcp: McpFact | null =
     opts.probeMcpServer === false
-      ? { probed: false, configured: false, resolved: false, version: null, boardRoot: null }
-      : await probeMcp(home, root);
+      ? { probed: false, configured: false, resolved: false, timedOut: false, version: null, boardRoot: null }
+      : await probeMcp(home, root, validTimeout(opts.mcpTimeoutMs));
   const targets = [
     ...writerBoards,
     ...(mcp?.boardRoot ? [{ source: 'mcp server', root: mcp.boardRoot }] : []),

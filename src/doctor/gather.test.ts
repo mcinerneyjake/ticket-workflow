@@ -233,6 +233,13 @@ describe('probing the MCP server', () => {
     return file;
   };
 
+  // Starts fine, reads stdin, never replies — the only way to reach the budget on purpose.
+  const hangingServer = (dir: string): string => {
+    const file = path.join(dir, 'hang.mjs');
+    fs.writeFileSync(file, 'process.stdin.resume();\n');
+    return file;
+  };
+
   const wireMcp = (command: string, args: string[]): void => {
     fs.writeFileSync(
       path.join(home, '.claude.json'),
@@ -240,7 +247,12 @@ describe('probing the MCP server', () => {
     );
   };
 
-  const probe = () => gatherFacts({ home, cwd: repo, env: {}, now: '2026-08-16T00:00:00.000Z' });
+  // ~2x the 8s CLI budget that made a loaded machine assert as a broken one, and deliberately UNDER
+  // vitest's 20s testTimeout: above it the probe would never settle, so `clearTimeout` and
+  // `child.kill()` would never run and a failing test would leak a live node (tkt-38391beace3e).
+  const PROBE_MS = 15_000;
+  const probe = () =>
+    gatherFacts({ home, cwd: repo, env: {}, mcpTimeoutMs: PROBE_MS, now: '2026-08-16T00:00:00.000Z' });
 
   it('reads a reply from a server that answers and exits', async () => {
     wireMcp(process.execPath, [fakeServer(root)]);
@@ -269,6 +281,35 @@ describe('probing the MCP server', () => {
     const facts = await probe();
     expect(facts.mcp?.configured).toBe(true);
     expect(facts.mcp?.resolved).toBe(true);
+  });
+
+  it('falls back to the default budget rather than letting 0 expire every probe', async () => {
+    // Without the guard this is setTimeout(..., 0): the probe expires before any server can answer,
+    // so one wrong option value turns the mcp check into a permanent MISMATCH rather than failing
+    // loudly about the option.
+    wireMcp(process.execPath, [fakeServer(root)]);
+    const facts = await gatherFacts({ home, cwd: repo, env: {}, mcpTimeoutMs: 0, now: '2026-08-16T00:00:00.000Z' });
+    expect(facts.mcp?.resolved).toBe(true);
+    expect(facts.mcp?.timedOut).toBe(false);
+  });
+
+  it('separates a probe that ran out of budget from a server that could not start', async () => {
+    // The flake this was filed for is a wall-clock race and is NOT reproduced here. What is, is the
+    // defect underneath it: an expired budget was byte-identical to a dead server, so doctor could
+    // not word the two differently. Both stay MISMATCH — see the checks.ts test for why.
+    // Only the expired arm wants a short budget. The cannot-start arm settles on spawn's `error`
+    // event, so it takes the generous one: a 50ms window there would be a wall-clock race on exactly
+    // the loaded machine this ticket is about.
+    wireMcp(process.execPath, [hangingServer(root)]);
+    const expired = await gatherFacts({ home, cwd: repo, env: {}, mcpTimeoutMs: 50, now: '2026-08-16T00:00:00.000Z' });
+    wireMcp(path.join(root, 'no-such-binary'), []);
+    const cannotStart = await probe();
+
+    // Both unresolved and both configured: `timedOut` is the ONLY field that tells them apart.
+    expect(expired.mcp?.resolved).toBe(false);
+    expect(cannotStart.mcp?.resolved).toBe(false);
+    expect(expired.mcp?.timedOut).toBe(true);
+    expect(cannotStart.mcp?.timedOut).toBe(false);
   });
 });
 
