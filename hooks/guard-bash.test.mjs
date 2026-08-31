@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseGit, cdTarget, decide } from './guard-bash.mjs';
+import { splitSegments } from './lib/shell.mjs';
 import { protectedBranches } from './lib/default-branch.mjs';
 
 // Git's repo context is exported into hook environments and inherited by `npm test` — absolute in a
@@ -68,12 +69,61 @@ describe('cdTarget', () => {
     expect(cdTarget('cd ~someuser/repo', KANBAN)).toBeNull();
   });
 
-  it('returns null for a quoted path with a space rather than a truncated one', () => {
-    // Tokens are whitespace-split upstream, so '/repos/my repo' arrives as '"/repos/my'.
-    // Returning '/repos/my' would judge that repo by a different one's branch.
-    expect(cdTarget('cd "/repos/my repo"', KANBAN)).toBeNull();
-    expect(cdTarget("cd '/repos/my repo'", KANBAN)).toBeNull();
+  it('keeps a balanced quoted span together instead of truncating it', () => {
+    // Whitespace-splitting delivered '"/repos/my' — a truncated path that still RESOLVES, so the
+    // guard judged one repo by another's branch. Naming it is what makes latching an unresolvable
+    // cd safe: a quoted spaced path is nameable, so it must be resolved rather than refused
+    // (tkt-a4c21bf57492).
+    expect(cdTarget('cd "/repos/my repo"', KANBAN)).toBe('/repos/my repo');
+    expect(cdTarget("cd '/repos/my repo'", KANBAN)).toBe('/repos/my repo');
+    expect(cdTarget('cd "../my repo"', KANBAN)).toBe('/repos/my repo');
     expect(cdTarget('cd "/repos/other"', KANBAN)).toBe(OTHER);
+  });
+
+  it('reaches cd through group punctuation and an env prefix', () => {
+    // The `^[({\s]+` strip runs on the WHOLE string, not per token. Losing that is one of the two
+    // fail-opens tkt-3006d09810f7 reverted, so quotedTokens must not reintroduce it — the third row
+    // is the one that binds both halves at once.
+    expect(cdTarget('( FOO=bar cd /repos/other', KANBAN)).toBe(OTHER);
+    expect(cdTarget('(cd /repos/other)', KANBAN)).toBe(OTHER);
+    expect(cdTarget('( FOO=bar cd "/repos/my repo"', KANBAN)).toBe('/repos/my repo');
+  });
+
+  it('dequotes a span anywhere in the token, not only one that wraps it', () => {
+    // A first-char/last-char test calls all of these unbalanced, and with the latch below that turns
+    // a REFUSAL into the answer for a directory the command names perfectly well — the false block
+    // that reverted tkt-3006d09810f7, one spelling over. Raised by review on tkt-a4c21bf57492.
+    expect(cdTarget('cd "/repos/my repo"/sub', KANBAN)).toBe('/repos/my repo/sub');
+    expect(cdTarget('cd "/repos/my repo"/', KANBAN)).toBe('/repos/my repo/');
+    expect(cdTarget('cd /repos/"my repo"', KANBAN)).toBe('/repos/my repo');
+    expect(cdTarget("cd /repos/'my repo'", KANBAN)).toBe('/repos/my repo');
+    // The fused form is the one that was FAIL-OPEN: it does not start with a quote, so nothing
+    // stripped it, and `/repos/"my repo"` resolved as a real-looking path nobody named.
+    expect(cdTarget('cd /a/"b c"', KANBAN)).toBe('/a/b c');
+  });
+
+  it('still returns null for an UNTERMINATED quote', () => {
+    // The span was truncated before it reached us, so no directory is named — the fail-closed
+    // reading, and the one quoted shape that must still latch.
+    expect(cdTarget('cd "/repos/my repo', KANBAN)).toBeNull();
+    expect(cdTarget("cd '/repos/my repo", KANBAN)).toBeNull();
+    expect(cdTarget('cd /repos/"my repo', KANBAN)).toBeNull();
+  });
+
+  it('reads the operand past cd option flags, but not past a bare dash', () => {
+    // `cd -P /x` names a directory; only a BARE `-` is OLDPWD, which cannot be resolved. Latching
+    // the flag forms refused a nameable directory — the same false block as above (review finding).
+    expect(cdTarget('cd -P /repos/other', KANBAN)).toBe(OTHER);
+    expect(cdTarget('cd -L /repos/other', KANBAN)).toBe(OTHER);
+    expect(cdTarget('cd -- /repos/other', KANBAN)).toBe(OTHER);
+    expect(cdTarget('cd -P "/repos/my repo"', KANBAN)).toBe('/repos/my repo');
+    expect(cdTarget('cd -', KANBAN)).toBeNull();
+    expect(cdTarget('cd -P', KANBAN)).toBeNull(); // no operand — goes HOME, unknowable
+    // `--` is how a shell names a directory that LOOKS like a flag, so the operand after it is a
+    // path however it starts. Added because mutating `target === '-'` to `target.startsWith('-')`
+    // left the suite green: after operandOf consumes the flags nothing else begins with a dash, so
+    // this is the only input that tells the two spellings apart.
+    expect(cdTarget('cd -- -weird', KANBAN)).toBe('/repos/kanban/-weird');
   });
 });
 
@@ -348,13 +398,12 @@ describe('decide — a cd the parser missed must not exempt a commit (tkt-3006d0
     expect(fromMain(`git commit -m x | (cd ${OTHER})`)).toBe(true);
   });
 
-  it('leaves an EXPLICIT unresolvable cd falling back to the session, as before', () => {
-    // Deliberately unchanged, and pinned so the scope of this fix stays legible. An explicit
-    // `cd <unparseable>` keeps the documented fall-back-to-session residual; only a move hidden
-    // behind a pipeline or compound statement latches unknownDir. Latching both also refuses
-    // `cd "<path with a space>"`, a nameable directory this parser simply cannot read.
-    expect(from('cd $D && git commit -m x')).toBe(false);
-    expect(from('cd "/repos/my repo" && git commit -m x')).toBe(false);
+  it('latches an EXPLICIT unresolvable cd too, now that a quoted span survives', () => {
+    // Pinned the other way while `cd "<path with a space>"` still arrived here unresolvable:
+    // latching then refused a nameable directory, with a remedy that had no valid spelling. The
+    // tokenizer fix removes that case from the set, so the latch can cover the rest. Full adversary
+    // list in the tkt-a4c21bf57492 block below.
+    expect(from('cd $D && git commit -m x')).toBe(true);
   });
 
   it('still follows a cd into a feature branch from a session on main', () => {
@@ -600,6 +649,154 @@ describe('the real hook, end to end', () => {
     expect(runHook('cd /nonexistent-xyz && git commit -m x', onMain)).toBe(2);
     expect(runHook('cd - && git commit -m x', onMain)).toBe(2);
     expect(runHook('cd $NOPE && git commit -m x', onMain)).toBe(2);
+  });
+});
+
+// tkt-a4c21bf57492. An explicit `cd` whose target this parser cannot NAME used to leave `dir` null
+// without latching `unknownDir`, and a null dir alone falls back to the SESSION repo — a feature
+// branch while a ticket is being worked, i.e. the permissive answer. The fix could not be the latch
+// alone: `cd "<path with a space>"` reached the same slot, and refusing it would refuse a directory
+// that is perfectly nameable, with a remedy ("a plain literal path") that has no valid spelling for
+// such a path. That is why tkt-3006d09810f7 wrote this fix and reverted it. Tokenizer first, then
+// the latch.
+describe('decide — an explicit cd it cannot name must not exempt a commit (tkt-a4c21bf57492)', () => {
+  // Two repos whose paths contain a space, one per branch state, so "resolved to the right repo"
+  // and "refused because unresolvable" cannot be confused for one another: a block proves nothing
+  // on its own, since the latch would produce one too.
+  const SPACED_MAIN = '/repos/my repo';
+  const SPACED_FEAT = '/repos/other one';
+  const fourRepos = byDir({
+    [KANBAN]: 'main',
+    [OTHER]: 'feat/x',
+    [SPACED_MAIN]: 'main',
+    [SPACED_FEAT]: 'feat/y',
+  });
+  // As the block above: the resolver must fall back to the SESSION's branch for a dir it does not
+  // know, because that is what currentBranch does. A stub returning null models a contract the code
+  // does not have, and the pre-existing branch===null rule would then satisfy every case here
+  // whether or not the latch exists.
+  const sessionAt = (home) => (d) => fourRepos(d) ?? fourRepos(home);
+  const at = (home, cmd) => decide(cmd, sessionAt(home), home);
+  const from = (cmd) => at(OTHER, cmd).blocked;      // session on feat/x — the permissive direction
+  const fromMain = (cmd) => at(KANBAN, cmd).blocked; // session on main
+
+  // ---- the tokenizer half: a quoted spaced path is NAMEABLE, so it must resolve ----
+
+  it('does not refuse a quoted spaced target carrying a suffix', () => {
+    // Review finding: `"…"/sub` failed a first/last-char balance test, so the new latch REFUSED a
+    // directory the command names. Before this ticket it fell back to the session and was allowed,
+    // so the latch turned a fail-open into a false block rather than into a correct answer.
+    const r = at(OTHER, `cd "${SPACED_FEAT}"/sub && git commit -m x`);
+    expect(r.reason ?? '', 'a nameable directory must not be refused').not.toMatch(/cannot name/i);
+    // ...and the fused spelling is judged where it points, not at the session.
+    expect(fromMain(`cd /repos/"other one" && git commit -m x`)).toBe(false);
+    expect(from(`cd /repos/"my repo" && git commit -m x`)).toBe(true);
+  });
+
+  it('does not refuse a cd carrying an option flag', () => {
+    expect(fromMain(`cd -P ${OTHER} && git commit -m x`)).toBe(false);
+    expect(from(`cd -P ${KANBAN} && git commit -m x`)).toBe(true);
+    expect(from('cd -P $D && git commit -m x')).toBe(true); // flag + unnameable operand still latches
+  });
+
+  it('judges a quoted spaced target at THAT repo, in both directions', () => {
+    // The direction that binds the tokenizer rather than the latch: from a session on main, a
+    // quoted path naming a FEATURE repo must be ALLOWED. Truncation ('"/repos/my') or a null both
+    // produce a block here, so only real resolution passes.
+    expect(fromMain(`cd "${SPACED_FEAT}" && git commit -m x`)).toBe(false);
+    expect(fromMain(`cd '${SPACED_FEAT}' && git commit -m x`)).toBe(false);
+    // ...and the reverse still blocks, for the RIGHT reason — not as an unresolvable move.
+    const blocked = at(OTHER, `cd "${SPACED_MAIN}" && git commit -m x`);
+    expect(blocked.blocked).toBe(true);
+    expect(blocked.reason, `blocked for the wrong reason: ${blocked.reason}`).toMatch(/commits to main/i);
+  });
+
+  it('cannot reach the UNTERMINATED-quote latch through decide, and says so', () => {
+    // Scoped down after review refuted the first version, which said "unbalanced" and generalized
+    // from one spelling. `cd "/a/b c"/sub` IS unbalanced by a first/last-char test, DOES split in
+    // two, and did reach the latch — a reachable false block, now fixed by dequoting properly.
+    // What survives is the narrower claim: an UNTERMINATED quote suppresses splitSegments' own
+    // split points and swallows the rest of the command, newline included, so no git segment can
+    // follow it. The balanced form is the positive control.
+    expect(splitSegments('cd "/repos/my repo && git commit -m x')).toHaveLength(1);
+    expect(splitSegments('cd "/repos/my repo" && git commit -m x')).toHaveLength(2);
+    expect(splitSegments('cd "/repos/my repo\ngit commit -m x')).toHaveLength(1);
+    // The refuted counterexample, now resolving rather than latching.
+    expect(splitSegments('cd "/repos/my repo"/sub && git commit -m x')).toHaveLength(2);
+    expect(cdTarget('cd "/repos/my repo"/sub', KANBAN)).toBe('/repos/my repo/sub');
+    // So the fail-closed reading of an unterminated quote is observable only one level down, where
+    // the cdTarget suite above asserts it. Recorded rather than deleted: a reader who adds a
+    // `decide`-level case for it will watch it pass while binding nothing.
+    expect(cdTarget('cd "/repos/my repo', KANBAN)).toBeNull();
+  });
+
+  // ---- the latch half: a genuinely unnameable target refuses commit and push ----
+
+  it('blocks a commit after every unnameable explicit cd spelling', () => {
+    for (const move of ['cd $D', 'cd', 'cd -', 'cd ~someuser/repo']) {
+      const r = at(OTHER, `${move} && git commit -m x`);
+      expect(r.blocked, `${move} must latch`).toBe(true);
+      expect(r.reason, `${move} blocked for the wrong reason`).toMatch(/cannot name/i);
+    }
+  });
+
+  it('blocks a push the same way — the latch is scoped to commit AND push', () => {
+    expect(from('cd $D && git push origin feat/x')).toBe(true);
+  });
+
+  it("blocks the hook header's own worked example", () => {
+    // Printed in guard-bash.mjs as a shape it does not defend ("poisoning the unresolvable-dir
+    // slot"). A switch between the two moves is what made it interesting: it repoints the branch
+    // map for the unknown dir, but the latch is not read from the branch.
+    expect(from('cd $A && git switch -c x && cd $B && git commit -m x')).toBe(true);
+  });
+
+  // ---- controls: a fix that blocks everything is not a fix ----
+
+  it('does not wedge reads or non-git work after an unnameable cd', () => {
+    expect(from('cd $D && git status')).toBe(false);
+    expect(from('cd $D && git log --oneline')).toBe(false);
+    expect(from('cd $D && npm test')).toBe(false);
+  });
+
+  it('clears the latch when a nameable cd follows, and re-latches when one precedes', () => {
+    expect(fromMain(`cd $D && cd ${OTHER} && git commit -m x`)).toBe(false); // cleared → judged at OTHER
+    expect(from(`cd $D && cd ${KANBAN} && git commit -m x`)).toBe(true);     // cleared → judged at KANBAN
+    expect(from(`cd ${OTHER} && cd $D && git commit -m x`)).toBe(true);      // re-latched
+  });
+
+  it('restores the latch as a pair with dir when a subshell closes', () => {
+    // The inner move is scoped to the subshell, so the commit after it runs in the session repo.
+    expect(from('(cd $D && ls) && git commit -m x')).toBe(false);
+    expect(fromMain('(cd $D && ls) && git commit -m x')).toBe(true);
+    // ...and a latch set INSIDE must not leak past the close, nor be cleared by a nameable inner cd.
+    expect(from(`(cd $D && (cd ${OTHER} && ls)) && git commit -m x`)).toBe(false);
+  });
+
+  it('honors an absolute -C through the latch, and refuses a relative one', () => {
+    expect(from(`cd $D && git -C ${OTHER} commit -m x`)).toBe(false);
+    expect(from(`cd $D && git -C ${KANBAN} commit -m x`)).toBe(true); // binds the OTHER direction
+    expect(from('cd $D && git -C ../other commit -m x')).toBe(true);
+    // A QUOTED -C path is deliberately absent: parseGit still whitespace-splits, so `git -C "/a/b c"
+    // commit` is not recognized as a commit at all and passes every rule. Review found this row
+    // asserting `false` and PASSING for that reason — a control binding nothing. It is a
+    // pre-existing fail-open in parseGit, filed separately rather than fixed here.
+  });
+
+  it('leaves both directions of the plain cd-following rule untouched', () => {
+    // kanban's .claude/settings.audit.test.mjs asserts both against the pinned build.
+    expect(fromMain(`cd ${OTHER} && git commit -m x`)).toBe(false);
+    expect(from(`cd ${KANBAN} && git commit -m x`)).toBe(true);
+  });
+
+  it('leaves a resolvable-but-nonexistent target falling back, NOT latching', () => {
+    // The spelling kanban pins as a deliberate fail-open is an UNQUOTED spaced path, whose first
+    // token is a real absolute path — mis-named, not un-nameable. This fix does not close it, and
+    // must not appear to: kanban's audit runs the pinned build and would go red on a tag bump.
+    const spaced = at(OTHER, '/repos/my repo');
+    expect(spaced).toBeDefined();
+    expect(from('cd /repos/my repo && git commit -m x')).toBe(false);
+    expect(from('cd /typo-dir && git commit -m x')).toBe(false);
   });
 });
 

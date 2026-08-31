@@ -41,8 +41,10 @@ import { dirTarget, hasTopLevelBackground, hasTopLevelPipe, hiddenDirMove, resol
 export const HOOK_STEPS = ['branch', 'typecheck', 'lint', 'test', 'commit', 'pr_opened', 'review'];
 
 // Strip leading subshell/group punctuation and simple VAR=val env prefixes,
-// returning a command segment's token list (mirrors guard-bash's parsing so
-// `echo "npm run lint"` isn't mistaken for the real command).
+// returning a command segment's token list. Shares the STRIP with guard-bash's parsing so
+// `echo "npm run lint"` isn't mistaken for the real command, but not the tokenizer: dirBuiltin is
+// quote-aware and this is not, which is harmless only because this feeds matchStep (a command-word
+// lookup) rather than directory resolution (tkt-a4c21bf57492).
 function tokenize(segment) {
   const stripped = segment.trim().replace(/^[({\s]+/, '').replace(/[)}\s]+$/, '');
   const tokens = stripped.split(/\s+/).filter(Boolean);
@@ -113,7 +115,9 @@ function matchStep(t) {
 // An UNRESOLVABLE directory records nothing, and is dropped here rather than returned: a caller
 // that received it could only guess, and the one guess available — the session — is the original
 // bug. "Can't tell" must never take the permissive branch. Unresolvable covers `cd -`, `popd`, a
-// quoted or whitespace-split path, a variable, and a move hidden behind a pipeline.
+// whitespace-split path, a variable, an UNTERMINATED quote, and a move hidden behind a pipeline. A
+// terminated quoted span is no longer among them — it names a real directory, and now resolves to it
+// (tkt-a4c21bf57492), so a milestone behind `cd "/a/my repo"` is attributed rather than dropped.
 //
 // WHAT THAT LIST DOES NOT COVER, and it is a real cost of attributing rather than refusing: a `cd`
 // that is DATA still parses as a move, and is now credited to the directory it names instead of
