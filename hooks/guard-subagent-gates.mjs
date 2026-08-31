@@ -122,6 +122,10 @@ export function decide(payload) {
 
   for (const segment of splitSegments(command)) {
     const git = parseGit(segment);
+    // `sub` is null when an unterminated quote swallowed the subcommand, and GATED_GIT.get(null) is
+    // undefined — an allow. Same fail-closed reading as the unreadable-command branch above
+    // (tkt-8f2e1f9894e2).
+    if (git?.truncated) return { blocked: true, reason: describe(payload, 'run a git command whose subcommand an unterminated quote swallowed') };
     const gitGate = git && GATED_GIT.get(git.sub);
     if (gitGate) return { blocked: true, reason: describe(payload, `git ${gitGate}`) };
 
