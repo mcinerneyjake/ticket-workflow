@@ -30,14 +30,18 @@ const twoRepos = byDir({ [KANBAN]: 'main', [OTHER]: 'feat/x' });
 
 describe('parseGit', () => {
   it('extracts the subcommand and args', () => {
-    expect(parseGit('git add -A')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, truncated: false });
-    expect(parseGit('git commit -m "x"')).toEqual({ sub: 'commit', args: ['-m', '"x"'], repoDir: null, truncated: false });
+    expect(parseGit('git add -A')).toEqual({ sub: 'add', args: ['-A'], rawArgs: ['-A'], repoDir: null, truncated: false });
+    expect(parseGit('git commit -m "x"'))
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], rawArgs: ['-m', '"x"'], repoDir: null, truncated: false });
   });
 
   it('captures -C as repoDir, skips -c, skips env prefixes', () => {
-    expect(parseGit('git -C /repo add foo')).toEqual({ sub: 'add', args: ['foo'], repoDir: '/repo', truncated: false });
-    expect(parseGit('git -c user.name=x commit')).toEqual({ sub: 'commit', args: [], repoDir: null, truncated: false });
-    expect(parseGit('FOO=bar git add foo')).toEqual({ sub: 'add', args: ['foo'], repoDir: null, truncated: false });
+    expect(parseGit('git -C /repo add foo'))
+      .toEqual({ sub: 'add', args: ['foo'], rawArgs: ['foo'], repoDir: '/repo', truncated: false });
+    expect(parseGit('git -c user.name=x commit'))
+      .toEqual({ sub: 'commit', args: [], rawArgs: [], repoDir: null, truncated: false });
+    expect(parseGit('FOO=bar git add foo'))
+      .toEqual({ sub: 'add', args: ['foo'], rawArgs: ['foo'], repoDir: null, truncated: false });
   });
 
   it('requires the command word to be git (not just a mention)', () => {
@@ -47,29 +51,29 @@ describe('parseGit', () => {
   });
 
   it('sees through subshell/group punctuation', () => {
-    expect(parseGit('(git add -A)')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, truncated: false });
+    expect(parseGit('(git add -A)')).toEqual({ sub: 'add', args: ['-A'], rawArgs: ['-A'], repoDir: null, truncated: false });
   });
 
-  // A quoted span is ONE token. Quoting is kept in the token rather than stripped here, exactly as
-  // quotedTokens does for cd: resolveDir/dequote own removal, and hiddenDirTarget needs the raw
-  // text (tkt-8f2e1f9894e2).
+  // A quoted span is ONE token. repoDir keeps its quoting — resolveDir owns removal there, and
+  // hiddenDirTarget needs the raw text (tkt-8f2e1f9894e2) — while sub/args come back dequoted and
+  // rawArgs preserves the spelling for the short-flag scan (tkt-6d1ae448e3b3).
   it('keeps a quoted span carrying a space in one token', () => {
     expect(parseGit('git -C "/repos/my repo" commit -m x'))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: '"/repos/my repo"', truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], rawArgs: ['-m', 'x'], repoDir: '"/repos/my repo"', truncated: false });
     expect(parseGit("git -C '/repos/my repo' commit -m x"))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: "'/repos/my repo'", truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], rawArgs: ['-m', 'x'], repoDir: "'/repos/my repo'", truncated: false });
     expect(parseGit('git commit -m "fix -a bug"'))
-      .toEqual({ sub: 'commit', args: ['-m', '"fix -a bug"'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'fix -a bug'], rawArgs: ['-m', '"fix -a bug"'], repoDir: null, truncated: false });
   });
 
   it('skips an env prefix whose quoted value contains a space', () => {
     expect(parseGit('EDITOR="code -w" git commit -m x'))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], rawArgs: ['-m', 'x'], repoDir: null, truncated: false });
   });
 
   it('reports a subcommand swallowed by an unterminated quote, rather than returning null', () => {
     expect(parseGit('git -C "/a/b commit -m x'))
-      .toEqual({ sub: null, args: [], repoDir: '"/a/b commit -m x', truncated: true });
+      .toEqual({ sub: null, args: [], rawArgs: [], repoDir: '"/a/b commit -m x', truncated: true });
     // Still null when there is simply no subcommand — no quote is involved, so nothing was hidden.
     expect(parseGit('git -C /repo')).toBeNull();
   });
@@ -693,6 +697,19 @@ describe('the real hook, end to end', () => {
     expect(runHook('git add -A', noRemote)).toBe(2);
   });
 
+  it('blocks the QUOTED spellings through the real binary too (tkt-6d1ae448e3b3)', () => {
+    // The unit rows for this fix go through decide() with a stubbed branch, so they would pass even
+    // if the real hook never reached the changed code. These drive the actual binary.
+    expect(runHook('git add "."', onFeat)).toBe(2);
+    expect(runHook('git push origin "main"', onFeat)).toBe(2);
+    expect(runHook('git switch "main" && git commit -m x', onFeat)).toBe(2);
+    // Controls: the ordinary shapes this must not start refusing — without them, a hook that blocked
+    // everything would pass the three rows above.
+    expect(runHook('git add src/one.ts', onFeat)).toBe(0);
+    expect(runHook('git commit -m"fix and go"', onFeat)).toBe(0);
+    expect(runHook('git push origin feat/x', onFeat)).toBe(0);
+  });
+
   it('fails CLOSED when the protected branch is genuinely ambiguous', () => {
     // The first version of this test passed `TICKET_WORKFLOW_PROTECTED_BRANCH: ''`, which trims to
     // falsy and is ignored — so it asserted exit 0 and never reached the fail-closed path at all.
@@ -1066,5 +1083,108 @@ describe('protectedBranches resolution', () => {
 
   it('ignores a blank override rather than treating it as a value', () => {
     expect(resolve(['main'], null, { TICKET_WORKFLOW_PROTECTED_BRANCH: '   ' })).toEqual(['main']);
+  });
+});
+
+describe('decide — a quoted VALUE must be judged dequoted (tkt-6d1ae448e3b3)', () => {
+  // tkt-8f2e1f9894e2 kept quoting IN the token so a spaced path survived tokenizing, and left its
+  // removal to resolveDir. Nothing did the same for sub/args, so every rule that compares a VALUE
+  // was matching against a spelling with quote characters still in it — and the quoted spelling of
+  // each is one an assistant writes by habit.
+  const SPACED = '/repos/my repo';
+  const spaced = byDir({ [KANBAN]: 'main', [OTHER]: 'feat/x', [SPACED]: 'main' });
+
+  it('blocks whole-tree staging written with quotes', () => {
+    expect(blocked('git add "."', 'feat/x')).toBe(true);
+    expect(blocked("git add '.'", 'feat/x')).toBe(true);
+    expect(blocked('git add "-A"', 'feat/x')).toBe(true);
+    expect(blocked('git stage "*"', 'feat/x')).toBe(true);
+    // Controls: the unquoted spelling still blocks, and a quoted path that merely CONTAINS a dot
+    // is still not whole-tree staging — the row tkt-8f2e1f9894e2 added must survive dequoting.
+    expect(blocked('git add .', 'feat/x')).toBe(true);
+    expect(blocked('git add "a . b"', 'feat/x')).toBe(false);
+  });
+
+  it('blocks a push whose protected target is quoted', () => {
+    expect(blocked('git push origin "main"', 'feat/x')).toBe(true);
+    expect(blocked("git push origin 'main'", 'feat/x')).toBe(true);
+    expect(blocked('git push origin "feat/x:main"', 'feat/x')).toBe(true);
+    // Controls: unquoted still blocks, and a quoted FEATURE target is still an ordinary push.
+    expect(blocked('git push origin main', 'feat/x')).toBe(true);
+    expect(blocked('git push origin "feat/x"', 'feat/x')).toBe(false);
+  });
+
+  it('records a quoted switch target dequoted, so the commit after it is still judged', () => {
+    expect(blocked('git switch "main" && git commit -m x', 'feat/x')).toBe(true);
+    expect(blocked("git switch 'main' && git commit -m x", 'feat/x')).toBe(true);
+    expect(blocked('git checkout -b "main" && git commit -m x', 'feat/x')).toBe(true);
+    // Controls: the unquoted chain still blocks, and switching to a real feature branch still works.
+    expect(blocked('git switch main && git commit -m x', 'feat/x')).toBe(true);
+    expect(blocked('git switch "feat/y" && git commit -m x', 'feat/x')).toBe(false);
+  });
+
+  it('reads a quoted SUBCOMMAND as the subcommand', () => {
+    expect(blocked('git "commit" -m x', 'main')).toBe(true);
+    expect(blocked("git 'push' origin main", 'feat/x')).toBe(true);
+    expect(blocked('git "status"', 'main')).toBe(false); // control: a read is still a read
+  });
+
+  it('dequotes a span sitting anywhere in the token, not only one that wraps it', () => {
+    // The same shape resolveDir already accepts for -C: `/a/"my repo"` names one path.
+    expect(blocked('git push origin ma"in"', 'feat/x')).toBe(true);
+    expect(blocked('git switch ma"in" && git commit -m x', 'feat/x')).toBe(true);
+  });
+
+  it('blocks destructive shapes written with quotes', () => {
+    expect(blocked('git push origin "+main"', 'feat/x')).toBe(true);
+    expect(blocked('git push "--force" origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('git reset "--hard"', 'feat/x')).toBe(true);
+    expect(blocked('git push --force origin feat/x', 'feat/x')).toBe(true); // control
+  });
+
+  it('still reads short-flag LETTERS raw, so an attached quoted value is not a flag cluster', () => {
+    // The regression this fix must not cause. Dequoting `-m"fix and go"` to `-mfix and go` puts the
+    // message text back into the cluster scan — an `a` reads as `commit -a`, an `f` as a force-push.
+    // That is exactly the false block tkt-8f2e1f9894e2 closed, so flag letters keep reading the RAW
+    // token while values read the dequoted one.
+    expect(blocked('git commit -m"fix and go"', 'feat/x')).toBe(false);
+    expect(blocked("git commit -m'fix and go'", 'feat/x')).toBe(false);
+    expect(blocked('git push -o"ci skip fast" origin feat/x', 'feat/x')).toBe(false);
+    expect(blocked('git commit -am"fix"', 'feat/x')).toBe(true); // control: a real cluster still blocks
+  });
+
+  it('does not let a quoted safe-flag push exempt itself from the main rule', () => {
+    // Dequoting made quoted flags parse as FLAGS for the first time — correct, and it put them in
+    // reach of pushesMain's safeFlag exemption for the first time too. `--mirror` pushes every ref,
+    // main included, so it is not safe in either spelling; the old block was an accident of the
+    // quote making it look like a positional, and the UNQUOTED spelling was walking through.
+    expect(blocked('git push "--mirror"', 'main')).toBe(true);
+    expect(blocked('git push --mirror', 'main')).toBe(true);
+    // Controls: the genuinely safe flags stay exempt in BOTH spellings. Without them, dropping the
+    // exemption wholesale would pass the two rows above.
+    expect(blocked('git push "--tags"', 'main')).toBe(false);
+    expect(blocked('git push --tags', 'main')).toBe(false);
+    expect(blocked('git push "--delete" origin feat/x', 'main')).toBe(false);
+  });
+
+  it('does not pretend an unterminated quote in an ARG fails closed', () => {
+    // `truncated` fires only when the unterminated span swallows the SUBCOMMAND slot. An arg-level
+    // one parses cleanly and falls back to the raw token, so it is an ALLOW. Pinned as documented
+    // behaviour, not as a guarantee — the argValue comment used to claim the opposite.
+    expect(blocked('git push origin "main', 'feat/x')).toBe(false);
+    expect(blocked('git -C "/a/b push origin main', 'feat/x')).toBe(true); // control: subcommand slot
+  });
+
+  it('leaves the -C repo path raw, so resolveDir still owns its dequoting', () => {
+    expect(decide(`git -C "${SPACED}" commit -m x`, spaced, OTHER).blocked).toBe(true);
+    expect(decide(`git -C "${SPACED}" status`, spaced, OTHER).blocked).toBe(false);
+  });
+
+  it('keeps an UNTERMINATED quote falling back to the raw token rather than to null', () => {
+    // dequote() reports null for an unterminated quote. Treating that as an empty value would make
+    // `git add "` compare equal to nothing at all; the raw token is the honest reading, and the
+    // shell rejects the command anyway. The commit/push fail-closed paths are unaffected.
+    expect(blocked('git add "a', 'feat/x')).toBe(false);
+    expect(blocked('git -C "/a/b commit -m x', 'feat/x')).toBe(true); // control: still fails closed
   });
 });

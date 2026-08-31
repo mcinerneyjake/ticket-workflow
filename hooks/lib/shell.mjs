@@ -12,7 +12,11 @@ import { homedir } from 'node:os';
 // guard-bash's latch that turned a nameable directory into a REFUSAL (the suffix form) or into a
 // literal-quote path that resolved to nothing and fell back to the session (the fused form: a
 // fail-open). Both found by review on tkt-a4c21bf57492. null = an unterminated quote.
-function dequote(s) {
+//
+// Exported for guard-bash, whose rules compare an ARG against a known string and so must see the
+// spelling a shell would hand git (tkt-6d1ae448e3b3). One copy, for the reason the rest of this
+// module is shared: a second scanner is how the three here desynchronised (tkt-ad984b09945b).
+export function dequote(s) {
   let out = '';
   let quote = null;
   for (const c of s) {
