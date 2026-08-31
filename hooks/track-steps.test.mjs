@@ -212,8 +212,20 @@ describe('commandToMilestones — which directory each milestone acts on (tkt-27
   // resolveDir returns null for these, and "unresolvable" must not mean "assume the session's
   // repo". That fallback is the whole of tkt-8ada0242e94e's original bug, so it stays closed.
   it('records nothing when the cd target cannot be resolved', () => {
-    for (const cd of ['cd $TARGET', 'cd "$TARGET"', 'cd "/repos/my session"', "cd '/repos/my session'", 'cd ~someuser/x', 'cd -', 'cd'])
+    for (const cd of ['cd $TARGET', 'cd "$TARGET"', 'cd ~someuser/x', 'cd -', 'cd'])
       expect(at(`${cd} && npm test`), cd).toEqual([]);
+  });
+
+  // A quoted spaced path used to sit in the list above, dropped because dirBuiltin whitespace-split
+  // it into a truncated `"/repos/my`. It names a real directory, so dropping it lost a milestone
+  // that did happen and does belong somewhere — the gap tkt-8ada0242e94e set out to close. The
+  // quotes are what distinguish it from an unquoted spaced path, which is still truncated and still
+  // attributed to the wrong directory (tkt-a4c21bf57492).
+  it('attributes a milestone behind a QUOTED spaced cd rather than dropping it', () => {
+    expect(at('cd "/repos/my session" && npm test')).toEqual(['test@/repos/my session']);
+    expect(at("cd '/repos/my session' && npm test")).toEqual(['test@/repos/my session']);
+    // The variable inside quotes is still unresolvable — balanced quotes do not make a `$` nameable.
+    expect(at('cd "$TARGET" && npm test')).toEqual([]);
   });
 
   // The structural guarantee that replaced the injected is-this-ours predicate: an unresolvable

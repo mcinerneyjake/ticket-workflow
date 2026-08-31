@@ -6,12 +6,27 @@
 import { isAbsolute, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 
+// Remove quoting wherever it sits in the token, not only where it wraps the whole of it: `"/a/my
+// repo"`, `"/a/my repo"/sub` and `/a/"my repo"` are all ordinary spellings of one real path. A
+// first-char/last-char test called the last two "unbalanced" — which fed the caller a null, and with
+// guard-bash's latch that turned a nameable directory into a REFUSAL (the suffix form) or into a
+// literal-quote path that resolved to nothing and fell back to the session (the fused form: a
+// fail-open). Both found by review on tkt-a4c21bf57492. null = an unterminated quote.
+function dequote(s) {
+  let out = '';
+  let quote = null;
+  for (const c of s) {
+    if (quote) { if (c === quote) quote = null; else out += c; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    out += c;
+  }
+  return quote ? null : out;
+}
+
 // null rather than a guess — a wrong dir judges one repo by another's branch.
 export function resolveDir(dir, target) {
-  const quoted = /^["']/.test(target);
-  const balanced = quoted && target.length > 1 && target.at(-1) === target[0];
-  if (quoted && !balanced) return null; // whitespace-split upstream truncated a quoted path
-  const t = balanced ? target.slice(1, -1) : target;
+  const t = dequote(target);
+  if (t === null) return null; // an UNTERMINATED quote — the span was truncated, so nothing is named
   if (!t || t.includes('$') || t.includes('*')) return null;
   if (t === '~') return homedir();
   if (t.startsWith('~/')) return join(homedir(), t.slice(2));
@@ -30,20 +45,60 @@ export function resolveDir(dir, target) {
 // Both regressions were fail-opens. Fixing it needs its own adversary list, not a rider on this one.
 function dirBuiltin(segment) {
   const stripped = segment.trim().replace(/^[({\s]+/, '').replace(/[)}\s]+$/, '');
-  const tokens = stripped.split(/\s+/);
+  const tokens = quotedTokens(stripped);
   let cmd = 0;
   while (cmd < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[cmd])) cmd++;
-  return { name: tokens[cmd], target: tokens[cmd + 1] };
+  return { name: tokens[cmd], args: tokens.slice(cmd + 1) };
 }
 
-// undefined = not a cd; null = unresolvable (`cd -`, bare `cd`, a variable). Callers must decide
-// what null means for them: guard-bash falls back to the session repo (a bogus cd cannot exempt
-// itself from the branch rules), track-steps records nothing (a bogus cd cannot misfile a
-// milestone). Both are the fail-CLOSED reading of null for that hook.
+// The directory operand, read PAST option flags: `cd -P /x`, `cd -L /x` and `cd -- /x` all name /x.
+// Treating any leading dash as unresolvable was fine while that answer merely fell back to the
+// session, but under guard-bash's latch it refuses a directory the command names — the false block
+// this ticket's own predecessor was reverted for, one spelling over (review, tkt-a4c21bf57492).
+// A BARE `-` is different in kind: it is OLDPWD, which nothing here can resolve.
+function operandOf(args) {
+  let i = 0;
+  while (i < args.length && args[i] !== '-' && args[i].startsWith('-')) {
+    const doubleDash = args[i] === '--';
+    i++;
+    if (doubleDash) break;
+  }
+  return args[i];
+}
+
+// Whitespace-split, except inside a quoted span: `cd "/a/my repo"` must arrive as ONE token. A plain
+// split delivered `"/a/my`, which resolveDir refuses — putting a directory that is perfectly
+// NAMEABLE into the same slot as one that names nothing, so a caller could not fail closed on the
+// second without also refusing the first. That is what reverted the latch in tkt-3006d09810f7
+// (tkt-a4c21bf57492). Quoting is kept in the token rather than removed here: dequote() owns
+// that, because hiddenDirTarget reaches resolveDir with a raw slice this function never sees.
+//
+// Deliberately not substitution-aware, exactly like dirBuiltin above: `$( … )` is tkt-b9c0eda6c630,
+// and the strip this runs on is applied to the WHOLE string, so `( FOO=bar cd /x` still reaches cd.
+function quotedTokens(s) {
+  const out = [];
+  let cur = '';
+  let quote = null;
+  for (const c of s) {
+    if (quote) { cur += c; if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { cur += c; quote = c; continue; }
+    if (/\s/.test(c)) { if (cur) out.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+// undefined = not a cd; null = unresolvable (`cd -`, bare `cd`, a variable, `~user`, an UNTERMINATED
+// quote). A terminated quoted span resolves wherever it sits in the token — `"/a/my repo"`,
+// `"/a/my repo"/sub` and `/a/"my repo"` all name one real directory (tkt-a4c21bf57492). Callers must
+// decide what null means for them: guard-bash refuses a following commit/push, track-steps records
+// nothing (a bogus cd cannot misfile a milestone). Both are the fail-CLOSED reading.
 export function cdTarget(segment, dir) {
-  const { name, target } = dirBuiltin(segment);
+  const { name, args } = dirBuiltin(segment);
   if (name !== 'cd') return undefined;
-  if (!target || target.startsWith('-')) return null; // `cd`, `cd -`, `cd -P …`
+  const target = operandOf(args);
+  if (!target || target === '-') return null; // `cd`, `cd -`, `cd -P` with no operand
   return resolveDir(dir, target);
 }
 
@@ -54,10 +109,11 @@ export function cdTarget(segment, dir) {
 // the two positions disagree. `popd` returns to a stack this does not track, so it reports
 // unresolvable rather than guessing — the fail-closed reading.
 export function dirTarget(segment, dir) {
-  const { name, target } = dirBuiltin(segment);
+  const { name, args } = dirBuiltin(segment);
   if (name === 'popd') return null;
   if (name !== 'cd' && name !== 'pushd') return undefined;
-  if (!target || target.startsWith('-')) return null;
+  const target = operandOf(args);
+  if (!target || target === '-') return null;
   return resolveDir(dir, target);
 }
 

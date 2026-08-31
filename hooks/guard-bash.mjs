@@ -16,11 +16,14 @@
 // SCOPE: this is a best-effort guard against the assistant's own predictable
 // commands, NOT an adversarial sandbox. It does NOT defend against deliberately
 // obscure forms — e.g. `git --git-dir <path> ...` global-option spoofing, env
-// prefixes other than simple VAR=val, hiding a branch change behind a plain
-// `git checkout <branch>` (only `switch` / `checkout -b` are tracked), or
-// poisoning the unresolvable-dir slot, which every unknown `cd` target shares:
-// `cd $A && git switch -c x && cd $B && git commit`. Defending those would mean
-// reimplementing a shell parser; GitHub branch protection is the real backstop.
+// prefixes other than simple VAR=val, or hiding a branch change behind a plain
+// `git checkout <branch>` (only `switch` / `checkout -b` are tracked). Defending
+// those would mean reimplementing a shell parser; GitHub branch protection is the
+// real backstop. An unknown `cd` target is NO LONGER on that list: it used to
+// poison the unresolvable-dir slot (`cd $A && git switch -c x && cd $B && git
+// commit`), and now refuses the commit instead (tkt-a4c21bf57492). A
+// SEGMENT-INITIAL `pushd`/`popd` still is on it — cdTarget matches only `cd`,
+// so `pushd $D && git commit` reads as no move at all (tkt-b62f7e93bb63).
 // See CLAUDE.md → Branch, commit & PR workflow.
 //
 // Protocol: read the hook payload as JSON on stdin, inspect
@@ -29,8 +32,9 @@
 // guardrail must never wedge legitimate work). Several individual rules go the
 // other way, failing CLOSED wherever an unknown would silently disable the rule
 // it guards: the current BRANCH (tkt-fbc74a3252fe), which branch this repo
-// PROTECTS, a DIRECTORY move this parser located but could not name
-// (tkt-3006d09810f7), and `git switch -`, whose destination is unknowable and is
+// PROTECTS, a DIRECTORY move this parser could not name — hidden behind a
+// pipeline (tkt-3006d09810f7) or written explicitly (tkt-a4c21bf57492) — and
+// `git switch -`, whose destination is unknowable and is
 // therefore assumed protected. Do NOT restate that as a count — the README said
 // one, then three, and review found each an undercount. The decision logic
 // (parseGit / decide) is exported and pure so it can be unit-tested without
@@ -178,7 +182,7 @@ export function destructiveGitReason(sub, args) {
 const DEFAULT_REPO = () => ({ hasRemote: true, protectedBranches: ['main'] });
 
 const UNRESOLVABLE_MOVE =
-  'A `cd` behind a pipeline or compound statement moves somewhere this guard cannot name, so the commit/push after it cannot be checked against the never-commit-to-main rule. Refusing rather than guessing: a move it cannot follow would otherwise be judged against the session repo, which is a feature branch while a ticket is being worked — i.e. allowed. Re-run it as a plain `cd <dir> && git …` chain, so the directory the commit lands in is the one this guard reads.';
+  'A `cd` in this command moves somewhere this guard cannot name — a variable, a bare `cd`, `cd -` (OLDPWD), a `~user` path, an unterminated quote, a `popd`, or a move hidden behind a pipeline or compound statement — so the commit/push after it cannot be checked against the never-commit-to-main rule. Refusing rather than guessing: a move it cannot follow would otherwise be judged against the session repo, which is a feature branch while a ticket is being worked — i.e. allowed. Re-run it as a plain `cd <dir> && git …` chain naming the directory literally. A path containing spaces is fine if you quote it: `cd "/a/my repo"` is read correctly.';
 
 export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
   if (typeof command !== 'string' || !command.trim()) return { blocked: false };
@@ -214,12 +218,15 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
 
     const moved = cdTarget(segment, dir);
     if (moved !== undefined) {
-      // An unresolvable explicit cd deliberately does NOT set unknownDir: that keeps the
-      // fall-back-to-session behaviour this hook's header calls a known residual and kanban's
-      // settings.audit.test.mjs pins. Latching it here would also refuse `cd "<path with a space>"
-      // && git commit` — a directory that is perfectly nameable and merely unparsed. Only a move
-      // this parser cannot even locate (below) latches (tkt-3006d09810f7).
+      // An explicit cd latches too: "moved somewhere I cannot name" must not compare equal to
+      // "never moved", since a null `dir` alone falls back to the SESSION repo — a feature branch
+      // while a ticket is being worked, i.e. the permissive answer. This half was written and
+      // reverted in tkt-3006d09810f7 because `cd "<path with a space>"` reached this slot as well,
+      // and refusing it refused a nameable directory with a remedy that had no valid spelling. It
+      // is safe now only because quotedTokens keeps that span together, so it resolves above rather
+      // than arriving here (tkt-a4c21bf57492).
       dir = moved;
+      unknownDir = moved === null;
     } else {
       const git = parseGit(segment);
       if (git) {
