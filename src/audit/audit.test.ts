@@ -207,6 +207,52 @@ describe('audit: each check goes red on exactly its own broken guardrail', () =>
       expect: 'fail',
       mutate: (d) => writeFileSync(path.join(d, 'vitest.config.ts'), '// thresholds: { lines: 80 }\nexport default { test: {} };\n'),
     },
+    // tkt-672c79fb7468: a worktree is a full second checkout NESTED in the repo vitest collects
+    // from, so without this glob every suite is collected twice and no commit passes the local gate.
+    {
+      id: 'vitest-collection',
+      expect: 'fail',
+      mutate: (d) => {
+        const p = path.join(d, 'vitest.config.ts');
+        writeFileSync(p, readBack(p).replace(", '.claude/worktrees/**'", ''));
+      },
+    },
+    {
+      // tkt-17d81c74b662 measured this form: `/*` matches the worktree DIRECTORY but not the suites
+      // nested inside it — present, plausible, and not excluding the thing it names.
+      id: 'vitest-collection',
+      expect: 'fail',
+      mutate: (d) => {
+        const p = path.join(d, 'vitest.config.ts');
+        writeFileSync(p, readBack(p).replace("'.claude/worktrees/**'", "'.claude/worktrees/*'"));
+      },
+    },
+    {
+      // coverage.exclude narrows what is REPORTED on, never what is collected. The two arrays are
+      // spelled identically, so a check reading the wrong one certifies a doubled run.
+      id: 'vitest-collection',
+      expect: 'fail',
+      mutate: (d) => {
+        const p = path.join(d, 'vitest.config.ts');
+        writeFileSync(
+          p,
+          readBack(p)
+            .replace(", '.claude/worktrees/**'", '')
+            .replace("exclude: ['src/**/*.test.ts']", "exclude: ['src/**/*.test.ts', '.claude/worktrees/**']"),
+        );
+      },
+    },
+    {
+      // A comment naming the glob is not configuration — and the shipped template carries exactly
+      // such a comment, so an unstripped read would certify every repo that merely mentions it.
+      id: 'vitest-collection',
+      expect: 'fail',
+      mutate: (d) =>
+        writeFileSync(
+          path.join(d, 'vitest.config.ts'),
+          "export default { test: { /* .claude/worktrees/** */ exclude: ['dist/**'], coverage: { thresholds: { lines: 80 } } } };\n",
+        ),
+    },
     {
       // Every marker WORD present, zero workflow content — substring matching certified this shape.
       id: 'claude-md',
@@ -216,6 +262,14 @@ describe('audit: each check goes red on exactly its own broken guardrail', () =>
     { id: 'node-version-sync', expect: 'fail', mutate: (d) => writeFileSync(path.join(d, '.nvmrc'), '26\n') },
     // BLOCKED ≠ PASS: the undeterminable state for each instrumented or readable check.
     { id: 'tsconfig-strict', expect: 'blocked', mutate: (d) => rmSync(path.join(d, 'node_modules', '.bin', 'tsc')) },
+    {
+      id: 'vitest-collection',
+      expect: 'blocked',
+      mutate: (d) => {
+        rmSync(path.join(d, 'vitest.config.ts'));
+        mkdirSync(path.join(d, 'vitest.config.ts'));
+      },
+    },
     {
       id: 'hook-settings-wired',
       expect: 'blocked',
@@ -235,7 +289,7 @@ describe('audit: each check goes red on exactly its own broken guardrail', () =>
     // A ratchet, pinned outside the loop. Deleting mutations narrows what this control covers without
     // failing anything — and at zero it would pass while controlling nothing, the shape
     // scripts/probe/vacuous-tests.mjs screens for. Raise this floor when checks are added.
-    expect(covered.size, 'the mutation set has shrunk — this control now covers less').toBeGreaterThanOrEqual(13);
+    expect(covered.size, 'the mutation set has shrunk — this control now covers less').toBeGreaterThanOrEqual(14);
     const dir = makeConformingRepo();
     const report = runAudit(dir, execWithEslint);
     for (const id of covered) {

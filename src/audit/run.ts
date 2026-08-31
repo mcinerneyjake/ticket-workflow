@@ -12,6 +12,7 @@ import { huskyPreCommit } from './checks/huskyPreCommit.js';
 import { eslintRules } from './checks/eslintRules.js';
 import { tsconfigStrict } from './checks/tsconfigStrict.js';
 import { vitestCoverage } from './checks/vitestCoverage.js';
+import { vitestCollection } from './checks/vitestCollection.js';
 import { nodeVersionSync } from './checks/nodeVersionSync.js';
 import { loadRepoConfig, CONFIG_FILE } from './config.js';
 import { tierIncludes } from '../templates.js';
@@ -33,6 +34,7 @@ export const AUDIT_CHECKS: readonly AuditCheck[] = [
   eslintRules,
   tsconfigStrict,
   vitestCoverage,
+  vitestCollection,
   nodeVersionSync,
 ];
 
