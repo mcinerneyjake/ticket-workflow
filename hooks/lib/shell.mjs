@@ -23,6 +23,14 @@ function dequote(s) {
   return quote ? null : out;
 }
 
+// True when a scan of `s` ends inside an unterminated quote — the state in which quotedTokens has
+// fused the rest of the line into ONE token, so the token a caller expected after it does not exist.
+// Derived from dequote rather than scanned again: this module already carries three scanners that
+// must agree about where a quote ends (tkt-ad984b09945b), and a fourth is how that desync happens.
+export function endsInsideQuote(s) {
+  return dequote(s) === null;
+}
+
 // null rather than a guess — a wrong dir judges one repo by another's branch.
 export function resolveDir(dir, target) {
   const t = dequote(target);
@@ -75,7 +83,12 @@ function operandOf(args) {
 //
 // Deliberately not substitution-aware, exactly like dirBuiltin above: `$( … )` is tkt-b9c0eda6c630,
 // and the strip this runs on is applied to the WHOLE string, so `( FOO=bar cd /x` still reaches cd.
-function quotedTokens(s) {
+//
+// Exported for guard-bash's parseGit, which split on plain whitespace and so read `git -C "/a/my
+// repo" commit` as a subcommand `repo"` — no rule fired, and a commit onto a protected branch walked
+// (tkt-8f2e1f9894e2). One tokenizer, for the same reason the rest of this module is shared: two
+// would drift on exactly the quoting the callers fail closed on.
+export function quotedTokens(s) {
   const out = [];
   let cur = '';
   let quote = null;

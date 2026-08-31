@@ -45,16 +45,25 @@ import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { isMain } from './lib/is-main.mjs';
 import { hasRemote, protectedBranches } from './lib/default-branch.mjs';
-import { cdTarget, hiddenDirTarget, resolveDir, splitSegments, subshellParens } from './lib/shell.mjs';
+import { cdTarget, endsInsideQuote, hiddenDirTarget, quotedTokens, resolveDir, splitSegments, subshellParens } from './lib/shell.mjs';
 
 // Pull the git subcommand + its args out of a single shell segment. The command
 // WORD must be `git` (after stripping leading subshell/group punctuation and
 // simple VAR=val env prefixes) — so data that merely mentions git, e.g.
 // `echo "git add -A"`, is not treated as a git invocation. `-C <path>` is
 // captured, not skipped: it names the repo the command acts on.
+//
+// Tokenized quote-aware, not on whitespace: a split put every token after a quoted
+// span one slot off, and both directions were guard failures. `git -C "/a/my repo"
+// commit` read as the subcommand `repo"`, and `EDITOR="code -w" git commit` failed
+// the env-prefix test and returned null — neither reached the never-commit-to-main
+// rule at all. The other way, `git commit -m "fix -a bug"` handed commitStagesAll a
+// bare `-a` nobody wrote, refusing an ordinary commit on any branch
+// (tkt-8f2e1f9894e2). Quoting stays IN the token: resolveDir/dequote own its
+// removal and accept it wherever it sits, so `-C "/a/my repo"/sub` names one dir.
 export function parseGit(segment) {
   const stripped = segment.trim().replace(/^[({\s]+/, '').replace(/[)}\s]+$/, '');
-  const tokens = stripped.split(/\s+/);
+  const tokens = quotedTokens(stripped);
   let cmd = 0;
   while (cmd < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[cmd])) cmd++; // env prefix
   if (tokens[cmd] !== 'git') return null;
@@ -65,14 +74,31 @@ export function parseGit(segment) {
     else if (tokens[i] === '-c') { i += 2; } // -c takes a value we don't care about
     else i += 1;
   }
-  if (i >= tokens.length) return null;
-  return { sub: tokens[i], args: tokens.slice(i + 1), repoDir };
+  // No token left where the subcommand belongs. When an unterminated quote is why — it fuses the
+  // rest of the line into one token, and `git -C "/a/b commit -m x` leaves nothing after `-C` —
+  // returning null would hide the invocation from EVERY rule. The whitespace split still recovered
+  // `commit` here, so silence would be a regression, and this module refuses an unterminated quote
+  // everywhere else (resolveDir, UNRESOLVABLE_MOVE). Report it and let the caller refuse: such a
+  // command is a shell syntax error, so nothing legitimate is wedged (tkt-8f2e1f9894e2).
+  if (i >= tokens.length)
+    return endsInsideQuote(stripped) ? { sub: null, args: [], repoDir, truncated: true } : null;
+  return { sub: tokens[i], args: tokens.slice(i + 1), repoDir, truncated: false };
 }
 
 // resolveDir/cdTarget/splitSegments live in lib/shell.mjs — track-steps needs the same parsing to
 // decide which repo a milestone belongs to. Re-exported so this hook's public surface is unchanged
 // (guard-subagent-gates.mjs imports splitSegments from here).
 export { cdTarget, splitSegments };
+
+// The short-flag LETTERS of a single-dash token, stopping at an attached value. Quote-aware
+// tokenizing keeps `-m"fix and go"` in one token, and scanning all of it read the message text as a
+// flag cluster — refusing an ordinary commit because its words contain an `a`, and an ordinary push
+// because they contain an `f`. Both were the false-block direction the tokenizer change set out to
+// remove, one spelling over (tkt-8f2e1f9894e2). Long `--` flags carry no letter cluster.
+function shortFlagLetters(token) {
+  if (!token.startsWith('-') || token.startsWith('--')) return '';
+  return token.slice(1).split(/['"]/)[0];
+}
 
 // Args that stage the whole working tree rather than named paths.
 function stagesEverything(args) {
@@ -83,9 +109,7 @@ function stagesEverything(args) {
 // `git commit -a` / `-am` (a single-dash cluster containing 'a') or `--all`
 // stages all tracked files, bypassing the add guard entirely.
 function commitStagesAll(args) {
-  return args.some(
-    (a) => a === '--all' || (a.startsWith('-') && !a.startsWith('--') && a.slice(1).includes('a')),
-  );
+  return args.some((a) => a === '--all' || shortFlagLetters(a).includes('a'));
 }
 
 // True when a push would land on main: an explicit main refspec/target, or a
@@ -135,7 +159,7 @@ export function destructiveGitReason(sub, args) {
   // e.g. 'f' in `-uf` or 'd' in `-df` — so clustered flags can't slip past an
   // exact-token check. Excludes long (`--`) flags and `-o=val` attached values.
   const hasShort = (ch) =>
-    args.some((a) => a.startsWith('-') && !a.startsWith('--') && !a.includes('=') && a.slice(1).includes(ch));
+    args.some((a) => !a.includes('=') && shortFlagLetters(a).includes(ch));
   switch (sub) {
     case 'push':
       // Force by flag (-f / -uf / --force / --force-with-lease) OR by the
@@ -184,6 +208,9 @@ const DEFAULT_REPO = () => ({ hasRemote: true, protectedBranches: ['main'] });
 const UNRESOLVABLE_MOVE =
   'A `cd` in this command moves somewhere this guard cannot name — a variable, a bare `cd`, `cd -` (OLDPWD), a `~user` path, an unterminated quote, a `popd`, or a move hidden behind a pipeline or compound statement — so the commit/push after it cannot be checked against the never-commit-to-main rule. Refusing rather than guessing: a move it cannot follow would otherwise be judged against the session repo, which is a feature branch while a ticket is being worked — i.e. allowed. Re-run it as a plain `cd <dir> && git …` chain naming the directory literally. A path containing spaces is fine if you quote it: `cd "/a/my repo"` is read correctly.';
 
+const TRUNCATED_QUOTE =
+  'An unterminated quote in this command swallowed the git subcommand, so it cannot be checked against the never-commit-to-main rule. Refusing rather than guessing: the subcommand could be `commit` or `push`, and a shell would reject the command anyway. Close the quote and retry.';
+
 export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
   if (typeof command !== 'string' || !command.trim()) return { blocked: false };
 
@@ -230,6 +257,7 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
     } else {
       const git = parseGit(segment);
       if (git) {
+        if (git.truncated) return { blocked: true, reason: TRUNCATED_QUOTE };
         const { sub, args, repoDir } = git;
         const gitDir = repoDir ? resolveDir(dir, repoDir) : dir; // -C acts on that repo, whatever the cwd
         // Scoped to commit/push and checked before the rules, like the branch===null refusal they

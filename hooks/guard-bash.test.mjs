@@ -30,14 +30,14 @@ const twoRepos = byDir({ [KANBAN]: 'main', [OTHER]: 'feat/x' });
 
 describe('parseGit', () => {
   it('extracts the subcommand and args', () => {
-    expect(parseGit('git add -A')).toEqual({ sub: 'add', args: ['-A'], repoDir: null });
-    expect(parseGit('git commit -m "x"')).toEqual({ sub: 'commit', args: ['-m', '"x"'], repoDir: null });
+    expect(parseGit('git add -A')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, truncated: false });
+    expect(parseGit('git commit -m "x"')).toEqual({ sub: 'commit', args: ['-m', '"x"'], repoDir: null, truncated: false });
   });
 
   it('captures -C as repoDir, skips -c, skips env prefixes', () => {
-    expect(parseGit('git -C /repo add foo')).toEqual({ sub: 'add', args: ['foo'], repoDir: '/repo' });
-    expect(parseGit('git -c user.name=x commit')).toEqual({ sub: 'commit', args: [], repoDir: null });
-    expect(parseGit('FOO=bar git add foo')).toEqual({ sub: 'add', args: ['foo'], repoDir: null });
+    expect(parseGit('git -C /repo add foo')).toEqual({ sub: 'add', args: ['foo'], repoDir: '/repo', truncated: false });
+    expect(parseGit('git -c user.name=x commit')).toEqual({ sub: 'commit', args: [], repoDir: null, truncated: false });
+    expect(parseGit('FOO=bar git add foo')).toEqual({ sub: 'add', args: ['foo'], repoDir: null, truncated: false });
   });
 
   it('requires the command word to be git (not just a mention)', () => {
@@ -47,7 +47,31 @@ describe('parseGit', () => {
   });
 
   it('sees through subshell/group punctuation', () => {
-    expect(parseGit('(git add -A)')).toEqual({ sub: 'add', args: ['-A'], repoDir: null });
+    expect(parseGit('(git add -A)')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, truncated: false });
+  });
+
+  // A quoted span is ONE token. Quoting is kept in the token rather than stripped here, exactly as
+  // quotedTokens does for cd: resolveDir/dequote own removal, and hiddenDirTarget needs the raw
+  // text (tkt-8f2e1f9894e2).
+  it('keeps a quoted span carrying a space in one token', () => {
+    expect(parseGit('git -C "/repos/my repo" commit -m x'))
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: '"/repos/my repo"', truncated: false });
+    expect(parseGit("git -C '/repos/my repo' commit -m x"))
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: "'/repos/my repo'", truncated: false });
+    expect(parseGit('git commit -m "fix -a bug"'))
+      .toEqual({ sub: 'commit', args: ['-m', '"fix -a bug"'], repoDir: null, truncated: false });
+  });
+
+  it('skips an env prefix whose quoted value contains a space', () => {
+    expect(parseGit('EDITOR="code -w" git commit -m x'))
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: null, truncated: false });
+  });
+
+  it('reports a subcommand swallowed by an unterminated quote, rather than returning null', () => {
+    expect(parseGit('git -C "/a/b commit -m x'))
+      .toEqual({ sub: null, args: [], repoDir: '"/a/b commit -m x', truncated: true });
+    // Still null when there is simply no subcommand — no quote is involved, so nothing was hidden.
+    expect(parseGit('git -C /repo')).toBeNull();
   });
 });
 
@@ -498,6 +522,103 @@ describe('decide — a cd the parser missed must not exempt a commit (tkt-3006d0
 
   it('sees a hidden cd even when the segment also opens with an explicit one', () => {
     expect(from(`cd /tmp | (cd ${KANBAN} && git commit -m y)`)).toBe(true);
+  });
+});
+
+// parseGit split on plain whitespace, so a quoted span carrying a space arrived as two tokens and
+// every token after it sat one slot off. The consequences point in BOTH directions: a `-C` path or
+// an env prefix with a space fell OUT of the never-commit-to-main rule (a fail-open — the shape the
+// guard exists for), while a commit message merely containing `-a` fell INTO the whole-tree-staging
+// rule (a false block). One quote-aware tokenizer, the same one cd parsing already uses, is the fix
+// rather than a second copy here (tkt-8f2e1f9894e2).
+describe('decide — a quoted span must not split into tokens (tkt-8f2e1f9894e2)', () => {
+  const SPACED = '/repos/my repo';
+  const spaced = byDir({
+    [KANBAN]: 'main',
+    [OTHER]: 'feat/x',
+    [SPACED]: 'main',
+    [`${SPACED}/sub`]: 'main',
+    '/repos/my repo two': 'feat/x',
+  });
+
+  it('blocks a commit on main in a -C repo whose path contains a space, in both quote styles', () => {
+    expect(decide(`git -C "${SPACED}" commit -m x`, spaced, OTHER).blocked).toBe(true);
+    expect(decide(`git -C '${SPACED}' commit -m x`, spaced, OTHER).blocked).toBe(true);
+  });
+
+  it('still allows that same -C commit when the spaced repo is on a feature branch', () => {
+    // The control the row above needs: without it, a tokenizer that refused every quoted -C
+    // outright would pass the block case while wedging the ordinary one.
+    expect(decide(`git -C "/repos/my repo two" commit -m x`, spaced, KANBAN).blocked).toBe(false);
+  });
+
+  it('resolves a quoted span wherever it sits in the -C token, as cd already does', () => {
+    expect(decide(`git -C "${SPACED}"/sub commit -m x`, spaced, OTHER).blocked).toBe(true);
+    expect(decide(`git -C /repos/"my repo" commit -m x`, spaced, OTHER).blocked).toBe(true);
+  });
+
+  it('blocks a commit on main behind an env prefix whose value contains a space', () => {
+    // The worst shape of the three: parseGit returned null, so the invocation was invisible to
+    // EVERY rule — not just the branch ones. The unquoted control passes today.
+    expect(decide('EDITOR="code -w" git commit -m x', onBranch('main')).blocked).toBe(true);
+    expect(decide('EDITOR=vim git commit -m x', onBranch('main')).blocked).toBe(true);
+  });
+
+  it('does not read -a inside a quoted commit message as commit --all', () => {
+    // The false-block direction. `commitStagesAll` was handed a bare `-a` the author never wrote,
+    // so this was refused on every branch, protected or not.
+    expect(blocked('git commit -m "fix -a bug"', 'feat/x')).toBe(false);
+    expect(blocked("git commit -m 'fix -a bug'", 'feat/x')).toBe(false);
+    expect(blocked('git commit -am "fix"', 'feat/x')).toBe(true); // the real -am still blocks
+  });
+
+  it('does not read a blanket staging token inside a quoted path as whole-tree staging', () => {
+    // The fixture must be one the OLD tokenizer actually got wrong. `"my dir/file .txt"` was not:
+    // it split to `.txt"`, which is in no blanket set, so the case passed with and without the fix
+    // — a control that passes is the finding (review, tkt-8f2e1f9894e2). These two split to a bare
+    // `.`, which IS blanket, and were refused on every branch.
+    expect(blocked('git add "a . b"', 'feat/x')).toBe(false);
+    expect(blocked('git add "release notes . draft"', 'feat/x')).toBe(false);
+    expect(blocked('git add -A', 'feat/x')).toBe(true); // control
+    expect(blocked('git add .', 'feat/x')).toBe(true); // control
+  });
+
+  it('reads short-flag letters only up to an attached value', () => {
+    // Keeping the quotes in the token fused `-m"fix and go"` into one arg, and the cluster scan then
+    // read the MESSAGE as flag letters: an `a` anywhere made it `commit -a`, an `f` made a push a
+    // force-push. Both refused ordinary work on any branch — the same false-block direction this
+    // suite exists to close, one spelling over (review, tkt-8f2e1f9894e2).
+    expect(blocked('git commit -m"fix the bug and go"', 'feat/x')).toBe(false);
+    expect(blocked("git commit -m'fix the bug and go'", 'feat/x')).toBe(false);
+    expect(blocked('git push -o"ci skip fast" origin feat/x', 'feat/x')).toBe(false);
+    // Controls: a real attached cluster still carries its letters, and the detached forms are
+    // untouched. Without these, stripping the letters entirely would pass the three rows above.
+    expect(blocked('git commit -am"fix"', 'feat/x')).toBe(true);
+    expect(blocked('git commit -a', 'feat/x')).toBe(true);
+    expect(blocked('git push -f origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('git push -uf origin feat/x', 'feat/x')).toBe(true);
+  });
+
+  it('refuses a git command whose subcommand an unterminated quote swallowed', () => {
+    // quotedTokens fuses the rest of the line into one token, so `-C` consumes it and NO token is
+    // left where the subcommand belongs. parseGit returning null there hid the invocation from every
+    // rule — where the whitespace split still recovered `commit` and blocked it on main. Fail closed
+    // instead: the shell would reject an unterminated quote anyway (review, tkt-8f2e1f9894e2).
+    expect(blocked('git -C "/a/b commit -m x', 'feat/x')).toBe(true);
+    expect(blocked("git -C '/a/b push origin main", 'feat/x')).toBe(true);
+    // Controls: a terminated quote is judged normally, and a genuinely subcommand-less git is still
+    // not a block — `parseGit('git')` must stay null, or every bare `git` would be refused.
+    expect(decide('git -C "/repos/my repo" status', spaced, OTHER).blocked).toBe(false);
+    expect(blocked('git', 'feat/x')).toBe(false);
+    expect(blocked('git -C /repos/other', 'feat/x')).toBe(false);
+  });
+
+  it('leaves every unquoted shape exactly as it was', () => {
+    expect(decide(`git -C ${KANBAN} commit -m x`, twoRepos, OTHER).blocked).toBe(true);
+    expect(decide(`git -C ${OTHER} commit -m x`, twoRepos, KANBAN).blocked).toBe(false);
+    expect(blocked('git commit -m x', 'main')).toBe(true);
+    expect(blocked('git commit -m x', 'feat/x')).toBe(false);
+    expect(blocked('git push origin main', 'feat/x')).toBe(true);
   });
 });
 
