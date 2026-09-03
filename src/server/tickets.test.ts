@@ -754,21 +754,41 @@ describe('summarize (pure aggregation)', () => {
     expect(s.project).toBeNull();
     expect(s.byStatus.every((b) => b.count === 0)).toBe(true);
     expect(s.byPriority.every((b) => b.count === 0)).toBe(true);
-    expect(s.byType.every((b) => b.count === 0)).toBe(true);
     expect(s.recentlyUpdated).toEqual([]);
   });
 
-  it('counts by status, priority, and type', () => {
+  it('counts by status and priority', () => {
     const s = summarize([
-      mk({ id: 'a', status: 'todo', priority: 'high', type: 'bug' }),
-      mk({ id: 'b', status: 'todo', priority: 'low', type: 'feature' }),
-      mk({ id: 'c', status: 'done', priority: 'high', type: 'bug' }),
+      mk({ id: 'a', status: 'todo', priority: 'high' }),
+      mk({ id: 'b', status: 'todo', priority: 'low' }),
+      mk({ id: 'c', status: 'done', priority: 'high' }),
     ]);
     expect(s.total).toBe(3);
     expect(find(s.byStatus, 'status', 'todo')?.count).toBe(2);
     expect(find(s.byStatus, 'status', 'done')?.count).toBe(1);
     expect(find(s.byPriority, 'priority', 'high')?.count).toBe(2);
-    expect(find(s.byType, 'type', 'bug')?.count).toBe(2);
+  });
+
+  // The single tally pass counts only what it sees; an empty bucket's zero row comes from the
+  // enum-driven output, not from the tally. Probing 'todo'/'done' above cannot catch a dropped
+  // zero row; asserting the full key sequence can.
+  it('emits every canonical bucket in enum order, including zero rows', () => {
+    const s = summarize([mk({ id: 'a', status: 'todo', priority: 'high' })]);
+    expect(s.byStatus.map((b) => b.status)).toEqual(['backlog', 'todo', 'in-progress', 'qa', 'done']);
+    expect(s.byPriority.map((b) => b.priority)).toEqual(['low', 'medium', 'high', 'urgent']);
+    expect(find(s.byStatus, 'status', 'qa')?.count).toBe(0);
+    expect(find(s.byPriority, 'priority', 'urgent')?.count).toBe(0);
+  });
+
+  // recentlyUpdated now sorts the scoped array in place instead of a defensive copy; that is
+  // only safe because the array is built inside summarize().
+  it('does not reorder the caller\'s array', () => {
+    const input = [
+      mk({ id: 'old', updated: '2026-01-01T00:00:00.000Z' }),
+      mk({ id: 'new', updated: '2026-06-01T00:00:00.000Z' }),
+    ];
+    summarize(input);
+    expect(input.map((t) => t.id)).toEqual(['old', 'new']);
   });
 
   it('excludes archived tickets from every count', () => {

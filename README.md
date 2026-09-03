@@ -177,6 +177,11 @@ Wire the MCP server (`.mcp.json`) and the hooks + allowlist (`.claude/settings.j
 see a consuming repo's config for the exact shape. Run `npx ticket-workflow show <id>`
 to view a ticket's pipeline.
 
+> **Breaking in 0.24.0:** `summarize()` / `summarizeBoard()` no longer return `byType`, and
+> `DashboardSummary.byType` and the `TypeCount` type are gone. No consumer read the field, but a
+> repo that duplicates `DashboardSummary` for the browser must drop it in the same pin bump or its
+> typecheck fails — removal is a compile error there, not a silent one.
+
 ### Wiring the hooks from an install
 
 Each hook is available both as a script path and as a subpath import, so a consumer can wire the

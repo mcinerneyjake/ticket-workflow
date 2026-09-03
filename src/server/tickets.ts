@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import matter from 'gray-matter';
-import { STATUS_IDS, TYPES, PRIORITIES, BOARD_STATUSES, CREATE_STATUS_IDS, STATUS_STEP, isSource, type Ticket, type StatusId, type DashboardSummary, type Provenance } from '../shared/constants.js';
+import { STATUS_IDS, TYPES, PRIORITIES, BOARD_STATUSES, CREATE_STATUS_IDS, STATUS_STEP, isSource, type Ticket, type StatusId, type Priority, type DashboardSummary, type Provenance } from '../shared/constants.js';
 import { ticketsDir } from '../paths.js';
 import { appendEvent } from './events.js';
 
@@ -585,29 +585,36 @@ const RECENT_LIMIT = 8;
 
 // Pure aggregation (no IO) behind the dashboard. Archived excluded; a project arg scopes every count.
 export function summarize(tickets: Ticket[], project: string | null = null): DashboardSummary {
-  const scoped = tickets.filter(
-    (t) => t.status !== 'archived' && (project === null || t.project === project),
-  );
-  const byStatus = BOARD_STATUSES.map((s) => ({
-    status: s.id,
-    count: scoped.filter((t) => t.status === s.id).length,
-  }));
-  const byPriority = PRIORITIES.map((priority) => ({
-    priority,
-    count: scoped.filter((t) => t.priority === priority).length,
-  }));
-  const byType = TYPES.map((type) => ({
-    type,
-    count: scoped.filter((t) => t.type === type).length,
-  }));
-  // ISO timestamps sort lexicographically = chronologically; newest first.
-  const recentlyUpdated = [...scoped]
+  // Tallies only what it sees; the canonical enum drives the OUTPUT below, which is what keeps
+  // an empty bucket's zero row and the enum ordering. Seeding these would be redundant.
+  const statusCounts = new Map<StatusId, number>();
+  const priorityCounts = new Map<Priority, number>();
+  const scoped: Ticket[] = [];
+
+  for (const t of tickets) {
+    if (t.status === 'archived') continue;
+    if (project !== null && t.project !== project) continue;
+    scoped.push(t);
+    statusCounts.set(t.status, (statusCounts.get(t.status) ?? 0) + 1);
+    priorityCounts.set(t.priority, (priorityCounts.get(t.priority) ?? 0) + 1);
+  }
+
+  // ISO timestamps sort lexicographically = chronologically; newest first. Sorted in place
+  // because `scoped` is built here — the caller's array is never reordered.
+  const recentlyUpdated = scoped
     .sort((a, b) => b.updated.localeCompare(a.updated))
     .slice(0, RECENT_LIMIT)
     .map(({ id, title, status, priority, project: p, updated }) => ({
       id, title, status, priority, project: p, updated,
     }));
-  return { project, total: scoped.length, byStatus, byPriority, byType, recentlyUpdated };
+
+  return {
+    project,
+    total: scoped.length,
+    byStatus: BOARD_STATUSES.map((s) => ({ status: s.id, count: statusCounts.get(s.id) ?? 0 })),
+    byPriority: PRIORITIES.map((priority) => ({ priority, count: priorityCounts.get(priority) ?? 0 })),
+    recentlyUpdated,
+  };
 }
 
 export async function summarizeBoard(project: string | null = null): Promise<DashboardSummary> {
