@@ -82,7 +82,6 @@ export type Ticket = {
 
 export type StatusCount = { status: StatusId; count: number }
 export type PriorityCount = { priority: Priority; count: number }
-export type TypeCount = { type: TicketType; count: number }
 
 // --- Workflow-step telemetry ----------------------------------------------
 // Ordered milestones a ticket passes through. Shared so emitters + reader can't drift (tkt-512f9b15ddb8).
@@ -168,6 +167,5 @@ export type DashboardSummary = {
   total: number
   byStatus: StatusCount[]
   byPriority: PriorityCount[]
-  byType: TypeCount[]
   recentlyUpdated: RecentTicket[]
 }
