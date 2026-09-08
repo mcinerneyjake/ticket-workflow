@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { handleToolCall, TOOLS } from './handlers.js';
@@ -746,6 +746,69 @@ describe('delete_ticket', () => {
     const res = await handleToolCall('delete_ticket', { id: 'tkt-doesnotexist' });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain('not found');
+  });
+});
+
+// tkt-7cab2f9cc082 — a non-HttpError escaping a handler reaches the catch-all. A raw fs message
+// embeds the absolute board path, and MCP hands the text straight to the caller.
+describe('catch-all sanitisation', () => {
+  // Restore centrally: a failing expect skips an inline mockRestore and leaks the fs spy into the
+  // next test, which is exactly how the verbatim-HttpError case first reported the wrong message.
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function eaccesError(file: string): NodeJS.ErrnoException {
+    const err: NodeJS.ErrnoException = new Error(`EACCES: permission denied, open '${file}'`);
+    err.code = 'EACCES';
+    return err;
+  }
+
+  it('does not leak the host path from a non-HttpError fault', async () => {
+    const id = await seed();
+    const file = path.join(dirs.tickets, `${id}.md`);
+    vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
+    vi.spyOn(fs, 'readFile').mockRejectedValue(eaccesError(file));
+
+    const res = await handleToolCall('get_ticket', { id });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).not.toContain(dirs.tickets);
+    expect(res.content[0].text).not.toContain('permission denied');
+    expect(res.content[0].text).toContain('EACCES'); // the errno alone, as readEvents does
+  });
+
+  it('logs the raw fault server-side', async () => {
+    const id = await seed();
+    const file = path.join(dirs.tickets, `${id}.md`);
+    const error = vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
+    vi.spyOn(fs, 'readFile').mockRejectedValue(eaccesError(file));
+
+    await handleToolCall('get_ticket', { id });
+
+    expect(error).toHaveBeenCalled();
+    const logged = error.mock.calls.flat().map((a) => String(a)).join(' ');
+    expect(logged).toContain('permission denied');
+  });
+
+  // The sanitiser must not swallow the deliberate, caller-facing messages either side of it.
+  it('still returns HttpError messages verbatim', async () => {
+    const res = await handleToolCall('get_ticket', { id: 'tkt-doesnotexist' });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toBe('Ticket not found: tkt-doesnotexist');
+  });
+
+  it('names the tool for a fault carrying no errno', async () => {
+    const id = await seed();
+    vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
+    vi.spyOn(fs, 'readFile').mockRejectedValue(new Error('kaboom /Users/someuser/board'));
+
+    const res = await handleToolCall('get_ticket', { id });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('get_ticket');
+    expect(res.content[0].text).not.toContain('kaboom');
+    expect(res.content[0].text).not.toContain('/Users/someuser/board');
   });
 });
 

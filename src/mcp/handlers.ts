@@ -1,6 +1,6 @@
 import { type Tool } from '@modelcontextprotocol/sdk/types.js';
 import {
-  listBoard, getTicket, createTicket, updateTicket, deleteTicket, HttpError,
+  listBoard, getTicket, createTicket, updateTicket, deleteTicket, HttpError, errnoCode,
   type UnreadableTicketFile,
 } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
@@ -355,9 +355,12 @@ export async function handleToolCall(
         return { content: [textContent(`Unknown tool: ${name}`)], isError: true };
     }
   } catch (err) {
-    const message = err instanceof HttpError
-      ? err.message
-      : `Unexpected error: ${err instanceof Error ? err.message : String(err)}`;
-    return { content: [textContent(message)], isError: true };
+    // HttpError messages are authored for the caller; anything else is a raw fault whose message
+    // embeds absolute host paths. Keep the detail server-side and return only the errno, matching
+    // readEvents' shape (tkt-7cab2f9cc082). console.error direct until tkt-c2ed32531824 lands.
+    if (err instanceof HttpError) return { content: [textContent(err.message)], isError: true };
+    console.error('[mcp] tool call failed', name, err);
+    const code = errnoCode(err);
+    return { content: [textContent(`Unexpected error handling ${name}${code ? ` (${code})` : ''}`)], isError: true };
   }
 }
