@@ -358,8 +358,11 @@ export async function getTicket(id: string): Promise<Ticket> {
     const { data, content } = matter(raw, NO_CACHE); // see NO_CACHE: consistent throw on bad YAML
     return normalize(id, data, content);
   } catch (err) {
-    // File exists but frontmatter won't parse — surface a clear error naming the ticket, not a raw YAMLException.
-    throw new HttpError(500, `Ticket ${id} has unparseable frontmatter: ${err instanceof Error ? err.message : String(err)}`);
+    // The YAMLException embeds a snippet of the file's own content and its line/column; it stays
+    // server-side because consumers surface HttpError messages to clients (tkt-7cab2f9cc082).
+    // console.error direct until the injectable logger (tkt-c2ed32531824) lands.
+    console.error('[tickets] unparseable frontmatter', file, err);
+    throw new HttpError(500, `Ticket ${id} has unparseable frontmatter`);
   }
 }
 

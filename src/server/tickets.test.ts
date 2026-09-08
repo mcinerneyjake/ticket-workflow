@@ -973,6 +973,35 @@ describe('corrupt ticket file resilience', () => {
     expect(err.message).toContain('tkt-bad');
   });
 
+  // tkt-7cab2f9cc082 — the parser message echoes the offending frontmatter line verbatim, and
+  // consumers surface HttpError messages to clients, so it must stay server-side.
+  // UNQUOTED_COLON, not CORRUPT: only its parser message quotes the file's own content
+  // ("...at line 2, column 20:\n    title: Fix the seam: stale tabs"), which is what makes the
+  // leak assertion below load-bearing rather than vacuously true.
+  it('does not leak the parser message for unparseable frontmatter', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
+    await writeRaw('tkt-bad', UNQUOTED_COLON);
+
+    const err = await httpError(getTicket('tkt-bad'));
+
+    expect(err.status).toBe(500);
+    expect(err.message).toBe('Ticket tkt-bad has unparseable frontmatter');
+    expect(err.message).not.toContain('stale tabs'); // the file's own content
+    error.mockRestore();
+  });
+
+  it('logs the unparseable-frontmatter detail server-side', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
+    await writeRaw('tkt-bad', CORRUPT);
+
+    await httpError(getTicket('tkt-bad'));
+
+    expect(error).toHaveBeenCalled();
+    const logged = error.mock.calls.flat().map((a) => String(a)).join(' ');
+    expect(logged).toContain('tkt-bad.md'); // the path the caller never sees
+    error.mockRestore();
+  });
+
   it('stays consistent across repeated reads (gray-matter content cache is bypassed)', async () => {
     // NO_CACHE guard: gray-matter's un-parsed cache would let a corrupt file throw once
     // then return a cached empty success (500 decaying to a silent ghost). Both reads must match.
