@@ -280,9 +280,9 @@ non-blocking and visible.
 Two honest limits on that table:
 
 - It describes what happens when a hook cannot **load**. It is not a claim about each hook's internal
-  behaviour: `guard-bash`, once loaded, deliberately exits 0 on a payload it cannot **parse** — but
-  several of its own rules then fail **closed**, wherever an unknown would otherwise silently disable
-  the rule it guards. An unresolvable current branch, a protected branch it cannot identify, a
+  behaviour: `guard-bash`, once loaded, fails **closed** on a payload it cannot **parse**
+  (`tkt-92360b0e2079`), as do several of its own rules, wherever an unknown would otherwise silently
+  disable the rule it guards. An unresolvable current branch, a protected branch it cannot identify, a
   directory move it located but could not name, and `git switch -`, whose destination is unknowable
   so it is assumed protected. **Read that as a design principle, not a closed list, and never as a
   count** — this sentence has claimed one, then three, and each was an undercount found by review

@@ -28,10 +28,11 @@
 //
 // Protocol: read the hook payload as JSON on stdin, inspect
 // `tool_input.command`. Exit 0 to allow; exit 2 to block (stderr is surfaced to
-// Claude so it can self-correct). An unparseable PAYLOAD → allow (fail open: a
-// guardrail must never wedge legitimate work). Several individual rules go the
-// other way, failing CLOSED wherever an unknown would silently disable the rule
-// it guards: the current BRANCH (tkt-fbc74a3252fe), which branch this repo
+// Claude so it can self-correct). An unparseable PAYLOAD → BLOCK (fail closed,
+// tkt-92360b0e2079: a command this hook cannot read is one it cannot judge, and
+// answering "I do not know" with "yes" is the one thing a guard must never do).
+// Individual rules go the same way wherever an unknown would silently disable
+// the rule it guards: the current BRANCH (tkt-fbc74a3252fe), which branch this repo
 // PROTECTS, a DIRECTORY move this parser could not name — hidden behind a
 // pipeline (tkt-3006d09810f7) or written explicitly (tkt-a4c21bf57492) — and
 // `git switch -`, whose destination is unknowable and is
@@ -407,8 +408,17 @@ export function main() {
   let payload;
   try {
     payload = JSON.parse(readFileSync(0, 'utf8'));
-  } catch {
-    process.exit(0); // not our concern if we can't parse the event
+  } catch (err) {
+    // Fail CLOSED (tkt-92360b0e2079): stdin we cannot READ or PARSE yields a command we cannot judge.
+    // Deliberately narrow — a payload that PARSES but carries no command still allows, because the
+    // Bash matcher also fires for BashOutput, whose events legitimately have none.
+    const how = err instanceof SyntaxError ? 'parse it as JSON' : `read it (${err?.code ?? err?.message ?? 'unknown error'})`;
+    process.stderr.write(
+      `[guard-bash] BLOCKED — unusable hook payload: could not ${how}. This is NOT a rule violation: ` +
+        'the guard refuses rather than guess at a command it cannot see. Re-run the command; if it repeats, ' +
+        'check the PreToolUse wiring in .claude/settings.json from a plain terminal.\n',
+    );
+    process.exit(2);
   }
 
   // payload.cwd is the project dir, not the Bash tool's cwd (verified 2026-07-15).
