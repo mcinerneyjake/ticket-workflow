@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterAll } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, openSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1186,5 +1186,61 @@ describe('decide — a quoted VALUE must be judged dequoted (tkt-6d1ae448e3b3)',
     // shell rejects the command anyway. The commit/push fail-closed paths are unaffected.
     expect(blocked('git add "a', 'feat/x')).toBe(false);
     expect(blocked('git -C "/a/b commit -m x', 'feat/x')).toBe(true); // control: still fails closed
+  });
+});
+
+describe('the real hook — an unreadable payload fails CLOSED (tkt-92360b0e2079)', () => {
+  const hook = fileURLToPath(new URL('./guard-bash.mjs', import.meta.url));
+  // Raw bytes rather than JSON.stringify: the whole point is stdin the hook CANNOT parse.
+  const runRaw = (input) => spawnSync('node', [hook], { input, encoding: 'utf8', env: hermeticEnv() });
+
+  it.each([
+    ['garbage text', 'not json'],
+    ['empty stdin', ''],
+    ['truncated JSON', '{"tool_name":"Bash","tool_input":'],
+  ])('exits 2 and says why on %s', (_label, input) => {
+    const r = runRaw(input);
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.stderr).toContain('parse it as JSON');
+    // The wedge is session-wide, so the message must not read as an ordinary rule violation.
+    expect(r.stderr).toContain('NOT a rule violation');
+  });
+
+  it('reports a READ failure as a read failure, not as bad JSON', () => {
+    // The other half of the same catch: a directory fd opens fine and then throws EISDIR on read.
+    // Same exit, opposite triage — a reader told "could not parse it as JSON" would chase the
+    // wrong fault entirely.
+    const fd = openSync(tmpdir(), 'r');
+    try {
+      const r = spawnSync('node', [hook], { stdio: [fd, 'pipe', 'pipe'], encoding: 'utf8', env: hermeticEnv() });
+      expect(r.status, r.stderr).toBe(2);
+      expect(r.stderr).toContain('could not read it');
+      expect(r.stderr).not.toContain('parse it as JSON');
+    } finally {
+      closeSync(fd);
+    }
+  });
+
+  it('still ALLOWS a payload that parses but carries no command', () => {
+    // Pins the scope decision this fix deliberately did NOT widen. The PreToolUse matcher is a
+    // regex, so `Bash` also fires for BashOutput, whose events carry no command at all — blocking
+    // those would wedge every background-shell poll (review, tkt-92360b0e2079).
+    const r = runRaw(JSON.stringify({ tool_name: 'BashOutput', tool_input: { bash_id: 'x' } }));
+    expect(r.status, r.stderr).toBe(0);
+  });
+
+  it('still allows a well-formed payload carrying a harmless command', () => {
+    // Positive control. Without it every row above would also pass a hook that blocked
+    // unconditionally, and the guarantee here is "an unreadable payload is refused", not
+    // "everything is refused" — the second would wedge every Bash call in the session.
+    const r = runRaw(JSON.stringify({ tool_input: { command: 'echo hi' } }));
+    expect(r.status, r.stderr).toBe(0);
+  });
+
+  it('still blocks a well-formed payload carrying a forbidden command', () => {
+    // The other control: proves this harness reaches the git rules at all, so a passing row above
+    // cannot be the hook merely failing to run.
+    const r = runRaw(JSON.stringify({ tool_input: { command: 'git add -A' } }));
+    expect(r.status, r.stderr).toBe(2);
   });
 });
