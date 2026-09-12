@@ -385,6 +385,152 @@ describe('audit: eslint asked, not grepped', () => {
   });
 });
 
+/**
+ * Recorded shape of a real `oxlint --print-config` answer (oxlint 1.81): severity is the string
+ * `deny`, and a rule's options arrive as a NESTED array — `["deny", [{…}]]`, not eslint's
+ * `["error", {…}]`.
+ */
+const OXLINT_CONFORMING = JSON.stringify({
+  rules: {
+    'typescript/no-explicit-any': 'deny',
+    'typescript/no-non-null-assertion': 'deny',
+    'typescript/consistent-type-assertions': ['deny', [{ assertionStyle: 'never' }]],
+  },
+});
+
+/** The conforming fixture with eslint swapped for oxlint — no eslint.config.*, an .oxlintrc.json. */
+function makeOxlintRepo(): string {
+  const dir = makeConformingRepo();
+  rmSync(path.join(dir, 'eslint.config.js'));
+  writeFileSync(path.join(dir, '.oxlintrc.json'), JSON.stringify({ plugins: ['typescript'] }));
+  return dir;
+}
+
+/** `'oxlint'.endsWith('eslint')` is false, so this cannot answer for the eslint probe by accident. */
+const execWithOxlint: Exec = (cmd, args, opts) => {
+  if (cmd.endsWith('oxlint')) return { kind: 'ran', ok: true, stdout: OXLINT_CONFORMING, stderr: '' };
+  return defaultExec(cmd, args, opts);
+};
+
+function execOxlintAnswering(stdout: string): Exec {
+  return (cmd, args, opts) => (cmd.endsWith('oxlint') ? { kind: 'ran', ok: true, stdout, stderr: '' } : defaultExec(cmd, args, opts));
+}
+
+describe('audit: oxlint asked, not grepped (tkt-5c0e00fae59d)', () => {
+  it('PASSES a repo whose linter is oxlint, when the three conventions resolve to deny', () => {
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execWithOxlint);
+    expect(r.status, r.detail).toBe('pass');
+    expect(r.detail).toContain('oxlint');
+  });
+
+  it('BLOCKED when .oxlintrc.json exists but oxlint is not installed', () => {
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', defaultExec);
+    expect(r.status, r.detail).toBe('blocked');
+    expect(r.detail).toContain('oxlint');
+  });
+
+  it('FAIL when oxlint resolves a required rule below deny', () => {
+    const weak = JSON.stringify({
+      rules: {
+        'typescript/no-explicit-any': 'warn',
+        'typescript/no-non-null-assertion': 'deny',
+        'typescript/consistent-type-assertions': ['deny', [{ assertionStyle: 'never' }]],
+      },
+    });
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(weak));
+    expect(r.status).toBe('fail');
+    expect(r.detail).toContain('no-explicit-any');
+  });
+
+  it('FAIL when a required rule is absent from the resolved config entirely', () => {
+    const missing = JSON.stringify({ rules: { 'typescript/no-explicit-any': 'deny' } });
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(missing));
+    expect(r.status).toBe('fail');
+    expect(r.detail).toContain('no-non-null-assertion');
+  });
+
+  it('FAIL when assertionStyle is not never, even at deny', () => {
+    const wrongStyle = JSON.stringify({
+      rules: {
+        'typescript/no-explicit-any': 'deny',
+        'typescript/no-non-null-assertion': 'deny',
+        'typescript/consistent-type-assertions': ['deny', [{ assertionStyle: 'as' }]],
+      },
+    });
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(wrongStyle));
+    expect(r.status).toBe('fail');
+    expect(r.detail).toContain('assertionStyle');
+  });
+
+  // The permissive direction to guard: denied WITHOUT options carries no assertionStyle at all,
+  // and oxlint's own default for it is not `never`.
+  it('FAIL when consistent-type-assertions is denied with no options', () => {
+    const bare = JSON.stringify({
+      rules: {
+        'typescript/no-explicit-any': 'deny',
+        'typescript/no-non-null-assertion': 'deny',
+        'typescript/consistent-type-assertions': 'deny',
+      },
+    });
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(bare));
+    expect(r.status).toBe('fail');
+    expect(r.detail).toContain('assertionStyle');
+  });
+
+  it('BLOCKED when oxlint answers unparseable output', () => {
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering('not json'));
+    expect(r.status, r.detail).toBe('blocked');
+  });
+
+  it('FAILS a repo with neither linter configured, naming both shapes', () => {
+    const dir = makeConformingRepo();
+    rmSync(path.join(dir, 'eslint.config.js'));
+    const r = statusOf(dir, 'eslint-rules', execWithOxlint);
+    expect(r.status).toBe('fail');
+    expect(r.detail).toContain('eslint.config');
+    expect(r.detail).toContain('oxlintrc');
+  });
+
+  it('prefers eslint when both are configured', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(path.join(dir, '.oxlintrc.json'), JSON.stringify({ plugins: ['typescript'] }));
+    const r = statusOf(dir, 'eslint-rules', execWithEslint);
+    expect(r.status, r.detail).toBe('pass');
+  });
+
+  /**
+   * Measured against oxlint 1.81: unlike eslint's, oxlint's `--print-config` is NOT file-scoped —
+   * it reports the top-level severity and hands back `overrides` unapplied. A repo denying all
+   * three at top level and switching one off for `**\/*.ts` lints clean (exit 0) while the resolved
+   * severity still reads `deny`, so reading severity alone certifies a repo that enforces nothing.
+   */
+  it('BLOCKED when an override touches a required rule — the resolved severity cannot be trusted', () => {
+    const overridden = JSON.stringify({
+      rules: {
+        'typescript/no-explicit-any': 'deny',
+        'typescript/no-non-null-assertion': 'deny',
+        'typescript/consistent-type-assertions': ['deny', [{ assertionStyle: 'never' }]],
+      },
+      overrides: [{ files: ['**/*.ts'], rules: { 'typescript/no-explicit-any': 'allow' } }],
+    });
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(overridden));
+    expect(r.status, r.detail).toBe('blocked');
+    expect(r.detail).toContain('no-explicit-any');
+  });
+
+  it('is unbothered by an override touching rules it does not audit', () => {
+    const unrelated = JSON.stringify({
+      rules: {
+        'typescript/no-explicit-any': 'deny',
+        'typescript/no-non-null-assertion': 'deny',
+        'typescript/consistent-type-assertions': ['deny', [{ assertionStyle: 'never' }]],
+      },
+      overrides: [{ files: ['**/*.test.ts'], rules: { 'react/rules-of-hooks': 'allow' } }],
+    });
+    expect(statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(unrelated)).status).toBe('pass');
+  });
+});
+
 describe('audit: branch protection asked of the API', () => {
   function withGh(handler: (args: readonly string[]) => ExecResult | undefined): Exec {
     return (cmd, args, opts) => {
@@ -720,5 +866,46 @@ describe('audit: hook-launcher accepts pre-marker launchers as blocked, not iner
     );
     const r = statusOf(dir, 'hook-launcher');
     expect(r.status, r.detail).toBe('fail');
+  });
+});
+
+/**
+ * The overrides guard exists BECAUSE oxlint's resolved severity cannot be trusted when overrides are
+ * present. An `overrides` value it cannot parse is therefore the case it knows least about, and it
+ * used to answer "nothing is overridden" — the permissive answer — for every such shape.
+ */
+describe('audit: oxlint overrides that cannot be read are BLOCKED, not waved through', () => {
+  const CONFORMING_RULES = {
+    'typescript/no-explicit-any': 'deny',
+    'typescript/no-non-null-assertion': 'deny',
+    'typescript/consistent-type-assertions': ['deny', [{ assertionStyle: 'never' }]],
+  };
+  const answering = (overrides: unknown): string => JSON.stringify({ rules: CONFORMING_RULES, overrides });
+
+  it('BLOCKED when `overrides` is not an array', () => {
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(answering({ files: ['*.ts'] })));
+    expect(r.status, r.detail).toBe('blocked');
+    expect(r.detail).toContain('overrides');
+  });
+
+  it('BLOCKED when an `overrides` entry is not an object', () => {
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(answering(['*.ts'])));
+    expect(r.status, r.detail).toBe('blocked');
+  });
+
+  it('BLOCKED when an `overrides` entry has a non-object `rules`', () => {
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(answering([{ files: ['*.ts'], rules: ['no-explicit-any'] }])));
+    expect(r.status, r.detail).toBe('blocked');
+  });
+
+  // Absence is not an unreadable shape: a block that sets no rules cannot relax one.
+  it('PASSES when an `overrides` entry sets no rules at all', () => {
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(answering([{ files: ['*.spec.ts'] }])));
+    expect(r.status, r.detail).toBe('pass');
+  });
+
+  it('PASSES when `overrides` is absent entirely', () => {
+    const r = statusOf(makeOxlintRepo(), 'eslint-rules', execOxlintAnswering(JSON.stringify({ rules: CONFORMING_RULES })));
+    expect(r.status, r.detail).toBe('pass');
   });
 });
