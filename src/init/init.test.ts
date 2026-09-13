@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardrailTemplates } from '../templates.js';
-import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS, GITIGNORE_ENV_NOT_READY, LAUNCHER_ENV_NOT_READY } from './run.js';
+import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS, GITIGNORE_ENV_NOT_READY, LAUNCHER_ENV_NOT_READY, PIN_PARITY_FRESH_SHAPES } from './run.js';
 import { parseInitArgs, cmdInit } from '../cli/index.js';
 import type { Exec } from '../audit/types.js';
 
@@ -288,6 +288,47 @@ describe('init tolerates hook-launcher BLOCKED only when the environment is not 
     const blocked = runInit(dir, {}, () => ({ kind: 'absent' })).report.results.find((r) => r.id === 'gitignore');
     expect(blocked?.status).toBe('blocked');
     expect(GITIGNORE_ENV_NOT_READY.some((p) => blocked?.detail.includes(p)), `untolerated detail: ${blocked?.detail}`).toBe(true);
+  });
+
+  it('the tolerated pin-parity shape is the one the check actually emits', () => {
+    // Same coupling as the two above: init writes the pin but installs nothing, so the check blocks
+    // on "not installed". A reworded detail must redden here, not quietly stop being tolerated.
+    const dir = tempDir();
+    const blocked = runInit(dir, {}, () => ({ kind: 'absent' })).report.results.find((r) => r.id === 'pin-parity');
+    expect(blocked?.status).toBe('blocked');
+    expect(PIN_PARITY_FRESH_SHAPES.some((sh) => sh.test(blocked?.detail ?? '')), `untolerated detail: ${blocked?.detail}`).toBe(true);
+  });
+
+  it('a pin-parity BLOCKED for any other reason is not fresh-scaffold state — init exits non-zero', () => {
+    const dir = tempDir();
+    // Installed, but with a manifest carrying no version: the pin is no longer "not installed", it
+    // is undeterminable — which must not read as a healthy scaffold.
+    mkdirSync(path.join(dir, 'node_modules', 'ticket-workflow'), { recursive: true });
+    writeFileSync(path.join(dir, 'node_modules', 'ticket-workflow', 'package.json'), JSON.stringify({ name: 'ticket-workflow' }));
+    const result = runInit(dir, {}, () => ({ kind: 'absent' }));
+    const blocked = result.report.results.find((r) => r.id === 'pin-parity');
+    expect(blocked?.status).toBe('blocked');
+    expect(PIN_PARITY_FRESH_SHAPES.some((sh) => sh.test(blocked?.detail ?? '')), `wrongly tolerated: ${blocked?.detail}`).toBe(false);
+    expect(result.exitCode, 'an undeterminable pin must not read as a healthy scaffold').toBe(1);
+  });
+
+  /** Review finding 6: the tolerance matched a SUBSTRING of a detail that interpolates the repo's
+   *  own dependency spec, so a dependency literally spelled `.../is not installed` put the phrase
+   *  into the unparseable-spec message and tolerated an undeterminable pin. */
+  it('is not fooled by a dependency spec containing the tolerated phrase', () => {
+    const dir = tempDir();
+    writeFileSync(
+      path.join(dir, 'package.json'),
+      JSON.stringify({ name: 'x', dependencies: { 'ticket-workflow': 'file:../vendor/is not installed' } }),
+    );
+    const result = runInit(dir, {}, () => ({ kind: 'absent' }));
+    const blocked = result.report.results.find((r) => r.id === 'pin-parity');
+    expect(blocked?.status).toBe('blocked');
+    expect(blocked?.detail, 'the injected phrase is present in the detail').toContain('is not installed');
+    expect(
+      PIN_PARITY_FRESH_SHAPES.some((sh) => sh.test(blocked?.detail ?? '')),
+      'an unparseable spec must NOT be tolerated as fresh-scaffold state',
+    ).toBe(false);
   });
 
   it('a gitignore probe that RAN and failed is not fresh-scaffold state — init exits non-zero', () => {

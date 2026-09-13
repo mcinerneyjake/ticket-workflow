@@ -14,6 +14,8 @@ import { tsconfigStrict } from './checks/tsconfigStrict.js';
 import { vitestCoverage } from './checks/vitestCoverage.js';
 import { vitestCollection } from './checks/vitestCollection.js';
 import { nodeVersionSync } from './checks/nodeVersionSync.js';
+import { pinParity } from './checks/pinParity.js';
+import { pinFreshness } from './checks/pinFreshness.js';
 import { loadRepoConfig, CONFIG_FILE } from './config.js';
 import { tierIncludes } from '../templates.js';
 import { defaultExec, makeResult, readRepoFile, type AuditCheck, type AuditContext, type AuditResult, type Exec } from './types.js';
@@ -29,6 +31,8 @@ export const AUDIT_CHECKS: readonly AuditCheck[] = [
   hookSettings,
   hookArming,
   branchProtection,
+  pinParity,
+  pinFreshness,
   packageScripts,
   huskyPreCommit,
   eslintRules,

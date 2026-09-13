@@ -22,8 +22,9 @@ export interface InitResult {
  *  the launcher imports) and no remote yet (branch protection). An allowlist by id — anything else
  *  BLOCKED moves init's exit code. `hook-launcher` is here because the audit now EXECUTES the
  *  launcher: before `npm install` it correctly blocks everything, which is unverifiable rather than
- *  conformant, and must not read as a PASS. */
-export const EXPECTED_FRESH_BLOCKED: ReadonlySet<string> = new Set(['eslint-rules', 'tsconfig-strict', 'branch-protection', 'hook-launcher', 'gitignore']);
+ *  conformant, and must not read as a PASS. `pin-parity` likewise: init writes the pin, so the tag
+ *  is declared but nothing is installed to compare it against until `npm install` runs. */
+export const EXPECTED_FRESH_BLOCKED: ReadonlySet<string> = new Set(['eslint-rules', 'tsconfig-strict', 'branch-protection', 'hook-launcher', 'gitignore', 'pin-parity']);
 
 /** See the tolerance narrowing in runInit. Pinned against the check's own details by init.test.ts. */
 export const LAUNCHER_ENV_NOT_READY: readonly string[] = ['cannot load the guard', 'node is not on PATH'];
@@ -31,6 +32,20 @@ export const LAUNCHER_ENV_NOT_READY: readonly string[] = ['cannot load the guard
 /** Same narrowing, for the gitignore check: it evaluates the rules by asking git, so a machine
  *  without git cannot answer. Any OTHER blocked reason means the probe ran and went wrong. */
 export const GITIGNORE_ENV_NOT_READY: readonly string[] = ['git is not on PATH'];
+
+/**
+ * Same narrowing, for the pin check: a scaffold that has not been installed yet has nothing to
+ * compare the pin against. Any OTHER blocked reason — an unparseable spec, a versionless manifest —
+ * is undetermined state that must not read as a healthy scaffold.
+ *
+ * ANCHORED, and a regex rather than a substring, because this detail is the only one of the three
+ * whose sentence interpolates repo-controlled text: a dependency spelled
+ * `file:../vendor/is not installed` lands in the unparseable-spec message, whose text would satisfy
+ * a bare `includes('is not installed')` and tolerate an undeterminable pin. Anchoring defeats that
+ * — the interpolated spec can never sit at position 0 — and `pin.ref` is validated as vX.Y.Z before
+ * it reaches this sentence, so the one interpolation inside the pattern cannot inject either.
+ */
+export const PIN_PARITY_FRESH_SHAPES: readonly RegExp[] = [/^ticket-workflow is pinned to v\d+\.\d+\.\d+ but is not installed\b/];
 
 export const GATE_SCRIPTS = {
   typecheck: 'tsc -p tsconfig.json',
@@ -173,6 +188,10 @@ export function runInit(
   const ignoreRules = report.results.find((r) => r.id === 'gitignore');
   if (ignoreRules?.status === 'blocked' && !GITIGNORE_ENV_NOT_READY.some((phrase) => ignoreRules.detail.includes(phrase))) {
     tolerable.delete('gitignore');
+  }
+  const pin = report.results.find((r) => r.id === 'pin-parity');
+  if (pin?.status === 'blocked' && !PIN_PARITY_FRESH_SHAPES.some((shape) => shape.test(pin.detail))) {
+    tolerable.delete('pin-parity');
   }
   const gating = report.results.filter((r) => !r.advisory);
   const blocked = gating.filter((r) => r.status === 'blocked');
