@@ -909,3 +909,72 @@ describe('audit: oxlint overrides that cannot be read are BLOCKED, not waved thr
     expect(r.status, r.detail).toBe('pass');
   });
 });
+/**
+ * The full-audit fixture deliberately declares NO ticket-workflow dependency, so every other
+ * integration test above satisfies pin-parity through its not-applicable branch and the suite stays
+ * offline. These cases drive the state the standard actually mandates — a declared pin plus an
+ * installed copy — through the real runAudit chain, with exec injected so no test touches a remote.
+ */
+describe('pin checks end-to-end through runAudit', () => {
+  /** Generated, not transcribed: the fixture symlinks THIS package as the installed copy. */
+  const installedVersion = (() => {
+    const parsed: unknown = JSON.parse(readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8'));
+    if (typeof parsed !== 'object' || parsed === null || !('version' in parsed) || typeof parsed.version !== 'string') {
+      throw new Error('could not read this package version');
+    }
+    return parsed.version;
+  })();
+
+  function repoPinnedTo(ref: string): string {
+    const dir = makeConformingRepo();
+    const pkg: unknown = JSON.parse(FIXTURE_PKG);
+    if (typeof pkg !== 'object' || pkg === null) throw new Error('fixture package.json is not an object');
+    writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ ...pkg, dependencies: { 'ticket-workflow': `github:someowner/ticket-workflow#${ref}` } }));
+    return dir;
+  }
+
+  const lsRemote = (tags: readonly string[]): string => tags.map((t) => `0000000000000000000000000000000000000000\trefs/tags/${t}`).join('\n');
+  const withRemote = (tags: readonly string[]): Exec => (cmd, args, opts) => {
+    if (cmd === 'git' && args[0] === 'ls-remote') return { kind: 'ran', ok: true, status: 0, stdout: lsRemote(tags), stderr: '' };
+    return execWithEslint(cmd, args, opts);
+  };
+
+  it('PASSES pin-parity when the pin matches the installed copy', () => {
+    const dir = repoPinnedTo(`v${installedVersion}`);
+    const r = statusOf(dir, 'pin-parity', withRemote([`v${installedVersion}`]));
+    expect(r.status, r.detail).toBe('pass');
+  });
+
+  it('FAILS pin-parity when the pin names a version the tree does not carry', () => {
+    const dir = repoPinnedTo('v0.0.1');
+    const r = statusOf(dir, 'pin-parity', withRemote(['v0.0.1']));
+    expect(r.status, r.detail).toBe('fail');
+    expect(r.detail).toContain(installedVersion);
+  });
+
+  it('a stale pin does NOT move the audit exit code, because freshness is advisory', () => {
+    const dir = repoPinnedTo(`v${installedVersion}`);
+    const exec = withRemote([`v${installedVersion}`, 'v99.0.0']);
+    const report = runAudit(dir, exec);
+    const fresh = report.results.find((r) => r.id === 'pin-freshness');
+    expect(fresh?.status, fresh?.detail).toBe('fail');
+    expect(fresh?.advisory).toBe(true);
+    // The whole reason for the split: a tag cut elsewhere must not redden a consumer required check.
+    const gatingFails = report.results.filter((r) => !r.advisory && r.status === 'fail');
+    expect(gatingFails.map((r) => r.id)).not.toContain('pin-freshness');
+    expect(auditExitCode(report, new Set(['branch-protection'])), formatAudit(report)).toBe(0);
+  });
+
+  it('an unreachable remote does not disturb the gating pin-parity answer', () => {
+    const dir = repoPinnedTo(`v${installedVersion}`);
+    const offline: Exec = (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'ls-remote') return { kind: 'ran', ok: false, status: 128, stdout: '', stderr: 'fatal: unreachable' };
+      return execWithEslint(cmd, args, opts);
+    };
+    expect(statusOf(dir, 'pin-parity', offline).status).toBe('pass');
+    const report = runAudit(dir, offline);
+    expect(report.results.find((r) => r.id === 'pin-freshness')?.status).toBe('blocked');
+    expect(auditExitCode(report, new Set(['branch-protection'])), formatAudit(report)).toBe(0);
+  });
+});
+

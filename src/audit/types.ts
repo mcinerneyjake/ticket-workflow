@@ -12,9 +12,11 @@ export interface AuditResult {
   /** One line. For fail/blocked, say what to do about it. */
   readonly detail: string;
   /**
-   * Advisory results are always reported but never move the exit code. Reserved for the one check
-   * that is BLOCKED by design on every run (hook-arming: machine-local wiring is invisible from a
-   * repository, so PASS is unreachable and gating on it would redden every CI forever). Everything
+   * Advisory results are always reported but never move the exit code. Two checks use it, both for
+   * answers that are not conformance facts about the audited repo: hook-arming (machine-local
+   * wiring is invisible from a repository, so PASS is unreachable and gating would redden every CI
+   * forever) and pin-freshness (a newer tag upstream is an upgrade backlog, and gating on it would
+   * fail every open PR in an untouched repo the moment someone cuts a tag elsewhere). Everything
    * else that cannot be determined still fails the gate — "can't check" is not conformance.
    */
   readonly advisory: boolean;
