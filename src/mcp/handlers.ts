@@ -11,6 +11,7 @@ import {
 import {
   extractTicketFields, validatedStatus, CREATE_STATUS_ENUM, UPDATE_STATUS_ENUM,
 } from '../server/validation.js';
+import { log } from '../logger.js';
 
 // MCP tool handlers — the testable core; mcp/server.ts is the thin transport entrypoint.
 
@@ -357,9 +358,9 @@ export async function handleToolCall(
   } catch (err) {
     // HttpError messages are authored for the caller; anything else is a raw fault whose message
     // embeds absolute host paths. Keep the detail server-side and return only the errno, matching
-    // readEvents' shape (tkt-7cab2f9cc082). console.error direct until tkt-c2ed32531824 lands.
+    // readEvents' shape (tkt-7cab2f9cc082).
     if (err instanceof HttpError) return { content: [textContent(err.message)], isError: true };
-    console.error('[mcp] tool call failed', name, err);
+    log.error('[mcp] tool call failed', name, err);
     const code = errnoCode(err);
     return { content: [textContent(`Unexpected error handling ${name}${code ? ` (${code})` : ''}`)], isError: true };
   }

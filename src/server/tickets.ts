@@ -5,6 +5,7 @@ import matter from 'gray-matter';
 import { STATUS_IDS, TYPES, PRIORITIES, BOARD_STATUSES, CREATE_STATUS_IDS, STATUS_STEP, isSource, type Ticket, type StatusId, type Priority, type DashboardSummary, type Provenance } from '../shared/constants.js';
 import { ticketsDir } from '../paths.js';
 import { appendEvent } from './events.js';
+import { log } from '../logger.js';
 
 // Service layer: the only module that touches the filesystem (Route -> Service).
 // Source of truth: one markdown file per ticket in the board's /tickets dir.
@@ -190,7 +191,7 @@ async function snapshotHistory(prior: Ticket): Promise<void> {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     await atomicWrite(path.join(dir, `${stamp}-${randomUUID().slice(0, 8)}.md`), serialize(prior));
   } catch (err) {
-    console.error(`[history] failed to snapshot prior body for ${prior.id} before overwrite:`, err);
+    log.error(`[history] failed to snapshot prior body for ${prior.id} before overwrite:`, err);
   }
 }
 
@@ -320,7 +321,7 @@ export async function listBoard(): Promise<BoardListing> {
       // A concurrent delete/archive can remove a file readdir just named (tkt-0612c572b49e).
       // Skip it like an unparseable one; anything else is a real fault and must still surface.
       if (!isENOENT(err)) throw err;
-      console.warn(`[tickets] skipping ticket file that disappeared mid-read: ${file}`);
+      log.warn(`[tickets] skipping ticket file that disappeared mid-read: ${file}`);
       unreadable.push({ file, reason: 'file disappeared between readdir and read' });
       continue;
     }
@@ -329,7 +330,7 @@ export async function listBoard(): Promise<BoardListing> {
       tickets.push(normalize(file.slice(0, -3), data, content));
     } catch (err) {
       // Unparseable frontmatter must not take the whole board down — skip so the rest stays up.
-      console.warn(`[tickets] skipping unparseable ticket file ${file}:`, err instanceof Error ? err.message : err);
+      log.warn(`[tickets] skipping unparseable ticket file ${file}:`, err instanceof Error ? err.message : err);
       unreadable.push({ file, reason: err instanceof Error ? err.message : String(err) });
     }
   }
@@ -360,8 +361,7 @@ export async function getTicket(id: string): Promise<Ticket> {
   } catch (err) {
     // The YAMLException embeds a snippet of the file's own content and its line/column; it stays
     // server-side because consumers surface HttpError messages to clients (tkt-7cab2f9cc082).
-    // console.error direct until the injectable logger (tkt-c2ed32531824) lands.
-    console.error('[tickets] unparseable frontmatter', file, err);
+    log.error('[tickets] unparseable frontmatter', file, err);
     throw new HttpError(500, `Ticket ${id} has unparseable frontmatter`);
   }
 }
@@ -437,7 +437,7 @@ async function emitStatusStep(id: string, status: StatusId): Promise<void> {
   try {
     await appendEvent({ ticketId: id, step, state: 'reached' });
   } catch (err) {
-    console.error('[events] failed to record status step', err);
+    log.error('[events] failed to record status step', err);
   }
 }
 
@@ -567,7 +567,7 @@ export async function archiveStaleTickets(): Promise<number> {
     await writeTicket({ ...cur, status: 'archived', updated: archived });
     count += 1;
   })));
-  console.log(`[archive] Archived ${count} stale ticket(s)`);
+  log.info(`[archive] Archived ${count} stale ticket(s)`);
   return count;
 }
 
@@ -654,6 +654,6 @@ export async function deleteTicket(id: string): Promise<void> {
       })),
     );
   } catch (err) {
-    console.error(`[delete] referential cleanup for ${id} failed:`, err);
+    log.error(`[delete] referential cleanup for ${id} failed:`, err);
   }
 }

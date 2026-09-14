@@ -4,9 +4,24 @@ import path from 'node:path';
 import { listTickets, listBoard, listProjects, getTicket, createTicket, updateTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, HttpError } from './tickets.js';
 import { readEvents } from './events.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
+import { setLogger } from '../logger.js';
 import type { Ticket } from '../shared/constants.js';
 
 const dirs = setupTempTicketDirs('kanban-test');
+
+// Captured through the logger seam rather than a console spy: the service writes to process.stderr
+// directly now, so a console spy would observe nothing (tkt-c2ed32531824).
+function captureLog(): { warn: string[]; error: string[] } {
+  const captured: { warn: string[]; error: string[] } = { warn: [], error: [] };
+  setLogger({
+    info: () => undefined,
+    warn: (...args) => { captured.warn.push(args.map(String).join(' ')); },
+    error: (...args) => { captured.error.push(args.map(String).join(' ')); },
+  });
+  return captured;
+}
+
+afterEach(() => { setLogger(null); });
 
 async function httpError<T>(p: Promise<T>): Promise<HttpError> {
   const err = await p.catch((e) => e);
@@ -956,14 +971,13 @@ describe('corrupt ticket file resilience', () => {
   const UNQUOTED_COLON = '---\ntitle: Fix the seam: stale tabs\ntype: task\n---\n';
 
   it('listTickets skips an unparseable file, keeps the rest of the board, and warns', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
+    const captured = captureLog();
     const good = await createTicket({ title: 'Good one' });
     await writeRaw('tkt-bad', CORRUPT);
     const all = await listTickets();                    // must not throw
     expect(all.map((t) => t.id)).toContain(good.id);
     expect(all.map((t) => t.id)).not.toContain('tkt-bad');
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
+    expect(captured.warn.length).toBeGreaterThan(0);
   });
 
   it('getTicket surfaces a 500 naming the ticket for unparseable frontmatter', async () => {
@@ -979,7 +993,6 @@ describe('corrupt ticket file resilience', () => {
   // ("...at line 2, column 20:\n    title: Fix the seam: stale tabs"), which is what makes the
   // leak assertion below load-bearing rather than vacuously true.
   it('does not leak the parser message for unparseable frontmatter', async () => {
-    const error = vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
     await writeRaw('tkt-bad', UNQUOTED_COLON);
 
     const err = await httpError(getTicket('tkt-bad'));
@@ -987,37 +1000,32 @@ describe('corrupt ticket file resilience', () => {
     expect(err.status).toBe(500);
     expect(err.message).toBe('Ticket tkt-bad has unparseable frontmatter');
     expect(err.message).not.toContain('stale tabs'); // the file's own content
-    error.mockRestore();
   });
 
   it('logs the unparseable-frontmatter detail server-side', async () => {
-    const error = vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
+    const captured = captureLog();
     await writeRaw('tkt-bad', CORRUPT);
 
     await httpError(getTicket('tkt-bad'));
 
-    expect(error).toHaveBeenCalled();
-    const logged = error.mock.calls.flat().map((a) => String(a)).join(' ');
+    expect(captured.error.length).toBeGreaterThan(0);
+    const logged = captured.error.join(' ');
     expect(logged).toContain('tkt-bad.md'); // the path the caller never sees
-    error.mockRestore();
   });
 
   it('stays consistent across repeated reads (gray-matter content cache is bypassed)', async () => {
     // NO_CACHE guard: gray-matter's un-parsed cache would let a corrupt file throw once
     // then return a cached empty success (500 decaying to a silent ghost). Both reads must match.
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
     await writeRaw('tkt-bad', CORRUPT);
     expect((await listTickets()).map((t) => t.id)).not.toContain('tkt-bad');
     expect((await listTickets()).map((t) => t.id)).not.toContain('tkt-bad'); // 2nd read too
     expect((await httpError(getTicket('tkt-bad'))).status).toBe(500);
     expect((await httpError(getTicket('tkt-bad'))).status).toBe(500);        // still 500, not a ghost
-    warn.mockRestore();
   });
 
   // tkt-6cd916608a2f — skipping is correct; skipping *silently* is the bug. A caller
   // holding no independent expected count reads the short list as the whole board.
   it('listBoard reports an unparseable file to the caller, naming it', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
     const good = await createTicket({ title: 'Good one' });
     await writeRaw('tkt-colon', UNQUOTED_COLON);
 
@@ -1027,7 +1035,6 @@ describe('corrupt ticket file resilience', () => {
     expect(board.unreadable).toHaveLength(1);
     expect(board.unreadable[0]?.file).toBe('tkt-colon.md');
     expect(board.unreadable[0]?.reason).toBeTruthy();
-    warn.mockRestore();
   });
 
   it('listBoard reports an empty unreadable list when every file parses', async () => {
@@ -1038,7 +1045,6 @@ describe('corrupt ticket file resilience', () => {
   });
 
   it('listBoard reports a file that vanishes between readdir and readFile', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
     await createTicket({ title: 'Survivor' });
     await fs.symlink(path.join(dirs.tickets, 'gone.md'), path.join(dirs.tickets, 'tkt-ghost.md'));
 
@@ -1046,7 +1052,6 @@ describe('corrupt ticket file resilience', () => {
 
     expect(board.tickets).toHaveLength(1);
     expect(board.unreadable.map((u) => u.file)).toEqual(['tkt-ghost.md']);
-    warn.mockRestore();
     vi.restoreAllMocks();
   });
 });
@@ -1062,7 +1067,7 @@ describe('concurrent file deletion during listTickets', () => {
   });
 
   it('skips a file that is named by readdir but gone by readFile, keeps the rest, and warns', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
+    const captured = captureLog();
     const survivor = await createTicket({ title: 'Survivor' });
     // A dangling symlink stands in for the race without mocking fs: readdir still names it,
     // readFile follows it and gets the same real ENOENT a mid-flight delete produces.
@@ -1072,7 +1077,7 @@ describe('concurrent file deletion during listTickets', () => {
 
     expect(all.map((t) => t.id)).toContain(survivor.id);
     expect(all.map((t) => t.id)).not.toContain('tkt-ghost');
-    expect(warn).toHaveBeenCalled();
+    expect(captured.warn.length).toBeGreaterThan(0);
   });
 
   it('still surfaces a non-ENOENT read failure instead of silently swallowing it', async () => {

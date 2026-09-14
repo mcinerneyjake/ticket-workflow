@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { log } from './logger.js';
 
 export type BoardRootSource = 'BOARD_DIR_OVERRIDE' | 'CLAUDE_PROJECT_DIR' | 'cwd';
 
@@ -37,7 +38,7 @@ export function boardRoot(): string {
   const { root, source } = resolveBoardRoot();
   if (source === 'cwd' && !warnedImplicitRoots.has(root)) {
     warnedImplicitRoots.add(root);
-    console.warn(
+    log.warn(
       `[ticket-workflow] No BOARD_DIR_OVERRIDE or CLAUDE_PROJECT_DIR set; using the current directory as the board root: ${root}. ` +
         'If the board looks empty, the server is likely running from the wrong directory — set BOARD_DIR_OVERRIDE to the board location.',
     );
