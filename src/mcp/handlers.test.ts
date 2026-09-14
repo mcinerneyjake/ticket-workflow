@@ -6,8 +6,19 @@ import { CREATE_STATUS_ENUM, UPDATE_STATUS_ENUM } from '../server/validation.js'
 import { createTicket, updateTicket, listTickets, getTicket } from '../server/tickets.js';
 import { STATUS_IDS, type StatusId } from '../shared/constants.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
+import { setLogger } from '../logger.js';
 
 const dirs = setupTempTicketDirs('kanban-mcp-test');
+
+// Captured through the logger seam rather than a console spy: handlers write to process.stderr
+// directly now, so a console spy would observe nothing (tkt-c2ed32531824).
+function captureErrors(): string[] {
+  const captured: string[] = [];
+  setLogger({ info: () => undefined, warn: () => undefined, error: (...args) => { captured.push(args.map(String).join(' ')); } });
+  return captured;
+}
+
+afterEach(() => { setLogger(null); });
 
 // ---------------------------------------------------------------------------
 // Parsing helpers — narrow JSON.parse output with predicates, no casts.
@@ -767,7 +778,6 @@ describe('catch-all sanitisation', () => {
   it('does not leak the host path from a non-HttpError fault', async () => {
     const id = await seed();
     const file = path.join(dirs.tickets, `${id}.md`);
-    vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
     vi.spyOn(fs, 'readFile').mockRejectedValue(eaccesError(file));
 
     const res = await handleToolCall('get_ticket', { id });
@@ -781,13 +791,13 @@ describe('catch-all sanitisation', () => {
   it('logs the raw fault server-side', async () => {
     const id = await seed();
     const file = path.join(dirs.tickets, `${id}.md`);
-    const error = vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
+    const captured = captureErrors();
     vi.spyOn(fs, 'readFile').mockRejectedValue(eaccesError(file));
 
     await handleToolCall('get_ticket', { id });
 
-    expect(error).toHaveBeenCalled();
-    const logged = error.mock.calls.flat().map((a) => String(a)).join(' ');
+    expect(captured.length).toBeGreaterThan(0);
+    const logged = captured.join(' ');
     expect(logged).toContain('permission denied');
   });
 
@@ -800,7 +810,6 @@ describe('catch-all sanitisation', () => {
 
   it('names the tool for a fault carrying no errno', async () => {
     const id = await seed();
-    vi.spyOn(console, 'error').mockImplementation(() => { /* silence */ });
     vi.spyOn(fs, 'readFile').mockRejectedValue(new Error('kaboom /Users/someuser/board'));
 
     const res = await handleToolCall('get_ticket', { id });

@@ -10,6 +10,7 @@ import {
   type TicketEventsResponse,
 } from '../shared/constants.js';
 import { eventsDir } from '../paths.js';
+import { log } from '../logger.js';
 import { HttpError, isENOENT, errnoCode } from './tickets.js';
 
 // Workflow-step telemetry: append-only JSONL, one file per ticket, in events/
@@ -130,7 +131,7 @@ export async function readEvents(ticketId: string): Promise<ReadEventsResult> {
     if (isENOENT(err)) return { events: [], skipped: 0, unrecognized: 0 };
     // The path and stack stay server-side; the thrown message carries only the errno, because
     // consumers surface HttpError messages to clients and a raw fs error embeds the events dir.
-    console.error('[events] read failed', file, err);
+    log.error('[events] read failed', file, err);
     const code = errnoCode(err);
     throw new HttpError(500, `Could not read events for ${ticketId}${code ? ` (${code})` : ''}`);
   }

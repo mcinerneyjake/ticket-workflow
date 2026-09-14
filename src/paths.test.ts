@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import path from 'node:path';
 import { boardRoot, resolveBoardRoot, ticketsDir, eventsDir, _resetBoardRootWarnings } from './paths.js';
+import { setLogger } from './logger.js';
 
 const KEYS = ['BOARD_DIR_OVERRIDE', 'CLAUDE_PROJECT_DIR', 'TICKETS_DIR_OVERRIDE', 'EVENTS_DIR_OVERRIDE'];
 function clearEnv() {
@@ -8,14 +9,22 @@ function clearEnv() {
 }
 
 describe('board-root resolution', () => {
+  // Captured through the logger seam, not a console spy: the service writes to process.stderr
+  // directly now, so a console spy would observe nothing at all (tkt-c2ed32531824). Scoped to this
+  // describe so a later one triggering log.warn cannot accumulate into it and make these counts
+  // order-dependent.
+  const warnings: string[][] = [];
+
   // Reset the warn-once memory + silence the warning so each test observes it
   // independently and the fallback warning doesn't pollute test output.
   beforeEach(() => {
     _resetBoardRootWarnings();
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    warnings.length = 0;
+    setLogger({ info: () => undefined, warn: (...args) => { warnings.push(args.map(String)); }, error: () => undefined });
   });
   afterEach(() => {
     clearEnv();
+    setLogger(null);
     vi.restoreAllMocks();
   });
 
@@ -89,8 +98,8 @@ describe('board-root resolution', () => {
     it('warns naming the resolved path when falling back to cwd', () => {
       clearEnv();
       boardRoot();
-      expect(console.warn).toHaveBeenCalledTimes(1);
-      expect(vi.mocked(console.warn).mock.calls[0][0]).toContain(process.cwd());
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0][0]).toContain(process.cwd());
     });
 
     it('warns only once per distinct root (no per-operation spam)', () => {
@@ -98,21 +107,21 @@ describe('board-root resolution', () => {
       boardRoot();
       boardRoot();
       boardRoot();
-      expect(console.warn).toHaveBeenCalledTimes(1);
+      expect(warnings).toHaveLength(1);
     });
 
     it('does not warn when BOARD_DIR_OVERRIDE is supplied', () => {
       clearEnv();
       process.env.BOARD_DIR_OVERRIDE = '/board';
       boardRoot();
-      expect(console.warn).not.toHaveBeenCalled();
+      expect(warnings).toHaveLength(0);
     });
 
     it('does not warn when CLAUDE_PROJECT_DIR is supplied', () => {
       clearEnv();
       process.env.CLAUDE_PROJECT_DIR = '/repo';
       boardRoot();
-      expect(console.warn).not.toHaveBeenCalled();
+      expect(warnings).toHaveLength(0);
     });
   });
 });

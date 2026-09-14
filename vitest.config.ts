@@ -3,6 +3,8 @@ import { configDefaults, defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     environment: 'node',
+    // Silences the service logger by default; see the file for why and how a test opts out.
+    setupFiles: ['src/test-support/silenceLogger.ts'],
     // Default glob picks up src/**/*.test.ts AND hooks/**/*.test.mjs. Extend the defaults rather
     // than replace them; .claude/worktrees/ can hold full second checkouts whose suites would
     // double-collect.

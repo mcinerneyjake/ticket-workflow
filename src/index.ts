@@ -5,6 +5,8 @@ export * from './server/events.js';
 export * from './server/validation.js';
 export * from './mcp/handlers.js';
 export { boardRoot, ticketsDir, eventsDir } from './paths.js';
+export { setLogger } from './logger.js';
+export type { Logger } from './logger.js';
 export { guardrailTemplates, tierIncludes } from './templates.js';
 export type { GuardrailTemplate, GuardrailTier } from './templates.js';
 export { runAudit, auditExitCode, formatAudit, AUDIT_CHECKS } from './audit/run.js';
