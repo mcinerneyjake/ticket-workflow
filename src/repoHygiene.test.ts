@@ -25,15 +25,19 @@ const PLACEHOLDERS = new Set([
 // `HOME=/Users/user`, is exactly the leak the first cut of this check missed, which made it
 // narrower than the grep it replaced. The owner class starts at `[A-Za-z_]`, so a leading-underscore
 // account is caught and `~5 minutes` is not.
-const ABS_HOME = /(?:\/Users\/|\/home\/)([A-Za-z_][A-Za-z0-9._-]*)/g;
+//
+// tkt-87b8b9b60b24: macOS is case-insensitive, so `/users/<owner>` is a working path too. The
+// off-case spellings count only at a path root, or every `/api/users/<id>` route reads as a leak;
+// only the canonical `/Users/`, `/home/` match mid-path. No blanket `i` (prose `HOME`). Declared
+// limits, pinned: `/USERS/`, `/HOME/` and a nested off-case prefix are unmatched; a root route flags.
+const ABS_HOME = /(?:\/Users\/|\/home\/|(?<![\w.~-])\/users\/|(?<![\w.~-])\/Home\/)([A-Za-z_][A-Za-z0-9._-]*)/g;
 // The tilde form DOES require a trailing slash, deliberately: bare `~word` is ordinary prose
 // ("~two hours", "~40 lines"), and flagging it would fire on documentation forever. So `cd ~user`
 // with no path after it is a known blind spot — named here and in CLAUDE.md rather than implied.
 const TILDE_HOME = /~([A-Za-z_][A-Za-z0-9._-]*)\//g;
 
-// Lines carrying this marker are the control fixtures below. Scoped to LINES, not to this whole
-// file: a whole-file exclusion is the hardcoded-exclusion-list mistake this ticket removed, and it
-// would make a genuine leak anywhere in this file unscannable.
+// Lines carrying this marker are the control fixtures below. Scoped to LINES of THIS file only: a
+// whole-file exclusion would hide a leak here, and an any-file marker lets a doc line opt out.
 const FIXTURE = 'HYGIENE_FIXTURE';
 
 const GIT_CONTEXT_VARS = ['GIT_DIR', 'GIT_INDEX_FILE', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_PREFIX'];
@@ -75,22 +79,46 @@ describe('public repo carries no local identifiers', () => {
     // consistently: a leak could be staged and then cleaned in the worktree, passing the pre-commit
     // gate while the leaked blob committed; a tracked-but-deleted file threw ENOENT and killed the
     // suite with an unrelated error; and `-I` gives binary skipping for free.
-    const candidates = git(['grep', '--cached', '-I', '-n', '-E', '(/Users/|/home/|~)[A-Za-z_]', '--', '.'], root);
+    // `-z` NUL-separates file and line number, so a `:` in a file name cannot misattribute a leak.
+    const candidates = git(['grep', '--cached', '-I', '-z', '-n', '-i', '-E', '(/Users/|/home/|~)[A-Za-z_]', '--', '.'], root);
 
-    // Non-vacuity, two ways. A negative claim resolved from an empty scan is a clean report that
-    // inspected nothing.
-    const tracked = git(['ls-files'], root).out.split('\n').filter(Boolean);
+    // Proves the grep runs and this pattern matches (this file's fixtures are tracked); breadth is
+    // proven by the file-count floor and the everything-scanned pin below, not by this.
+    expect(candidates.ok, 'the candidate pattern matched NOTHING — the instrument is broken, not the repo clean').toBe(true);
+    const tracked = git(['ls-files', '-z'], root).out.split('\0').filter(Boolean);
     expect(tracked.length).toBeGreaterThan(50);
-    const control = git(['grep', '--cached', '-c', 'ticket-workflow', '--', '.'], root);
-    expect(control.ok, 'the index-grep instrument found nothing at all — it is broken, not the repo clean').toBe(true);
+    // Candidate records are newline-separated, so a newline in a path could forge `file === self`.
+    expect(tracked.filter((f) => f.includes('\n')), 'tracked paths containing a newline break record parsing').toEqual([]);
 
+    // `git grep --cached` never reads a symlink (whose blob is a target path), a submodule, or a
+    // conflicted (stage 1-3) entry, so each is an unscanned file; fail for a human rather than skip it.
+    const unscannable = git(['ls-files', '-s', '-z'], root).out.split('\0').filter(Boolean)
+      .filter((entry) => !/^100(?:644|755) [0-9a-f]+ 0\t/.test(entry))
+      .map((entry) => entry.slice(entry.indexOf('\t') + 1));
+    expect(unscannable, 'tracked symlinks, submodules or conflicted entries are never scanned by git grep').toEqual([]);
+
+    // `-I` skips binary files, and one stray NUL byte classifies a text file as binary, hiding a leak.
+    // Compared against files grep reads at all, so an empty file (no lines) is not mistaken for one.
+    const listed = (flags: string[]) => new Set(git(['grep', '--cached', ...flags, '-l', '-z', '-e', '', '--', '.'], root).out.split('\0').filter(Boolean));
+    const textFiles = listed(['-I']);
+    const skippedAsBinary = [...listed([])].filter((f) => !textFiles.has(f));
+    expect(skippedAsBinary, 'tracked files classify as BINARY and are skipped by the -I scan — a stray NUL byte hides a leak this way').toEqual([]);
+
+    const self = path.relative(root, fileURLToPath(import.meta.url)).split(path.sep).join('/');
     const leaks: string[] = [];
+    let fixturesSkipped = 0;
     for (const line of candidates.out.split('\n').filter(Boolean)) {
-      if (line.includes(FIXTURE)) continue;
-      const [file, , ...rest] = line.split(':');
-      const owners = leakedOwners(rest.join(':'));
-      for (const owner of owners) leaks.push(`${file}: ${owner}`);
+      const [file, lineNo, ...rest] = line.split('\0');
+      expect(/^\d+$/.test(lineNo ?? '') && rest.length > 0, `unparseable grep record: ${JSON.stringify(line)}`).toBe(true);
+      const text = rest.join('\0');
+      if (file === self && text.includes(FIXTURE)) {
+        fixturesSkipped++;
+        continue;
+      }
+      for (const owner of leakedOwners(text)) leaks.push(`${file}: ${owner}`);
     }
+    // The fixtures below must reach the classifier; zero skipped means the records were never parsed.
+    expect(fixturesSkipped, 'no fixture line of this file was parsed — the record split is broken').toBeGreaterThan(0);
 
     expect(leaks, 'a home path names a real account — use a placeholder').toEqual([]);
   });
@@ -105,12 +133,33 @@ describe('public repo carries no local identifiers', () => {
     expect(leakedOwners('cd ~realaccount/repo')).toEqual(['realaccount']); // HYGIENE_FIXTURE
   });
 
+  it('flags the prefix in either natural case (tkt-87b8b9b60b24)', () => {
+    expect(leakedOwners('/users/realaccount/x')).toEqual(['realaccount']); // HYGIENE_FIXTURE
+    expect(leakedOwners('/Home/realaccount/x')).toEqual(['realaccount']); // HYGIENE_FIXTURE
+    expect(leakedOwners('/mnt/c/Users/realaccount/x')).toEqual(['realaccount']); // HYGIENE_FIXTURE
+  });
+
+  it('does not read a nested lowercase route segment as a home dir', () => {
+    expect(leakedOwners('GET /api/users/active')).toEqual([]); // HYGIENE_FIXTURE
+    expect(leakedOwners('https://example.com/Home/Index')).toEqual([]); // HYGIENE_FIXTURE
+  });
+
+  it('DOES flag a root-level lowercase route (known limit)', () => {
+    expect(leakedOwners('GET /users/search')).toEqual(['search']); // HYGIENE_FIXTURE
+  });
+
+  it('does NOT catch a nested off-case prefix (known limit)', () => {
+    expect(leakedOwners('/mnt/c/users/realaccount/x')).toEqual([]); // HYGIENE_FIXTURE
+  });
+
   it('permits placeholders, CI runner paths and ordinary prose', () => {
     expect(leakedOwners('cd ~someuser/repo')).toEqual([]); // HYGIENE_FIXTURE
     expect(leakedOwners('/Users/x/repos/some-repo')).toEqual([]); // HYGIENE_FIXTURE
     expect(leakedOwners('/home/runner/work/repo/repo')).toEqual([]); // HYGIENE_FIXTURE
     expect(leakedOwners('it took ~two hours and ~40 lines')).toEqual([]); // HYGIENE_FIXTURE
     expect(leakedOwners('no home path here at all')).toEqual([]);
+    // An uppercase path segment in prose must not read as a home dir — the blanket-`i` regression.
+    expect(leakedOwners('Shared mount/HOME/git middle of the argv')).toEqual([]); // HYGIENE_FIXTURE
   });
 
   // The documented blind spot, pinned so it cannot be mistaken for coverage later.
