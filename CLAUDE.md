@@ -16,7 +16,8 @@ This is a public repo. **Never commit a local identifier**: no home-directory pa
 account, no machine-local board paths, no private hostnames.
 
 **Enforced in the gate, not by a grep you have to remember.** `src/repoHygiene.test.ts` scans the
-**index** — the snapshot that will actually commit — for `~user/`, `/Users/user` and `/home/user`,
+**index** — the snapshot that will actually commit — for `~user/`, `/Users/user` and `/home/user`
+(plus off-case `/users/` and `/Home/`; see gap 4 and the false positives below),
 failing unless the owner is an obvious placeholder (`someuser`, `x`, `runner`, …). The consequence
 to know when running it locally: **an unstaged edit is not scanned.** `git add` first, or the run
 reports on a file you have already changed. `src/templates.test.ts` holds template contents to the
@@ -27,7 +28,18 @@ list went stale, so it reported a hit on **every clean run** while the identifie
 committed — a real account name in a `~user/` path — sat in a shape it never matched. A check that
 always fires is a check people stop reading (`tkt-3a91af2aa6d9`).
 
-**What it cannot catch.** Three gaps, all deliberate and all measured:
+**What it fails on rather than skips** (`tkt-87b8b9b60b24`): a tracked symlink, submodule or
+conflicted index entry, which `git grep --cached` never reads; a file the scan's `-I` skips as binary;
+and a path containing a newline, which breaks record parsing. Each reddens the gate for a human to
+judge instead of passing as clean. An empty file is fine; a tracked symlink is not.
+
+**False positives to expect**, in any tracked file, code included: a segment starting with a letter
+or `_` that is not a placeholder, after canonical `/Users/` or `/home/` anywhere (`/api/home/<word>`);
+after off-case `/users/` or `/Home/` at the start of a line or following any character other than
+`[A-Za-z0-9_.~-]` (`GET /users/<word>`, `${API}/users/<word>`); or after a tilde, as in `~<word>/`
+(`about ~<word>/quarter`). Rewrite the example with `<id>`, `:id` or a placeholder.
+
+**What it cannot catch.** Four gaps, all deliberate and all measured:
 
 1. **A bare tilde account with no path after it** — `cd ~user` is invisible, because `~word` is
    ordinary prose (`~two hours`, `~40 lines`) and matching it would fire on documentation forever.
@@ -35,6 +47,11 @@ always fires is a check people stop reading (`tkt-3a91af2aa6d9`).
 2. **Anything that is not a path shape.** A probe cannot name the identifiers it hunts without
    committing them, so a bare first name in fixture data is invisible to it.
 3. **Another repo's on-disk directory named in a comment**, unless it sits under a home path.
+4. **An off-case prefix after a path character.** `/users/` and `/Home/` are ignored when the slash
+   follows a letter, digit, `_`, `.`, `~` or `-`, so routes like `/api/users/<id>` stay quiet, which
+   also hides a real nested `/mnt/c/users/<id>`. Any spelling other than `/Users/`, `/users/`,
+   `/home/` and `/Home/` never matches anywhere (`/USERS/`, `/HOME/`, `/uSers/`). Both limits are
+   pinned by tests.
 
 Gaps 2 and 3 were both found by hand in the same pass and stay convention plus review: give fixtures
 placeholder names, and describe another repo by what it is, never by where it sits on disk.

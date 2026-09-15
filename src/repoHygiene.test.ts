@@ -27,9 +27,9 @@ const PLACEHOLDERS = new Set([
 // account is caught and `~5 minutes` is not.
 //
 // tkt-87b8b9b60b24: macOS is case-insensitive, so `/users/<owner>` is a working path too. The
-// off-case spellings count only at a path root, or every `/api/users/<id>` route reads as a leak;
-// only the canonical `/Users/`, `/home/` match mid-path. No blanket `i` (prose `HOME`). Declared
-// limits, pinned: `/USERS/`, `/HOME/` and a nested off-case prefix are unmatched; a root route flags.
+// off-case spellings are ignored after a path character (`[\w.~-]`), or every `/api/users/<id>` route
+// reads as a leak; canonical `/Users/`, `/home/` match anywhere. No blanket `i` (prose `HOME`). Pinned
+// limits: all-caps prefixes and a nested off-case prefix are unmatched.
 const ABS_HOME = /(?:\/Users\/|\/home\/|(?<![\w.~-])\/users\/|(?<![\w.~-])\/Home\/)([A-Za-z_][A-Za-z0-9._-]*)/g;
 // The tilde form DOES require a trailing slash, deliberately: bare `~word` is ordinary prose
 // ("~two hours", "~40 lines"), and flagging it would fire on documentation forever. So `cd ~user`
@@ -150,6 +150,14 @@ describe('public repo carries no local identifiers', () => {
 
   it('does NOT catch a nested off-case prefix (known limit)', () => {
     expect(leakedOwners('/mnt/c/users/realaccount/x')).toEqual([]); // HYGIENE_FIXTURE
+    // The `.`, `~` and `-` half of the lookbehind, which no word-character fixture exercises.
+    expect(leakedOwners('see ./users/realaccount and ~/users/realaccount')).toEqual([]); // HYGIENE_FIXTURE
+    expect(leakedOwners('x-/Home/realaccount')).toEqual([]); // HYGIENE_FIXTURE
+  });
+
+  it('does NOT catch an all-caps prefix, even at a path root (known limit)', () => {
+    expect(leakedOwners('/USERS/realaccount/x')).toEqual([]); // HYGIENE_FIXTURE
+    expect(leakedOwners('see /HOME/realaccount/x')).toEqual([]); // HYGIENE_FIXTURE
   });
 
   it('permits placeholders, CI runner paths and ordinary prose', () => {
