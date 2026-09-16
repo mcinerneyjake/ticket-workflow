@@ -428,7 +428,53 @@ has the package and point it at whichever checkout needs the worktree.
 
 The worktree lands in `.claude/worktrees/<name>`, **inside** the repo. That is load-bearing rather
 than tidy: Node resolves upward, so the gate runs in a fresh worktree with no install. A sibling
-directory would need a full `node_modules` per worktree.
+directory would need a full `node_modules` per worktree. Resolving upward is not the same as having a
+`node_modules` at the worktree root, though: a suite that asserts that path exists still needs the
+link described below.
+
+### Provisioning: the files a checkout does not carry
+
+A new worktree has no `.env`, no machine-local config and no `node_modules`. After creating one, the
+command copies them in from the checkout it was created from. It reads **Claude Code's own
+declaration**, so `EnterWorktree` / `claude -w` and this command get the same result from one source:
+
+- **`.worktreeinclude`** at the repo root, gitignore syntax. A file is copied only when it matches
+  **and git ignores it**, which is the rule Claude Code applies. An untracked file that is not ignored
+  is reported as `skipped`, and a tracked one is never listed.
+- **`worktree.symlinkDirectories`** in `.claude/settings.json`, e.g. `["node_modules"]`. Each entry
+  is symlinked, not copied. Only the project `settings.json` is read; a value set in user or local
+  settings reaches Claude Code but not this command.
+
+```
+# .worktreeinclude
+.env
+.claude/skills/*/repos.local.json
+```
+
+What it will not do, each reported and each failing the command with a non-zero exit:
+
+- **Provision anything but a linked worktree of the same repository.** The source checkout itself, a
+  plain directory and another repository's worktree are all refused.
+- **Overwrite.** An existing destination is `present` and left alone, so re-running is safe.
+- **Copy a symlink**, or write through a destination directory that resolves outside the worktree.
+- **Copy a file the new worktree does not ignore.** The worktree is cut from a commit, so its ignore
+  rules can differ from the source checkout's working tree.
+- **Copy into a linked directory.** Links are made first, as Claude Code orders them, and a
+  `.worktreeinclude` match under one (a `.env` shipped inside `node_modules/pkg/`) is `skipped`.
+  Copying first would create a real directory the link could never replace.
+- **Leave an unignored link behind.** `node_modules/` with a trailing slash ignores a directory but
+  **not a symlink to one**. The link would sit untracked, one `git add` away from a commit, and would
+  make `git worktree remove` refuse. It is removed and reported instead. Write `node_modules` without
+  the slash.
+- **Read "could not check" as "nothing declared."** Invalid `settings.json`, a non-array
+  `symlinkDirectories`, a `.worktreeinclude` that is not a regular file, or git failing all refuse.
+
+Do not list `.claude/settings.local.json`. Measured against Claude Code 2.1.273, `EnterWorktree`
+does not copy it, because it resolves a worktree's local settings to the main checkout. A copy would
+be a stale overlay that could bring back a permission you have since revoked.
+
+`provisionWorktree({ repoDir, worktreeDir })` is exported from the package root for scripts that
+create worktrees with plain `git worktree add`.
 
 Two refusals worth knowing, both cases where proceeding would be worse than stopping:
 
