@@ -478,12 +478,14 @@ describe('cmdWorktree', () => {
     project: null, blockers: [], parent: null, dueDate: null, assignee: null,
   };
   const created = { kind: 'created' as const, path: '.claude/worktrees/tkt-1-fix', branch: 'fix/tkt-1-fix', base: 'origin/main' };
+  const nothingDeclared = () => ({ kind: 'provisioned' as const, declared: false, entries: [] });
 
   it('derives the branch from the ticket type and title when the board is reachable', async () => {
     const seen: Array<{ branch: string }> = [];
     await cmdWorktree(['tkt-1'], {
       fetchTicket: async () => ticket,
       create: (o) => { seen.push({ branch: o.branch }); return created; },
+      provision: nothingDeclared,
     });
     // bug → fix, and the slug comes from the title — not a convention hardcoded per repo.
     expect(seen).toEqual([{ branch: 'fix/tkt-1-fix-the-broken-thing-now' }]);
@@ -496,6 +498,7 @@ describe('cmdWorktree', () => {
       cmdWorktree(['tkt-1'], {
         fetchTicket: async () => { throw new Error('404'); },
         create: () => created,
+        provision: nothingDeclared,
       }),
     ).rejects.toThrow(/could not read ticket tkt-1.*pass --branch/s);
   });
@@ -505,6 +508,7 @@ describe('cmdWorktree', () => {
     await cmdWorktree(['--branch', 'feat/x'], {
       fetchTicket: async () => { asked = true; return ticket; },
       create: () => created,
+        provision: nothingDeclared,
     });
     expect(asked).toBe(false);
   });
@@ -514,7 +518,37 @@ describe('cmdWorktree', () => {
     await cmdWorktree(['--branch', 'feat/x'], {
       fetchTicket: async () => ticket,
       create: () => ({ kind: 'refused', reason: 'branch feat/x already exists' }),
+      provision: nothingDeclared,
     });
+    expect(process.exitCode).toBe(1);
+    process.exitCode = before;
+  });
+
+  it('never provisions a worktree whose creation was refused', async () => {
+    let provisioned = false;
+    const before = process.exitCode;
+    await cmdWorktree(['--branch', 'feat/x'], {
+      fetchTicket: async () => ticket,
+      create: () => ({ kind: 'refused', reason: 'no' }),
+      provision: () => { provisioned = true; return nothingDeclared(); },
+    });
+    expect(provisioned).toBe(false);
+    process.exitCode = before;
+  });
+
+  it.each([
+    ['a refused provisioning', { kind: 'refused' as const, reason: 'settings.json is not valid JSON' }],
+    ['a failed entry', { kind: 'provisioned' as const, declared: true, entries: [{ kind: 'failed' as const, path: '.env', reason: 'EACCES' }] }],
+  ])('provisions the created worktree and exits non-zero on %s', async (_label, outcome) => {
+    const before = process.exitCode;
+    process.exitCode = undefined;
+    const seen: Array<{ repoDir: string; worktreeDir: string }> = [];
+    await cmdWorktree(['--branch', 'feat/x', '--repo', '/repo'], {
+      fetchTicket: async () => ticket,
+      create: () => created,
+      provision: (o) => { seen.push(o); return outcome; },
+    });
+    expect(seen).toEqual([{ repoDir: '/repo', worktreeDir: '/repo/.claude/worktrees/tkt-1-fix' }]);
     expect(process.exitCode).toBe(1);
     process.exitCode = before;
   });

@@ -11,6 +11,7 @@ import { runInit } from '../init/run.js';
 import { buildReport, formatReport } from '../verify/rules.js';
 import { gatherTicketFacts } from '../verify/gather.js';
 import { createWorktree, branchName, PREFIX_BY_TYPE } from '../worktree/create.js';
+import { provisionFailed, provisionWorktree } from '../worktree/provision.js';
 import { sweep } from '../vacuous/probe.js';
 import { checkRoot, vacuousExitCode, EXIT as VACUOUS_EXIT } from '../vacuous/ratchet.js';
 
@@ -317,11 +318,12 @@ export function parseWorktreeArgs(args: readonly string[]): WorktreeArgs {
 export interface WorktreeDeps {
   readonly fetchTicket: typeof getTicket;
   readonly create: typeof createWorktree;
+  readonly provision: typeof provisionWorktree;
 }
 
 export async function cmdWorktree(
   args: string[],
-  deps: WorktreeDeps = { fetchTicket: getTicket, create: createWorktree },
+  deps: WorktreeDeps = { fetchTicket: getTicket, create: createWorktree, provision: provisionWorktree },
 ): Promise<void> {
   const { id, branch, base, name, repoDir } = parseWorktreeArgs(args);
   let finalBranch = branch;
@@ -345,6 +347,22 @@ export async function cmdWorktree(
   }
   console.log(`created    ${result.path}`);
   console.log(`branch     ${result.branch}  (from ${result.base})`);
+
+  // The worktree is kept on a provisioning failure: it is usable once the named file is supplied,
+  // and removing it would discard nothing but the evidence of what went wrong.
+  const provisioned = deps.provision({ repoDir, worktreeDir: path.resolve(repoDir, result.path) });
+  if (provisioned.kind === 'refused') {
+    console.error(`provision  refused: ${provisioned.reason}`);
+  } else if (!provisioned.declared) {
+    console.log('provision  nothing declared (.worktreeinclude, worktree.symlinkDirectories)');
+  } else {
+    for (const e of provisioned.entries) {
+      const line = `provision  ${e.kind.padEnd(8)} ${e.path}${'reason' in e ? `  — ${e.reason}` : ''}`;
+      if (e.kind === 'failed') console.error(line);
+      else console.log(line);
+    }
+  }
+  if (provisionFailed(provisioned)) process.exitCode = 1;
   console.log('\nNext:');
   console.log(`  cd ${result.path}`);
   console.log('\nWhen the ticket is merged, remove it — a stale worktree carries its own copy of');

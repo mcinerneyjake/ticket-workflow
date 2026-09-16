@@ -10,6 +10,8 @@ export type { Logger } from './logger.js';
 export { guardrailTemplates, tierIncludes } from './templates.js';
 export type { GuardrailTemplate, GuardrailTier } from './templates.js';
 export { runAudit, auditExitCode, formatAudit, AUDIT_CHECKS } from './audit/run.js';
+export { provisionWorktree, provisionFailed, INCLUDE_FILE as WORKTREE_INCLUDE_FILE } from './worktree/provision.js';
+export type { ProvisionOutcome, ProvisionEntry, ProvisionOptions } from './worktree/provision.js';
 export { runInit } from './init/run.js';
 export type { InitResult } from './init/run.js';
 export type { AuditReport } from './audit/run.js';
