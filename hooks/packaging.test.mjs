@@ -82,7 +82,42 @@ const PROBES = {
     env: { WORKTREE_STALE_THRESHOLD: '1' },
     check: (r) => expect(r.stdout).toContain('STALE'),
   }),
+  // Both worktree probes drive the ENFORCING path rather than the arming one: arming exits 0, so an
+  // arm-shaped probe could not tell a wired hook from a dead one. A pre-seeded marker makes the
+  // session armed, and fixtures.repo is a primary checkout, which is the one place a write is refused.
+  'guard-worktree.mjs': () => ({
+    payload: {
+      session_id: 'ses-packaging-probe',
+      tool_name: 'Edit',
+      tool_input: { file_path: path.join(fixtures.repo, 'CLAUDE.md') },
+      cwd: fixtures.repo,
+    },
+    env: { WORKTREE_GUARD_STATE_DIR: armedStateDir() },
+    check: (r) => expect(r.status, r.stderr).toBe(2),
+  }),
+  // Same payload, one level up: this one additionally proves the subpath export resolves, since the
+  // precheck reaches a verdict only by importing the guard through it.
+  'guard-worktree-precheck.mjs': () => ({
+    payload: {
+      session_id: 'ses-packaging-probe',
+      tool_name: 'Edit',
+      tool_input: { file_path: path.join(fixtures.repo, 'CLAUDE.md') },
+      cwd: fixtures.repo,
+    },
+    env: { WORKTREE_GUARD_STATE_DIR: armedStateDir() },
+    check: (r) => {
+      expect(r.status, r.stderr).toBe(2);
+      // A failed import exits 2 as well, so the code alone would not distinguish them.
+      expect(r.stderr).not.toMatch(/could not be loaded/);
+    },
+  }),
 };
+
+function armedStateDir() {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tw-wtstate-'));
+  writeFileSync(path.join(dir, 'ses-packaging-probe'), JSON.stringify({ ticket: TICKET }));
+  return dir;
+}
 
 function runHook(file, spec, dir) {
   const env = { ...process.env, ...(spec.env ?? {}) };

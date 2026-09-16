@@ -24,10 +24,11 @@
 // Never fetches. The comparison is against whatever base ref the local repo
 // already has, so a distance is a floor, not an exact figure.
 
-import { readFileSync, realpathSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { isMain } from './lib/is-main.mjs';
 import { resolveBaseRef, tryGit } from './lib/default-branch.mjs';
+import { worktreeFacts } from './lib/worktree.mjs';
 
 // Matched by BASENAME, not by exact path: nested instruction files are a
 // supported Claude Code feature, so apps/web/CLAUDE.md must count.
@@ -150,41 +151,14 @@ export function formatReport(assessment) {
   };
 }
 
-// Returns { out } or { err } — callers must distinguish "git said no" from
-// "git could not answer", so a thrown error is never flattened into null.
-
-const NOT_A_REPO = /not a git repository|does not appear to be a git repository/i;
-
 export function gatherFacts(cwd, threshold = DEFAULT_THRESHOLD) {
-  const inside = tryGit(['rev-parse', '--is-inside-work-tree'], cwd);
-  if (inside.err) {
-    // Genuinely outside a repo is the common case and warrants silence. Any other
-    // git failure means the check could not run, which must be said out loud.
-    if (NOT_A_REPO.test(inside.err)) return { isLinkedWorktree: false };
-    return { isLinkedWorktree: null, probeError: firstLine(inside.err), threshold };
-  }
-  if (inside.out !== 'true') return { isLinkedWorktree: false };
-
-  const gitDir = tryGit(['rev-parse', '--absolute-git-dir'], cwd);
-  // --path-format=absolute needs git >= 2.31; --git-common-dir alone is older and
-  // may be relative, so it is resolved against the worktree root when needed.
-  let commonDir = tryGit(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd);
-  if (commonDir.err) {
-    const relative = tryGit(['rev-parse', '--git-common-dir'], cwd);
-    const root = tryGit(['rev-parse', '--show-toplevel'], cwd);
-    commonDir =
-      relative.out && root.out
-        ? { out: relative.out.startsWith('/') ? relative.out : `${root.out}/${relative.out}` }
-        : relative;
-  }
-  if (gitDir.err || commonDir.err) {
-    return {
-      isLinkedWorktree: null,
-      probeError: firstLine(gitDir.err || commonDir.err),
-      threshold,
-    };
-  }
-  if (resolveReal(gitDir.out) === resolveReal(commonDir.out)) return { isLinkedWorktree: false };
+  // The primary-vs-linked probe lives in lib/worktree.mjs, shared with guard-worktree
+  // (tkt-1d647fd64ce4). Its three non-linked answers collapse to two here: this hook only reports on
+  // linked worktrees, so 'primary' and 'none' are equally "nothing to say", while a null kind stays
+  // the could-not-check that the header's invariant turns into level: 'unknown'.
+  const { kind, probeError } = worktreeFacts(cwd);
+  if (kind === null) return { isLinkedWorktree: null, probeError, threshold };
+  if (kind !== 'linked') return { isLinkedWorktree: false };
 
   const branch = tryGit(['rev-parse', '--abbrev-ref', 'HEAD'], cwd).out ?? null;
   const baseRef = resolveBaseRef(cwd);
@@ -218,20 +192,8 @@ export function gatherFacts(cwd, threshold = DEFAULT_THRESHOLD) {
 // branch is protected is the kind of split that hides for weeks (tkt-f32915b3e858).
 export { resolveBaseRef };
 
-function firstLine(text) {
-  return String(text ?? '').split('\n')[0].slice(0, 200);
-}
-
-function resolveReal(p) {
-  try {
-    return realpathSync(p);
-  } catch {
-    return p;
-  }
-}
-
-// Extracted from the direct-execution tail so a consumer can import and call it, matching the other
-// four hooks. It keeps the trailing process.exit(0) they all have: `main` IS the I/O wiring, so a
+// Extracted from the direct-execution tail so a consumer can import and call it, as every hook here
+// does. It keeps the trailing process.exit(0) they all have: `main` IS the I/O wiring, so a
 // launcher that imports it gets the hook's real exit behaviour rather than a half-run.
 export function main() {
   try {
