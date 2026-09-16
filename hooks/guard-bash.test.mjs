@@ -1244,3 +1244,86 @@ describe('the real hook — an unreadable payload fails CLOSED (tkt-92360b0e2079
     expect(r.status, r.stderr).toBe(2);
   });
 });
+
+// A segment whose first word is a shell RESERVED WORD hid the git invocation from every rule:
+// parseGit stripped only leading `(`/`{`/whitespace, so `then` landed where the command word
+// belongs and the whole segment returned null. Same-line spelling only — splitSegments already
+// breaks the multi-line form at the newline, so a multi-line repro would pass before the fix and
+// prove nothing (tkt-e70ae972476e).
+describe('decide — a shell keyword must not hide a git invocation (tkt-e70ae972476e)', () => {
+  const KEYWORDS = ['then', 'do', 'else', 'elif', 'if', 'while', 'until', '!'];
+
+  it.each(KEYWORDS)('blocks a commit on main led by `%s`', (kw) => {
+    expect(blocked(`true; ${kw} git commit -m x; fi`, 'main')).toBe(true);
+  });
+
+  it('blocks the real compound spellings, not just a synthetic prefix', () => {
+    expect(blocked('true; then git commit -m x; fi', 'main')).toBe(true);
+    expect(blocked('for x in a; do git commit -m x; done', 'main')).toBe(true);
+    expect(blocked('if false; then :; else git commit -m x; fi', 'main')).toBe(true);
+    expect(blocked('if false; then :; elif true; then git commit -m x; fi', 'main')).toBe(true);
+  });
+
+  // The bypass defeated EVERY rule, not only never-commit-to-main: a null parseGit means no rule
+  // ever saw the invocation. So the branch-agnostic ones need their own row, on a FEATURE branch
+  // where the branch-gated rules cannot be what blocks.
+  it('blocks the branch-agnostic destructive rules on a feature branch', () => {
+    expect(blocked('true; then git add -A; fi', 'feat/x')).toBe(true);
+    expect(blocked('true; then git push --force origin feat/x; fi', 'feat/x')).toBe(true);
+    expect(blocked('true; then git reset --hard HEAD~1; fi', 'feat/x')).toBe(true);
+  });
+
+  it('blocks a push to main led by a keyword', () => {
+    expect(blocked('true; then git push origin main; fi', 'main')).toBe(true);
+  });
+
+  it('skips stacked keywords and keywords interleaved with env prefixes', () => {
+    expect(blocked('if ! git commit -m x; then :; fi', 'main')).toBe(true);
+    expect(blocked('true; then GIT_AUTHOR_NAME=x git commit -m x; fi', 'main')).toBe(true);
+    expect(parseGit('then GIT_AUTHOR_NAME=x git add -A').sub).toBe('add');
+  });
+
+  // The negative direction. Skipping a leading keyword must not promote a DEEPER token to the
+  // command word: only the segment's own leading run is skipped, so a keyword sitting in data or
+  // after a real command still leaves the segment a non-git one.
+  it('does not treat a keyword appearing as data as a git invocation', () => {
+    expect(parseGit('echo then git commit')).toBe(null);
+    expect(parseGit('grep -n then git file')).toBe(null);
+    expect(blocked('git commit -m "then git push --force"', 'feat/x')).toBe(false);
+  });
+
+  it('CONTROL: the same commands on a feature branch are still allowed', () => {
+    expect(blocked('true; then git commit -m x; fi', 'feat/x')).toBe(false);
+    expect(blocked('for x in a; do git commit -m x; done', 'feat/x')).toBe(false);
+  });
+
+  it('CONTROL: the multi-line form was already blocked and stays blocked', () => {
+    expect(blocked('if true; then\ngit commit -m x\nfi', 'main')).toBe(true);
+  });
+
+  // The first cut of the fix skipped the keyword but left a FOLLOWING `(` in the command slot,
+  // because the segment-level strip runs once at offset 0. `then ( git … )` is an ordinary idiom,
+  // so this reopened the same hole one token to the right (review, tkt-e70ae972476e).
+  describe('grouping punctuation after the keyword', () => {
+    it('blocks a commit on main inside a keyword-led subshell, spaced and fused', () => {
+      expect(blocked('true; then ( git commit -m x ); fi', 'main')).toBe(true);
+      expect(blocked('true; then (git commit -m x); fi', 'main')).toBe(true);
+    });
+
+    it('blocks the branch-agnostic rules inside a keyword-led subshell', () => {
+      expect(blocked('true; then ( git add -A ); fi', 'feat/x')).toBe(true);
+      expect(blocked('for d in a; do ( git push --force origin x ); done', 'feat/x')).toBe(true);
+      expect(blocked('true; else ( git reset --hard HEAD~1 ); fi', 'feat/x')).toBe(true);
+    });
+
+    it('CONTROL: the brace form was already blocked, and a bare subshell still is', () => {
+      expect(blocked('true; then { git add -A; }', 'feat/x')).toBe(true);
+      expect(blocked('(git commit -m x)', 'main')).toBe(true);
+    });
+
+    it('CONTROL: punctuation does not promote a non-git command word', () => {
+      expect(parseGit('then ( echo git commit )')).toBe(null);
+      expect(blocked('true; then ( echo git add -A ); fi', 'feat/x')).toBe(false);
+    });
+  });
+});
