@@ -355,6 +355,11 @@ describe('regressions found by review', () => {
     ['a then-branch', () => 'if true; then git checkout -- .; fi'],
     ['a do-body', () => 'for f in a; do git checkout -- .; done'],
     ['an xargs wrapper', () => 'echo . | xargs git checkout --'],
+    // The keyword skip left a FOLLOWING `(` in the command slot — the segment-level strip runs once,
+    // at offset 0 — so the hole reopened one token to the right (review, tkt-e70ae972476e).
+    ['a then-branch subshell, spaced', () => 'if true; then ( git checkout -- . ); fi'],
+    ['a then-branch subshell, fused', () => 'if true; then (git checkout -- .); fi'],
+    ['a do-body subshell', () => 'for f in a; do (git checkout -- .); done'],
   ])('blocks git that is not the segment head: %s', (_label, command) => {
     expect(verdict(running(command(), fx.primary)).blocked).toBe(true);
   });

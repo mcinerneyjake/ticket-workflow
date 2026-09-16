@@ -252,6 +252,27 @@ export function subshellParens(segment) {
 // after them was admitted as the session's. Where it moved to is unknowable here, so the caller
 // must treat this as unresolvable rather than as no move.
 const DIR_BUILTINS = new Set(['cd', 'pushd', 'popd']);
+
+// Shell reserved words, which precede a command without being one. Shared by exactly TWO readers
+// today — guard-bash's parseGit and guard-worktree's analysePiece — which is the drift that let
+// `then git commit` through on main while guard-worktree caught it (tkt-e70ae972476e).
+//
+// NOT yet the single source for every parser, and do not read it as one: guard-subagent-gates'
+// parseGh and dirBuiltin below both still carry their own keyword-less leading run, so `then gh pr
+// merge` is still invisible to the subagent merge gate. Measured, filed separately.
+//
+// Membership is not coverage. `case`/`esac` are members, but a case ARM is still unparsed: the
+// `*)` pattern token stops the run, so `case x in *) git commit …` reaches no rule. That needs a
+// pattern-token rule rather than another member.
+export const SHELL_KEYWORDS = new Set(
+  ['if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'case', 'esac', '!', '{', '}'],
+);
+
+// Deliberately NARROWER than SHELL_KEYWORDS, and not derived from it: widening this set changes
+// which hidden `cd`s hiddenDirTarget detects, which is a separate fail-open with its own adversary
+// list. Measured gaps: `if`/`while`/`until`/`!`, and a case arm's `)` (the predecessor test below
+// matches `(`, never `)`). parseGit now DEPENDS on that gap — a keyword-led git is visible to the
+// rules but judged against the session repo when an `if`-led `cd` moved — so the two land together.
 const COMMAND_POSITION = new Set(['|', '||', '&', '&&', ';', '{', '(', 'then', 'do', 'else', 'elif']);
 
 // Text that is DATA rather than this segment's command: a `cd` in a commit message moved nothing,

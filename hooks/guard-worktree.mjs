@@ -55,7 +55,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { isMain } from './lib/is-main.mjs';
 import { worktreeKind } from './lib/worktree.mjs';
 import { tryGit } from './lib/default-branch.mjs';
-import { quotedTokens, resolveDir, splitSegments, subshellParens } from './lib/shell.mjs';
+import { quotedTokens, resolveDir, SHELL_KEYWORDS, splitSegments, subshellParens } from './lib/shell.mjs';
 import { parseGit } from './guard-bash.mjs';
 
 const TAG = '[guard-worktree]';
@@ -279,8 +279,10 @@ function commandPieces(segment) {
 }
 
 // Shell words that precede a command without being one. Skipping them is what lets `then git …`,
-// `do git …` and `xargs git …` reach the rules; leaving them in is the fail-open review found.
-const COMPOUND = new Set(['if', 'then', 'else', 'elif', 'while', 'until', 'do', 'done', 'fi', 'case', 'esac', '!', '{', '}']);
+// `do git …` and `xargs git …` reach the rules; leaving them in is the fail-open review found. The
+// reserved words come from lib/shell.mjs so this hook and guard-bash's parseGit cannot drift on
+// THAT set again — they already had, and parseGit was the one admitting `then git commit`
+// (tkt-e70ae972476e). WRAPPERS below is still local, so the two do diverge on `then time git …`.
 const WRAPPERS = new Set(['env', 'sudo', 'nice', 'nohup', 'xargs', 'command', 'builtin', 'exec', 'stdbuf', 'time']);
 
 /**
@@ -296,16 +298,21 @@ function analysePiece(piece) {
   const envAssignments = [];
   let i = 0;
   let sawWrapper = false;
+  // Per token, not just at offset 0: the strip above runs once, so after a keyword is skipped a
+  // following `(` survived and `then (git checkout -- .` read as a non-git piece (tkt-e70ae972476e).
+  const bare = (t) => t.replace(/^[({]+/, '');
   while (i < tokens.length) {
-    const t = tokens[i];
+    const t = bare(tokens[i]);
+    if (t === '') { i++; continue; }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { envAssignments.push(t); i++; continue; }
-    if (COMPOUND.has(t)) { i++; continue; }
+    if (SHELL_KEYWORDS.has(t)) { i++; continue; }
     if (WRAPPERS.has(t)) { sawWrapper = true; i++; continue; }
     // Only after a wrapper: `grep -n git file` must NOT have its flags skipped down to `git`.
     if (sawWrapper && t.startsWith('-')) { i++; continue; }
     break;
   }
-  return { envAssignments, tokens: tokens.slice(i) };
+  const rest = tokens.slice(i);
+  return { envAssignments, tokens: rest.length ? [bare(rest[0]), ...rest.slice(1)] : rest };
 }
 
 /** The directory operand of a cd/pushd, or null when it names something this cannot resolve. */
