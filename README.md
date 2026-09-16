@@ -44,8 +44,20 @@ It ships three pieces:
   `git push`, `gh pr create` or `gh pr merge` — the actions that sit behind a
   human approval gate, which a subagent has no channel to ask for. Reading and
   posting findings (`git log`/`diff`, `gh pr view`/`diff`/`list`,
-  `gh pr comment`) are untouched. Wire `guard-ticket` only if you want that
-  policy — the others suit any consumer.
+  `gh pr comment`) are untouched. And a PAIR — `guard-worktree.mjs` with
+  `guard-worktree-precheck.mjs` — that, once a session has called
+  `start_ticket`, refuses writes aimed at a repository's **primary** checkout,
+  so two ticket sessions cannot share one working tree. The guard arms on
+  `start_ticket` by writing a marker keyed on the session id (under
+  `~/.claude/state/worktree-guard/`, or `WORKTREE_GUARD_STATE_DIR`); the
+  precheck is the half you wire on `Edit|Write|NotebookEdit|Bash`, and it costs
+  one `stat()` in a session that never started a ticket, reaching package code
+  only once armed — so a broken install cannot wedge editing machine-wide. A
+  block names the fix (`EnterWorktree`, or `git worktree add` for another
+  repo), and `git stash` push/pop is refused from **every** checkout, because
+  `refs/stash` lives in the shared common directory. Wire `guard-ticket` and
+  the `guard-worktree` pair only if you want those policies — the others suit
+  any consumer.
 - **CLI viewer** (`ticket-workflow`) — `list` and `show <id>`, rendering a
   ticket's pipeline from the same reducer the web board uses.
 
@@ -204,7 +216,9 @@ main();
 > resolves but exports no callable `main`, the throw exits 1, again an allow. Wrap both, as
 > [Installing it once per machine](#installing-it-once-per-machine-user-scope) does.
 
-The exported subpaths are exactly the five hook files above. Importing a hook does **not** run it;
+The exported subpaths are exactly the hook files in `hooks/` — no count is given here on purpose,
+because the one that used to be said "five" while the map listed six; `hooks/packaging.test.mjs`
+asserts the two agree. Importing a hook does **not** run it;
 `main()` reads the payload from stdin and ends in `process.exit()`, so it is one hook per process —
 which is how Claude Code invokes them anyway (one process per matcher).
 
@@ -269,6 +283,8 @@ nothing to block and must not wedge the session — but note it exits **1, not 0
 | `guard-ticket` | `PreToolUse` | **closed** (exit 2) |
 | `guard-review-target` | `UserPromptExpansion` | **closed** (exit 2) |
 | `guard-subagent-gates` | `PreToolUse` | **closed** (exit 2) |
+| `guard-worktree` | `PreToolUse` | **closed** (exit 2) |
+| `guard-worktree-precheck` | `PreToolUse` | **depends on arming** — see below |
 | `warn-stale-worktree` | `SessionStart` | open (exit 1) |
 | `track-steps` | `PostToolUse` **and** `PostToolUseFailure` | open (exit 1) |
 
@@ -294,6 +310,15 @@ Two honest limits on that table:
   subagent whose command it cannot read) and **exits 1** when it cannot even establish that (an
   unparseable payload) — blocking there would wedge every main-thread command over a case the rule
   never covers, so it is loud rather than silent.
+- `guard-worktree-precheck` is the one row whose fail direction is not fixed, and that is its whole
+  design. It is wired directly rather than through a launcher, so if the *precheck file itself* cannot
+  run, node exits 1 and the call is allowed. Once a marker says the session is armed, every failure
+  past that point closes: an unreadable state directory, and a `ticket-workflow` it cannot import,
+  both exit 2. The asymmetry is deliberate — a broken install must not wedge Edit and Bash for
+  sessions that never started a ticket, but it must never let an armed one run unguarded. One
+  exception, stated because "every failure closes" would otherwise overclaim: a payload carrying no
+  usable `session_id` exits 0 without reaching the marker at all, so an armed session whose payload
+  cannot be attributed is allowed through.
 - The `open` rows are a genuine gap. Nothing here detects a reporter that stopped recording; the
   stderr is visible only if someone is looking. Treat "are my hooks actually running?" as a question
   needing its own check.
