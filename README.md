@@ -55,7 +55,22 @@ It ships three pieces:
   only once armed — so a broken install cannot wedge editing machine-wide. A
   block names the fix (`EnterWorktree`, or `git worktree add` for another
   repo), and `git stash` push/pop is refused from **every** checkout, because
-  `refs/stash` lives in the shared common directory. Wire `guard-ticket` and
+  `refs/stash` lives in the shared common directory. A session never disarms,
+  but once **every** ticket it started has a PR that `gh` reports merged into
+  the default branch of the repo `origin` names (pinned with `-R`, `GH_REPO`
+  ignored), with no PR for that ticket still open, that repo's primary — on
+  its default branch — also admits two cleanups: `git pull --ff-only origin
+  <default>` / `git merge --ff-only origin/<default>` when there are no
+  tracked modifications, `HEAD` is an ancestor of `origin/<default>`, and no
+  untracked or **ignored** file sits where the update would write; and
+  `git checkout -- <file>` / `git restore <file>` for a tracked regular file
+  whose unfiltered content already equals `origin/<default>`. Ticket `status`
+  is never consulted, and any `gh` failure keeps the session armed; edits,
+  commits, branches and other repos stay blocked. Only the 100 most recent
+  PRs are read, so an older merge reads as unmerged; the check runs before
+  the command, so a compound command that writes a file and then restores it
+  in one line is not protected; and sessions armed before this release keep
+  a single-ticket marker and never reach this state. Wire `guard-ticket` and
   the `guard-worktree` pair only if you want those policies — the others suit
   any consumer.
 - **CLI viewer** (`ticket-workflow`) — `list` and `show <id>`, rendering a

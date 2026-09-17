@@ -49,12 +49,13 @@
 // Subagents are NOT a residual: a subagent's PreToolUse carries the parent's session_id, so an armed
 // parent arms its subagents (measured, tkt-2ef9d53ea8b5).
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { isMain } from './lib/is-main.mjs';
 import { worktreeKind } from './lib/worktree.mjs';
-import { tryGit } from './lib/default-branch.mjs';
+import { protectedBranches, tryGit } from './lib/default-branch.mjs';
 import { quotedTokens, resolveDir, SHELL_KEYWORDS, splitSegments, subshellParens } from './lib/shell.mjs';
 import { parseGit } from './guard-bash.mjs';
 
@@ -138,32 +139,91 @@ export function arm(payload, env = process.env) {
     );
 
   const ticket = typeof payload?.tool_input?.id === 'string' ? payload.tool_input.id : null;
+  const lock = `${markerPath(id, env)}.lock`;
+  let locked = false;
   try {
     mkdirSync(stateDirOf(env), { recursive: true });
-    writeFileSync(markerPath(id, env), JSON.stringify({ ticket, armedAt: new Date().toISOString() }));
+    // Two start_ticket hooks in one session (parallel calls, a subagent) would otherwise read the same
+    // prior marker and the last write would drop the other's ticket.
+    locked = acquireLock(lock, lockWaitMs(env));
+    const prior = priorMarker(id, env);
+    const tickets = ticket && !prior.tickets.includes(ticket) ? [...prior.tickets, ticket] : prior.tickets;
+    // A ticket this marker cannot name, or a write it could not serialise, can never vouch for every
+    // ticket the session started, so the post-merge state becomes unreachable rather than skipped.
+    const complete = locked && prior.complete && ticket !== null;
+    writeFileSync(markerPath(id, env), JSON.stringify({ ticket, tickets, complete, armedAt: new Date().toISOString() }));
   } catch (e) {
     return block(
       `${TAG} Blocked: could not write the worktree-guard marker (${firstLine(e?.message)}).\n` +
         'Refusing to start a ticket that would then run unguarded.',
     );
+  } finally {
+    if (locked) releaseLock(lock);
   }
   // After the write, so the fresh marker's own mtime keeps it out of this sweep.
   pruneMarkers(env);
   return ALLOW;
 }
 
-function readTicket(sessionId, env) {
+/**
+ * { ticket, tickets, complete } — `complete` is true only when `tickets` provably names EVERY ticket
+ * this session started. A legacy single-ticket marker records only the last one, so it is incomplete.
+ */
+export function readMarker(sessionId, env = process.env) {
+  let data;
   try {
-    return JSON.parse(readFileSync(markerPath(sessionId, env), 'utf8'))?.ticket ?? null;
+    data = JSON.parse(readFileSync(markerPath(sessionId, env), 'utf8'));
   } catch {
-    return null;
+    return { ticket: null, tickets: [], complete: false };
+  }
+  const ticket = typeof data?.ticket === 'string' ? data.ticket : null;
+  if (!Array.isArray(data?.tickets)) return { ticket, tickets: ticket ? [ticket] : [], complete: false };
+  if (!data.tickets.every((t) => typeof t === 'string')) return { ticket, tickets: [], complete: false };
+  return { ticket, tickets: [...data.tickets], complete: data.complete === true };
+}
+
+const LOCK_WAIT_MS = 2_000;
+
+function lockWaitMs(env) {
+  const n = Number(env?.WORKTREE_GUARD_LOCK_WAIT_MS);
+  return env?.WORKTREE_GUARD_LOCK_WAIT_MS !== undefined && Number.isFinite(n) && n >= 0 ? n : LOCK_WAIT_MS;
+}
+
+/** mkdir is atomic, so it is the lock. Any failure other than "held" reports unlocked, never locked. */
+function acquireLock(lock, waitMs) {
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    try {
+      mkdirSync(lock);
+      return true;
+    } catch (e) {
+      if (e?.code !== 'EEXIST' || Date.now() >= deadline) return false;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
   }
 }
 
+function releaseLock(lock) {
+  try {
+    rmdirSync(lock);
+  } catch {
+    // A lock we cannot remove only makes later arms incomplete, which is the closed direction.
+  }
+}
+
+function priorMarker(sessionId, env) {
+  try {
+    statSync(markerPath(sessionId, env));
+  } catch (e) {
+    return { tickets: [], complete: e?.code === 'ENOENT' };
+  }
+  return readMarker(sessionId, env);
+}
+
 export function decide(payload, opts = {}) {
-  const { kindOf = worktreeKind, ticket = null } = opts;
+  const { kindOf = worktreeKind, ticket = null, marker = null, mergeState = ghMergeState } = opts;
   const tool = payload?.tool_name;
-  if (tool === 'Bash') return decideBash(payload, kindOf, ticket);
+  if (tool === 'Bash') return decideBash(payload, kindOf, ticket, { marker, mergeState });
   if (GUARDED_EDITS.has(tool)) return decideEdit(payload, kindOf, ticket);
   return ALLOW;
 }
@@ -209,7 +269,7 @@ function containingDir(target, cwd) {
   return null;
 }
 
-function decideBash(payload, kindOf, ticket) {
+function decideBash(payload, kindOf, ticket, postMerge) {
   const command = payload?.tool_input?.command;
   if (typeof command !== 'string' || !command.trim()) return ALLOW;
 
@@ -243,7 +303,7 @@ function decideBash(payload, kindOf, ticket) {
         continue;
       }
 
-      const verdict = judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, ticket, start);
+      const verdict = judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, ticket, start, postMerge);
       if (verdict) return verdict;
     }
 
@@ -337,7 +397,7 @@ function operandDir(tokens, dir) {
   return resolveDir(dir, target);
 }
 
-function judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, ticket, start) {
+function judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, ticket, start, postMerge) {
   if (name === 'git') {
     const git = parseGit(tokens.join(' '));
     if (!git) return null;
@@ -381,7 +441,11 @@ function judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, tick
     const target = repoDir ? resolveDir(dir, repoDir) : dir;
     const unknown = repoDir ? target === null : unknownDir || dir === null;
     if (unknown || target === null) return block(unresolvable(`git ${sub ?? ''}`.trim(), ticket));
-    return judgeDir(target, kindFor, ticket, start, `git ${sub}`);
+    const denied = judgeDir(target, kindFor, ticket, start, `git ${sub}`);
+    if (!denied || kindFor(target) !== 'primary') return denied;
+    const cleanup = postMergeCleanup(sub, args, target, postMerge);
+    if (cleanup === null) return denied;
+    return cleanup.ok ? null : block(`${denied.reason}\nPost-merge cleanup refused: ${cleanup.why}.`);
   }
 
   if (name === 'gh' && ghMutates(tokens)) {
@@ -477,6 +541,161 @@ function ghMutates(tokens) {
   return words[0] === 'pr' && words[1] === 'checkout';
 }
 
+// ── Post-merge state (tkt-c9ae67a61caf) ─────────────────────────────────────────────────────────
+// Not a disarm. `status: done` is never consulted: the session sets it itself, so trusting it would
+// let a session unlock itself. Only a PR that gh reports merged unlocks, and only these two shapes.
+
+/** The cleanup a command is shaped as — null when it is not one, so the ordinary block stands. */
+function cleanupShape(sub, args) {
+  if (sub === 'pull' || sub === 'merge') {
+    if (args.filter((a) => a === '--ff-only').length !== 1) return null;
+    return { kind: 'ff', sub, operands: args.filter((a) => a !== '--ff-only') };
+  }
+  if (sub === 'checkout') return args[0] === '--' ? { kind: 'restore', paths: args.slice(1) } : null;
+  if (sub === 'restore') {
+    const paths = args[0] === '--' ? args.slice(1) : args;
+    return paths.some((a) => a.startsWith('-')) ? null : { kind: 'restore', paths };
+  }
+  return null;
+}
+
+/** null: not a cleanup shape. { ok: true }: allow. { ok: false, why }: still blocked, with the reason. */
+function postMergeCleanup(sub, args, dir, postMerge) {
+  const shape = cleanupShape(sub, args);
+  if (!shape) return null;
+  const refuse = (why) => ({ ok: false, why });
+
+  const root = tryGit(['rev-parse', '--show-toplevel'], dir).out;
+  if (!root) return refuse('the repository root could not be resolved');
+  const branches = protectedBranches(root);
+  if (!branches || branches.length !== 1) return refuse('the default branch could not be determined');
+  const base = branches[0];
+  const upstream = `origin/${base}`;
+  if (!tryGit(['rev-parse', '--verify', '--quiet', `${upstream}^{commit}`], root).out)
+    return refuse(`${upstream} does not exist`);
+  // Any other branch in a primary is a paused session's work, not this ticket's leftovers.
+  if (tryGit(['symbolic-ref', '--short', 'HEAD'], root).out !== base) return refuse(`the primary is not on ${base}`);
+
+  const local = shape.kind === 'ff' ? fastForwardProblem(shape, base, upstream, root) : restoreProblem(shape.paths, dir, upstream);
+  if (local) return refuse(local);
+
+  // Local checks first: they are cheap and offline, and the verifier below is a network call.
+  return everyTicketMerged(postMerge, root, base)
+    ? { ok: true }
+    : refuse(`not every ticket this session started has a PR verified merged into ${base} in ${root}`);
+}
+
+function everyTicketMerged(postMerge, root, base) {
+  const marker = postMerge?.marker;
+  if (!marker?.complete || !Array.isArray(marker.tickets) || marker.tickets.length === 0) return false;
+  return marker.tickets.every((t) => {
+    try {
+      return postMerge.mergeState(t, root, base) === 'merged';
+    } catch {
+      return false;
+    }
+  });
+}
+
+function fastForwardProblem({ sub, operands }, base, upstream, root) {
+  // Explicit operands only: a bare `git pull` follows branch.<base>.remote/merge, which can name
+  // any branch at all.
+  const allowed = sub === 'pull' ? ['origin', base] : [upstream];
+  if (operands.length !== allowed.length || operands.some((x, i) => x !== allowed[i]))
+    return `only \`git pull --ff-only origin ${base}\` or \`git merge --ff-only ${upstream}\` is allowed`;
+  const status = tryGit(['status', '--porcelain', '--untracked-files=no'], root);
+  if (status.err !== undefined) return 'the working tree state could not be read';
+  if (status.out) return 'the primary has tracked modifications';
+  if (tryGit(['merge-base', '--is-ancestor', 'HEAD', upstream], root).err !== undefined)
+    return `${base} is not an ancestor of ${upstream}, so this is not a pure fast-forward`;
+
+  // git refuses to overwrite an untracked file, but overwrites an IGNORED one silently — so any
+  // stray path the fast-forward would write is refused here, ignored or not.
+  const incoming = tryGit(['diff', '-z', '--name-only', '--no-renames', 'HEAD', upstream], root);
+  const stray = tryGit(['status', '-z', '--porcelain', '--ignored', '--untracked-files=normal'], root);
+  if (incoming.err !== undefined || stray.err !== undefined) return 'the paths this would write could not be listed';
+  const names = incoming.out.split('\0').filter(Boolean);
+  const clash = stray.out
+    .split('\0')
+    .filter((e) => e.startsWith('?? ') || e.startsWith('!! '))
+    .map((e) => e.slice(3).replace(/\/$/, ''))
+    .find((p) => names.some((n) => n === p || n.startsWith(`${p}/`) || p.startsWith(`${n}/`)));
+  return clash ? `${clash} is untracked or ignored here and ${upstream} would overwrite it` : null;
+}
+
+function restoreProblem(paths, dir, upstream) {
+  if (paths.length === 0) return 'no path was named';
+  for (const p of paths) {
+    if (!p || /[*?[\]]/.test(p) || p.startsWith(':') || p.startsWith('-')) return `${p} is not a literal file path`;
+    let stat;
+    try {
+      stat = lstatSync(resolve(dir, p));
+    } catch {
+      return `${p} does not exist`;
+    }
+    // A symlink's blob is its target PATH, while hash-object follows it to the content.
+    if (!stat.isFile()) return `${p} is not a regular file`;
+    const listed = tryGit(['--literal-pathspecs', 'ls-files', '--full-name', '--error-unmatch', '--', p], dir);
+    if (listed.err !== undefined || !listed.out || listed.out.includes('\n')) return `${p} is not a tracked file`;
+    const want = tryGit(['rev-parse', '--verify', '--quiet', `${upstream}:${listed.out}`], dir).out;
+    // --no-filters: a clean filter or eol conversion can hash a locally edited file equal to the blob.
+    const have = tryGit(['--literal-pathspecs', 'hash-object', '--no-filters', p], dir).out;
+    if (!want || !have || want !== have) return `${p} differs from ${upstream}, so restoring it would discard work`;
+  }
+  return null;
+}
+
+const GH_TIMEOUT_MS = 10_000;
+
+/** HOST/OWNER/REPO from a GitHub-shaped remote URL, or null for anything else (a local path included). */
+function githubRepo(url) {
+  const m = typeof url === 'string'
+    ? url.match(/^(?:(?:https?|ssh):\/\/(?:[^@/]+@)?|[^@/:]+@)([A-Za-z0-9.-]+)(?::\d+)?[:/]([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/)
+    : null;
+  return m ? `${m[1]}/${m[2]}/${m[3]}` : null;
+}
+
+/**
+ * 'merged' | 'unmerged' | 'unknown' for one ticket. The repo is pinned with -R from `origin`'s URL
+ * and GH_REPO is stripped: gh's own resolution follows GH_REPO and `gh repo set-default`, either of
+ * which can answer for a different repository. Only 'merged' unlocks, and an OPEN PR naming the
+ * ticket vetoes an earlier merged one. Residual: only the 100 most recent PRs are read.
+ */
+export function ghMergeState(ticket, root, base, run = spawnSync, git = tryGit) {
+  const repo = githubRepo(git(['remote', 'get-url', 'origin'], root).out);
+  if (!repo) return 'unknown';
+  const env = { ...process.env, GH_PROMPT_DISABLED: '1' };
+  delete env.GH_REPO;
+  let r;
+  try {
+    r = run('gh', ['pr', 'list', '-R', repo, '--state', 'all', '--limit', '100', '--json', 'headRefName,baseRefName,mergedAt,state'], {
+      cwd: root,
+      encoding: 'utf8',
+      timeout: GH_TIMEOUT_MS,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env,
+    });
+  } catch {
+    return 'unknown';
+  }
+  if (!r || r.error || r.signal || r.status !== 0) return 'unknown';
+  let prs;
+  try {
+    prs = JSON.parse(r.stdout);
+  } catch {
+    return 'unknown';
+  }
+  if (!Array.isArray(prs)) return 'unknown';
+  const escaped = String(ticket).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const names = new RegExp(`(^|[^A-Za-z0-9])${escaped}($|[^A-Za-z0-9])`);
+  const mine = prs.filter((pr) => typeof pr?.headRefName === 'string' && names.test(pr.headRefName));
+  if (mine.some((pr) => pr.state !== 'MERGED' && pr.state !== 'CLOSED')) return 'unmerged';
+  const merged = mine.some(
+    (pr) => pr.state === 'MERGED' && pr.baseRefName === base && typeof pr.mergedAt === 'string' && pr.mergedAt !== '',
+  );
+  return merged ? 'merged' : 'unmerged';
+}
+
 function message(what, dir, kind, ticket, sessionCwd) {
   // The REPO ROOT, not the directory that happened to contain the file: naming `<repo>/src` as "the
   // primary checkout" is wrong, and the worktree-exists check below would look for
@@ -566,7 +785,8 @@ export function run(raw, env = process.env) {
     fail(`${TAG} Blocked: the worktree-guard state could not be read, so this session's arming is unknown.`);
   if (state === 'unarmed') process.exit(0);
 
-  const verdict = decide(payload, { ticket: readTicket(payload.session_id, env) });
+  const marker = readMarker(payload.session_id, env);
+  const verdict = decide(payload, { ticket: marker.ticket, marker });
   if (verdict.blocked) fail(verdict.reason);
   process.exit(0);
 }
