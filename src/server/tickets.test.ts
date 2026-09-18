@@ -1034,7 +1034,28 @@ describe('corrupt ticket file resilience', () => {
     expect(board.tickets.map((t) => t.id)).toEqual([good.id]);
     expect(board.unreadable).toHaveLength(1);
     expect(board.unreadable[0]?.file).toBe('tkt-colon.md');
-    expect(board.unreadable[0]?.reason).toBeTruthy();
+    expect(board.unreadable[0]?.reason).toBe('unparseable frontmatter');
+  });
+
+  // tkt-c095408c13e5 — the same leak getTicket closed above, one layer out: the YAML parser message
+  // quotes the offending frontmatter line, and this reason travels verbatim into the list_tickets
+  // envelope. UNQUOTED_COLON, not CORRUPT: only its message echoes the file's own content.
+  it('listBoard does not leak the parser message in the unreadable reason', async () => {
+    await writeRaw('tkt-colon', UNQUOTED_COLON);
+
+    const board = await listBoard();
+
+    expect(board.unreadable[0]?.reason).toBe('unparseable frontmatter');
+    expect(board.unreadable[0]?.reason).not.toContain('stale tabs'); // the file's own content
+  });
+
+  it('logs the listBoard unparseable-frontmatter detail server-side', async () => {
+    const captured = captureLog();
+    await writeRaw('tkt-colon', UNQUOTED_COLON);
+
+    await listBoard();
+
+    expect(captured.warn.join(' ')).toContain('stale tabs'); // the detail the caller never sees
   });
 
   it('listBoard reports an empty unreadable list when every file parses', async () => {
@@ -1052,6 +1073,8 @@ describe('corrupt ticket file resilience', () => {
 
     expect(board.tickets).toHaveLength(1);
     expect(board.unreadable.map((u) => u.file)).toEqual(['tkt-ghost.md']);
+    // Pinned so a blanket fix to the unparseable reason cannot quietly take this one with it.
+    expect(board.unreadable[0]?.reason).toBe('file disappeared between readdir and read');
     vi.restoreAllMocks();
   });
 });
