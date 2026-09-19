@@ -331,7 +331,9 @@ export async function listBoard(): Promise<BoardListing> {
     } catch (err) {
       // Unparseable frontmatter must not take the whole board down — skip so the rest stays up.
       log.warn(`[tickets] skipping unparseable ticket file ${file}:`, err instanceof Error ? err.message : err);
-      unreadable.push({ file, reason: err instanceof Error ? err.message : String(err) });
+      // Generic on purpose: the parser message quotes the offending frontmatter line, and this
+      // reason reaches clients verbatim in the list_tickets envelope (tkt-c095408c13e5).
+      unreadable.push({ file, reason: 'unparseable frontmatter' });
     }
   }
   return { tickets: tickets.sort((a, b) => a.order - b.order), unreadable };

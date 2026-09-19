@@ -283,7 +283,12 @@ describe('list_tickets', () => {
 
       expect(res.isError).toBeUndefined();             // board still renders (tkt-cd9d5026c34f)
       expect(asList(res).map((t) => t.title)).toEqual(['Good']);
-      expect(env.unreadable).toEqual([{ file: 'tkt-colon.md', reason: expect.any(String) }]);
+      expect(env.unreadable).toEqual([{ file: 'tkt-colon.md', reason: 'unparseable frontmatter' }]);
+      // Scoped to the WHOLE envelope, not just unreadable: the toEqual above already pins every
+      // byte of that field, so narrowing this to it could never fail independently. `note`
+      // interpolates file-derived text, so this is the assertion that guards the client surface
+      // against a leak re-entering through some other field (tkt-c095408c13e5).
+      expect(JSON.stringify(env)).not.toContain('stale tabs');
       expect(String(env.note)).toContain('tkt-colon.md');
     });
 
