@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
  * but the available update path would downgrade gray-matter from 4.0.3 to 2.0.1" and exits 1, so
  * `update_files` has failed on every attempt since 2026-08-09 and no PR is ever opened. npm's own
  * resolver disagrees — `npm update js-yaml` moves it in one command and leaves gray-matter at 4.0.3,
- * because `^3.13.1` admits 3.15.1. The bump is therefore by hand, and this is what keeps it.
+ * because `^3.13.1` admits 3.15.2. The bump is therefore by hand, and this is what keeps it.
  *
  * Deliberately NOT an `overrides` entry, which was Dependabot's other suggestion. Two reasons: npm
  * already picks the highest satisfying version unaided (proven by the one-command update), so an
@@ -36,9 +36,16 @@ export function atLeast(version, floor) {
   return parse(version) >= parse(floor);
 }
 
-// GHSA-5p4m-2wfm-xmqj — quadratic CPU consumption in !!omap resolution. Transitive via gray-matter,
-// which is the frontmatter parser the whole ticket engine reads through, so it is on the hot path.
-const ADVISORIES = [{ name: 'js-yaml', floor: '3.15.1', ghsa: 'GHSA-5p4m-2wfm-xmqj' }];
+// GHSA-2883-xcg3-v3hh — maxTotalMergeKeys does not bound CPU for empty merge sources; supersedes
+// GHSA-5p4m-2wfm-xmqj, whose 3.15.1 floor it raises. Transitive via gray-matter, the frontmatter
+// parser the whole ticket engine reads through, so it is on the hot path (tkt-d3ca2a78c557).
+// hono is unreachable today — the MCP server instantiates only StdioServerTransport — but it is a
+// runtime dep every consumer inherits by tag, so the floor stands rather than being re-argued the
+// day a transport changes. 4.13.5 also answers GHSA-g6gw-c38x-mqfc and GHSA-crvj-82cr-hjcx.
+const ADVISORIES = [
+  { name: 'js-yaml', floor: '3.15.2', ghsa: 'GHSA-2883-xcg3-v3hh' },
+  { name: 'hono', floor: '4.13.5', ghsa: 'GHSA-gqvv-2mrq-wpjv' },
+];
 
 describe('security advisories answered in the lockfile', () => {
   it.each(ADVISORIES)('$name is at or above $floor ($ghsa)', ({ name, floor }) => {
