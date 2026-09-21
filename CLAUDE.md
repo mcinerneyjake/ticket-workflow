@@ -58,8 +58,38 @@ placeholder names, and describe another repo by what it is, never by where it si
 
 ## Quality gate
 
-`npm run typecheck`, `npm run lint`, and `npm test` must all pass before a ticket is done; CI (job
-`gate`) runs the same plus coverage, build, and `audit .`. The pre-commit hook runs the gate locally.
+`npm run typecheck`, `npm run lint`, and `npm test` must all pass before a ticket is done; CI runs
+the same plus coverage, build, `audit .`, and — in the `suite` job, after them — `npm audit
+--audit-level=high`. The pre-commit hook runs typecheck, lint and test locally; it does **not** run
+either audit, so those two are first seen in CI.
+
+**`npm audit` blocks, and is scoped to high/critical on purpose** (`tkt-7172e91d6e16`). It is the one
+gate step whose verdict comes from a **live advisory feed** rather than from the diff, so it can turn
+red on a PR that changed nothing. Blocking is still the right call — a dependency check that cannot
+fail is a guard that reports success — but the threshold is what keeps it readable: moderate
+advisories against unreachable transitive packages must not block anyone, or this becomes the check
+that always fires and people stop reading (`tkt-3a91af2aa6d9`). It runs **last** among the blocking
+steps for the same reason: a job aborts at its first failure, so an earlier position would let a bad
+advisory day hide every result the diff actually produced. Note it is a genuinely new availability
+dependency — the bulk-advisories endpoint, which `setup-node`'s `cache: npm` does not cover — so an
+outage reads as a red gate.
+
+**The escape hatch, in order. Never a change to the audit command.** Lowering `--audit-level`, adding
+`continue-on-error`, appending `|| true` or an `if:` are all defeats, and `ci.gate.test.mjs` fails on
+each:
+
+1. **`npm update <pkg>`** first. npm's resolver often lands a patch inside the existing range with no
+   manifest change at all — that is how js-yaml moved, and `deps.advisory.test.mjs` records the case.
+2. **An `overrides` entry** only when the range genuinely will not admit the patch. Note
+   `deps.advisory.test.mjs` argues *against* reaching for it by default — npm usually needs no help,
+   and an override silently forces the version on every transitive consumer inside this repo. Treat
+   it as the second resort it is, and record the GHSA **in `deps.advisory.test.mjs`**, which is
+   JavaScript and can hold the reasoning; `package.json` is strict JSON and cannot carry a comment.
+   `overrides` also binds this repo only — consumers of the published package are unaffected.
+3. **No patched version anywhere** is a genuine stop: say so on a ticket rather than editing the gate.
+
+`deps.advisory.test.mjs` stays as the record of *why* a given bump was made by hand. `npm audit` is
+what makes that file's staleness non-fatal, since it needs nobody to remember to raise a floor.
 
 - TypeScript conventions (lint-enforced): no `as` casts (`as const` allowed), no non-null `!`, no
   `any` in your own types.

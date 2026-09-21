@@ -42,6 +42,14 @@ jobs:
       - run: npm run lint
       # Coverage variant so the per-file thresholds in vitest.config.ts are enforced, not just run.
       - run: npm run test:coverage
+      # Last of the blocking checks on purpose: its verdict comes from a live advisory feed, so it is
+      # the one step that can go red on a diff that changed nothing — and a job aborts at its first
+      # failure, so running it earlier would suppress every diff-derived signal behind it.
+      # Scoped to high/critical for the same reason: moderate advisories against unreachable
+      # transitive packages would make this the check that always fires, which is the check people
+      # stop reading (tkt-3a91af2aa6d9). Widening the threshold is never the fix — CLAUDE.md →
+      # Quality gate names the escape hatch. Pinned by ci.gate.test.mjs.
+      - run: npm audit --audit-level=high
       # Dogfood: the package that defines the guardrail standard must pass it. `npm ci` already
       # built dist via prepare. GH_TOKEN lets the branch-protection check ask the API — without it
       # that check reports BLOCKED and the audit exits 1.
