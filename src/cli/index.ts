@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { clearStaleSlots, DEFAULT_TTL_MS, formatSlot, listSlots, pidLiveness, TestRunRefusal, testSlotsStateDir } from '../test-run/slots.js';
 import { listTickets, getTicket } from '../server/tickets.js';
 import { getTicketEvents } from '../server/events.js';
 import { isStatusId, STATUS_IDS } from '../shared/constants.js';
@@ -165,6 +166,43 @@ export function cmdVacuous(args: string[]): void {
     // A broken instrument or an empty tree is a probe error, never a clean sweep.
     console.error(e instanceof Error ? e.message : String(e));
     process.exitCode = VACUOUS_EXIT.PROBE_ERROR;
+  }
+}
+
+/**
+ * `test-slots [status|clear-stale] [--json]` reads or prunes the machine-wide run slots that
+ * `holdTestRun` takes (tkt-14788b3fc356). Usage errors exit 2 and unreadable state exits with the
+ * helper's own STATE_UNREADABLE code, handled here so a typo is never mistaken for an empty board.
+ */
+export function cmdTestSlots(args: readonly string[], env: NodeJS.ProcessEnv = process.env): void {
+  const flags = args.filter((a) => a.startsWith('-'));
+  const words = args.filter((a) => !a.startsWith('-'));
+  const verb = words[0] ?? 'status';
+  if (flags.some((f) => f !== '--json') || words.length > 1 || (verb !== 'status' && verb !== 'clear-stale')) {
+    console.error('usage: ticket-workflow test-slots [status|clear-stale] [--json]');
+    process.exitCode = 2;
+    return;
+  }
+  const stateDir = testSlotsStateDir(env);
+  const opts = { probe: pidLiveness, now: Date.now(), ttlMs: DEFAULT_TTL_MS };
+  try {
+    const rows = verb === 'status' ? listSlots(stateDir, opts) : clearStaleSlots(stateDir, opts);
+    if (flags.includes('--json')) {
+      console.log(JSON.stringify({ stateDir, verb, slots: rows }, null, 2));
+      return;
+    }
+    if (rows.length === 0) {
+      console.log(`${verb === 'status' ? 'no test slots held' : 'no stale test slots'} (${stateDir})`);
+      return;
+    }
+    for (const row of rows) console.log(`${verb === 'status' ? '' : 'removed '}${formatSlot(row)}`);
+  } catch (err) {
+    if (err instanceof TestRunRefusal) {
+      console.error(err.message);
+      process.exitCode = err.code;
+      return;
+    }
+    throw err;
   }
 }
 
@@ -394,6 +432,9 @@ export async function main(): Promise<void> {
     case 'vacuous':
       cmdVacuous(rest);
       break;
+    case 'test-slots':
+      cmdTestSlots(rest);
+      break;
     case 'show': {
       const id = rest[0];
       if (id === undefined) throw new Error('usage: ticket-workflow show <id>');
@@ -404,7 +445,7 @@ export async function main(): Promise<void> {
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
           'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json] | ' +
-          'vacuous <path> [--check] | ' +
+          'vacuous <path> [--check] | test-slots [status|clear-stale] [--json] | ' +
           'worktree <ticket-id> [--branch <name>] [--base <ref>] [--name <dir>] [--repo <path>]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;

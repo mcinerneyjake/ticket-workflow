@@ -569,6 +569,56 @@ order, on a branch, before the PR. It cannot establish that the code is correct,
 meaningful, that a bug repro was written first, or that the reasoning was sound. Never sell it as
 more than that.
 
+## `test-run` — one machine, K test runs at a time, each in its own TMPDIR
+
+Several agent sessions committing at once each run a full vitest suite through the husky gate, and
+the spawn-heavy suites starve each other past their timeouts while the machine looks idle. A
+per-repo worker cap bounds one run; it cannot see across runs. This does (`tkt-14788b3fc356`):
+
+```ts
+// vitest.config.ts — before `export default defineConfig`
+import { holdTestRun, TEST_RUN_GLOBAL_SETUP } from 'ticket-workflow/test-run';
+await holdTestRun({ repo: 'my-repo' });
+
+export default defineConfig({
+  test: {
+    globalSetup: [TEST_RUN_GLOBAL_SETUP], // releases the slot; ROOT `test` block only under a projects split
+    // ...
+  },
+});
+```
+
+At config resolution — before vitest snapshots the worker environment or cleans the coverage
+directory — it takes one of **K** slots under `~/.claude/state/test-slots/` and points `TMPDIR` at a
+fresh `<tmpdir>/<repo>-test/run-<pid>-<rand>`, so every `mkdtemp` a suite leaks dies with the run and
+no two runs share a directory. Waiting is foreground with backoff, printing who holds the slots.
+
+| setting | default | env |
+|---|---|---|
+| slots | 2 | `TEST_SLOTS` |
+| wait before refusing | 10 min | `TEST_SLOTS_WAIT_MS` |
+| state directory | `~/.claude/state/test-slots` | `TEST_SLOTS_DIR` |
+| heartbeat TTL (a holder past it is reclaimed with a warning) | 15 min | — |
+
+An integer override that is not one refuses rather than guessing. K is read by each run, so a run
+started with a larger `TEST_SLOTS` widens the cap for itself — a choice, not a guard failure, and the
+holder list shows it. There is no opt-out: the helper is
+a no-op inside a vitest worker (`VITEST_WORKER_ID`, so a test may import the config) and on `CI`
+(`TEST_SLOTS_FORCE=1` re-enables it there). Exit codes are distinct and are the claim: **75** every
+slot is held by a live holder and the wait ran out · **78** the state directory or a slot file cannot
+be read or trusted, or an override is invalid · **74** the per-run TMPDIR cannot be created. A
+refused run holds nothing.
+
+A holder is reclaimed only when its pid is gone (`ESRCH`); a pid another user owns reads as alive,
+and a live holder whose heartbeat stopped is reclaimed after the TTL. The claim is an atomic
+`link(2)` and the reclaim decides under a per-slot lock — measured on the race test, a reclaim that
+judged from an earlier read could rename a live winner's fresh record.
+
+```bash
+npx ticket-workflow test-slots            # who holds what, with liveness and age
+npx ticket-workflow test-slots clear-stale
+```
+
 ## Development
 
 ```bash

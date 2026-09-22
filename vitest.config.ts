@@ -1,10 +1,18 @@
 import { configDefaults, defineConfig } from 'vitest/config';
+import { holdTestRun } from './src/test-run/hold.js';
+
+// One of K machine-wide test-run slots, and a per-run TMPDIR, taken at config resolution so a
+// refused run has touched nothing (tkt-14788b3fc356). Released by src/test-run/globalSetup.ts.
+// No-op inside workers (vitest.config.test.ts imports this file from one) and on CI.
+await holdTestRun({ repo: 'ticket-workflow' });
 
 export default defineConfig({
   test: {
     environment: 'node',
     // Silences the service logger by default; see the file for why and how a test opts out.
     setupFiles: ['src/test-support/silenceLogger.ts'],
+    // Releases the slot and TMPDIR above. Only the release lives here — see holdTestRun.
+    globalSetup: ['./src/test-run/globalSetup.ts'],
     // Default glob picks up src/**/*.test.ts AND hooks/**/*.test.mjs. Extend the defaults rather
     // than replace them; .claude/worktrees/ can hold full second checkouts whose suites would
     // double-collect.
@@ -38,7 +46,14 @@ export default defineConfig({
       include: ['src/**/*.ts'],
       // mcp/server.ts is a thin stdio-transport entrypoint with no logic (same exclusion its
       // consumer applies); index.ts stays IN — the export-surface test executes the barrel.
-      exclude: ['src/**/*.test.ts', 'src/test-support/**', 'src/mcp/server.ts'],
+      exclude: [
+        'src/**/*.test.ts',
+        'src/test-support/**',
+        'src/mcp/server.ts',
+        // Runs in vitest's main process, which v8 never instruments, and is branchless; the
+        // release it returns lives in hold.ts, which is measured.
+        'src/test-run/globalSetup.ts',
+      ],
       reporter: ['text'],
       // A floor, not a target: per-file so an untested new file can't hide behind the aggregate.
       // Branches start at 40 — the shortfall is concentrated in error-path guards (EISDIR/EACCES
