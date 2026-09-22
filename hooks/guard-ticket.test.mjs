@@ -39,7 +39,9 @@ describe('decide — blocks only create_ticket', () => {
   });
 
   // Fail CLOSED: the settings matcher routes only create_ticket here, so no readable
-  // tool name is treated as the create call (opposite of guard-bash's fail-open).
+  // tool name is treated as the create call. guard-bash's FIELD-level analogue goes the
+  // other way — a command-less event is allowed, because its matcher is all of Bash and
+  // blocking would wedge BashOutput. Reach, not a weaker rule (see guard-ticket.mjs).
   it('fails closed on an absent or non-string tool name', () => {
     expect(isBlocked(undefined)).toBe(true);
     expect(decide({ tool_name: 42 }).blocked).toBe(true);
