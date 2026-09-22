@@ -126,10 +126,11 @@ describe('npm-version — no floor declared is PASS and inert, not FAIL', () => 
     expect(res.detail).toContain('no engines.npm floor');
   });
 
-  /** The check must be inert on THIS repo until tkt-61ec9c048684 declares a floor — that is the
-   *  property which keeps it off every consumer's gate, so it is asserted rather than assumed. */
-  it("is inert on this repo's own shape (engines: node only)", () => {
-    const res = run(pkgJson({ engines: { node: '>=24' }, name: 'ticket-workflow' }), npmNeverRuns);
+  /** Inert for a consumer declaring node-only engines — the property that keeps this check off
+   *  every consumer's gate, and most declare no npm floor. This repo does declare one as of
+   *  tkt-61ec9c048684; src/npmFloor.test.ts pins that, and the check is live here. */
+  it('is inert for a consumer package.json declaring only engines.node', () => {
+    const res = run(pkgJson({ engines: { node: '>=24' }, name: 'consumer' }), npmNeverRuns);
     expect(res.status).toBe('pass');
   });
 });
