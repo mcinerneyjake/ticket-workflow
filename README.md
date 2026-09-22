@@ -619,6 +619,39 @@ npx ticket-workflow test-slots            # who holds what, with liveness and ag
 npx ticket-workflow test-slots clear-stale
 ```
 
+### `test-contention` — proving the bound works
+
+`test-contention` checks the bound (`tkt-98cdd3b87020`). It runs `npm test` N times concurrently,
+each run in its own throwaway worktree of the resolved `HEAD` commit under the tmpdir. Each worktree
+is provisioned as `worktree` provisions one, and gets a `node_modules` link. It then prints a
+per-file table (file · runs failed · timeouts) and removes the worktrees, on Ctrl-C too. Reports and
+logs stay under `~/.claude/state/test-contention/runs/` (`TEST_CONTENTION_DIR`).
+
+```bash
+npx ticket-workflow test-contention --runs 4 --control   # TEST_SLOTS=N: the bound removed
+npx ticket-workflow test-contention --runs 4             # the bound in force
+```
+
+The bounded arm prints a verdict **only** against a control that went red the same local day, for
+the same checkout, commit and N. A green run on a machine that cannot show contention proves nothing.
+A control counts as red only when every failure is a timeout. An assertion failure means `HEAD` is
+broken on its own, and that control is not recorded as red.
+
+The verdict is also withheld when any run wrote no readable report, or when a run held no slot or
+K ≥ N. A repo whose vitest config does not await `holdTestRun` is unbounded. It is withheld as well
+when a vitest process outside this command's own process tree appeared during the runs. The process
+list is polled every 5 s.
+
+The command refuses to start while such a process is live, or when the process list cannot be read.
+Uncommitted changes are not in the runs. There is no per-run timeout, so a hung suite hangs the
+command; Ctrl-C still cleans up.
+
+While the control arm runs, it holds N machine-wide slots, and the queued waits scale with N. Other
+sessions' test runs wait meanwhile, and on a long control their wait budget can run out (exit 75).
+Run it when the machine is otherwise idle.
+
+Exit codes: **0** PASS, or control red · **1** FAIL · **2** no verdict, refused, or usage.
+
 ## Development
 
 ```bash
