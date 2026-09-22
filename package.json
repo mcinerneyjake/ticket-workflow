@@ -6,7 +6,8 @@
   "author": "Jake McInerney",
   "type": "module",
   "engines": {
-    "node": ">=24"
+    "node": ">=24",
+    "npm": ">=11.19.0"
   },
   "bin": {
     "ticket-workflow-mcp": "dist/mcp/server.js",

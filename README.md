@@ -245,8 +245,15 @@ The hooks and MCP server can govern *every* repo on a machine by wiring them at 
 upgrade silently relocates it):
 
 ```bash
+npm i -g npm@11   # this package declares engines.npm; engine-strict makes a stale npm REFUSE
 npm install --prefix ~/.claude/tools ticket-workflow@github:<owner>/ticket-workflow#<tag>
 ```
+
+The npm line is a prerequisite, not a suggestion: the package ships `engine-strict=true`, which a
+git-tag install inherits, so an npm below `engines.npm` fails with `EBADENGINE` instead of writing a
+lockfile that silently drops `libc` from optional native entries. Node 24.5.0 bundles npm 11.5.1,
+which is below the floor. An existing install survives an aborted upgrade — the check throws while
+npm is still building the ideal tree — but the upgrade will not proceed until npm is current.
 
 Wiring a checkout is the trap worth naming: hooks are re-read on **every** invocation, so checking
 out a branch that edits `guard-bash.mjs` re-arms or dis-arms the machine's guard for every running
@@ -565,8 +572,12 @@ more than that.
 ## Development
 
 ```bash
-npm install      # runs the prepare build
+npm install      # runs the prepare build; refuses outright below engines.npm
 npm run typecheck
 npm test
 npm run build    # emit dist/
 ```
+
+`engine-strict=true` is on, so `npm install` errors rather than warns when npm is below the declared
+floor. That is deliberate — an outdated npm rewrites `package-lock.json` and drops the `libc` field
+from optional native entries. `npm i -g npm@11` first if it refuses.
