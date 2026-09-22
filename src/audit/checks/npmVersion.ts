@@ -14,7 +14,7 @@ export function versionCore(spec: string): Semver | undefined {
 
 /** A prerelease sorts BELOW its own release ('11.0.0-pre.0' < '11.0.0'), which a numeric core cannot
  *  express — so it is carried separately rather than folded into the comparison. */
-function isPrerelease(version: string): boolean {
+export function isPrerelease(version: string): boolean {
   return /^\s*\d+(?:\.\d+){0,2}-/.test(version);
 }
 
