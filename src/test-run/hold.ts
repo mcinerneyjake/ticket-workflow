@@ -77,7 +77,7 @@ declare global {
   var __ticketWorkflowTestRun: Promise<RunState> | undefined;
 }
 
-const globalRegistry: Registry = {
+export const globalRegistry: Registry = {
   get: () => globalThis.__ticketWorkflowTestRun,
   set: (p) => {
     globalThis.__ticketWorkflowTestRun = p;
@@ -108,7 +108,7 @@ export function defaultRepoName(cwd: string): string {
   return sanitizeRepo(path.basename(cwd));
 }
 
-const realSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+export const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** `CI` set to anything non-empty counts; GitHub sets `CI=true`. `TEST_SLOTS_FORCE=1` overrides it. */
 function skipReason(env: NodeJS.ProcessEnv): SkipReason | null {
@@ -149,7 +149,7 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
   const cwd = opts.cwd ?? process.cwd();
   const repo = opts.repo ?? defaultRepoName(cwd);
   const now = opts.now ?? Date.now;
-  const sleep = opts.sleep ?? realSleep;
+  const sleep = opts.sleep ?? defaultSleep;
   const log = opts.log ?? ((line: string) => console.error(line));
   const probe = opts.probe ?? pidLiveness;
   const setExitCode = opts.setExitCode ?? defaultSetExitCode;

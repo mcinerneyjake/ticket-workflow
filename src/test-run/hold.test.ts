@@ -1,8 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { defaultRegisterExit, defaultRepoName, defaultSetExitCode, holdTestRun, releaseTestRun, type HoldTestRunOptions, type Registry, type RunState } from './hold.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { defaultRegisterExit, defaultRepoName, defaultSetExitCode, defaultSleep, globalRegistry, holdTestRun, releaseTestRun, type HoldTestRunOptions, type Registry, type RunState } from './hold.js';
 import { EXIT, parseSlotRecord, TestRunRefusal, type Liveness } from './slots.js';
 
 // Every case injects env, stateDir, tmpRoot and registry. Inside a vitest worker process.env carries
@@ -322,6 +322,34 @@ describe('the process-level defaults, exercised directly because the main proces
     expect(process.listenerCount('exit')).toBe(before + 1);
     process.removeListener('exit', fn);
     expect(process.listenerCount('exit')).toBe(before);
+  });
+
+  it('defaultSleep resolves after roughly the requested time', async () => {
+    const t0 = Date.now();
+    await defaultSleep(20);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(15);
+  });
+
+  it('globalRegistry round-trips through globalThis, and is restored afterwards', () => {
+    const saved = globalRegistry.get();
+    const marker = Promise.resolve<RunState>({ outcome: { kind: 'skipped', reason: 'ci' }, held: null });
+    globalRegistry.set(marker);
+    expect(globalRegistry.get()).toBe(marker);
+    globalRegistry.set(undefined);
+    expect(globalRegistry.get()).toBeUndefined();
+    globalRegistry.set(saved);
+  });
+
+  it('the default log writes the grant line to stderr', async () => {
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(' '));
+    });
+    const h = harness({ log: undefined });
+    await holdTestRun(h.opts);
+    await releaseTestRun(h.registry);
+    spy.mockRestore();
+    expect(lines.some((l) => l.startsWith('[test-run] slot 1/2'))).toBe(true);
   });
 
   it('defaultRepoName reads a sanitised package name, and falls back to the directory name', () => {
