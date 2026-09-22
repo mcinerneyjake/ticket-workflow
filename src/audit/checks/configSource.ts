@@ -130,7 +130,7 @@ export function depthBetween(masked: string, from: number, to: number): number {
 
 /** Whether the key token starting at `start` sits where an object KEY can sit: at the start of an
  *  object body, or after a comma. `x ? 'test' : { … }` put a ternary branch where a key was read. */
-function atKeyPosition(masked: string, start: number): boolean {
+export function atKeyPosition(masked: string, start: number): boolean {
   for (let i = start - 1; i >= 0; i -= 1) {
     const ch = masked.charAt(i);
     if (/\s/.test(ch)) continue;

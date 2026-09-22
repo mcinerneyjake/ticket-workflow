@@ -19,15 +19,16 @@ function run(files: Record<string, string | ReadResult>) {
 }
 
 const HOLD = `await holdTestRun({ repo: 'x' });`;
+const RELEASE = 'globalSetup: [TEST_RUN_GLOBAL_SETUP]';
 
-function config(preamble: string): string {
+function config(preamble: string, release: string = RELEASE): string {
   return `import { defineConfig } from 'vitest/config';
 import { holdTestRun, TEST_RUN_GLOBAL_SETUP } from 'ticket-workflow/test-run';
 
 ${preamble}
 
 export default defineConfig({
-  test: { globalSetup: [TEST_RUN_GLOBAL_SETUP] },
+  test: { ${release} },
 });
 `;
 }
@@ -161,6 +162,157 @@ describe('test-run-hold — cannot determine is BLOCKED, never a pass', () => {
   it('BLOCKS on a shared vite config whose test block cannot be delimited', () => {
     const res = run({ 'vite.config.ts': `export default defineConfig({ test: { exclude: [] ` });
     expect(res.status).toBe('blocked');
+  });
+});
+
+/** A config body written out in full, for shapes the fixed `test: { … }` above cannot express. */
+function rawConfig(body: string): string {
+  return `import { defineConfig } from 'vitest/config';
+import { holdTestRun, TEST_RUN_GLOBAL_SETUP } from 'ticket-workflow/test-run';
+
+${HOLD}
+
+export default defineConfig(${body});
+`;
+}
+
+/** The hold and the release are separate dimensions; before tkt-d3e5108c3a4c only the hold varied,
+ *  so a config that took a slot and never gave it back was certified. */
+describe('test-run-hold — the release, which the hold alone does not prove', () => {
+  it('FAILS a held config with no globalSetup at all, naming the release', () => {
+    const res = run({ 'vitest.config.ts': config(HOLD, '') });
+    expect(res.status, res.detail).toBe('fail');
+    expect(res.detail).toContain('globalSetup');
+    expect(res.detail).not.toContain('does not call holdTestRun');
+  });
+
+  it('FAILS a globalSetup that runs something else', () => {
+    const res = run({ 'vitest.config.ts': config(HOLD, `globalSetup: ['./db.ts']`) });
+    expect(res.status, res.detail).toBe('fail');
+  });
+
+  it('PASSES the array, bare, namespace and alongside-another spellings', () => {
+    for (const release of [
+      RELEASE,
+      'globalSetup: TEST_RUN_GLOBAL_SETUP',
+      'globalSetup: [tw.TEST_RUN_GLOBAL_SETUP]',
+      `globalSetup: ['./db.ts', TEST_RUN_GLOBAL_SETUP]`,
+      `'globalSetup': [TEST_RUN_GLOBAL_SETUP]`,
+    ]) {
+      const res = run({ 'vitest.config.ts': config(HOLD, release) });
+      expect(res.status, release).toBe('pass');
+    }
+  });
+
+  /** This package cannot import itself by name, so the path spelling is first-class, not a fallback. */
+  it('PASSES a string path to the shipped globalSetup, source or built', () => {
+    for (const release of [
+      `globalSetup: ['./src/test-run/globalSetup.ts']`,
+      `globalSetup: ['./node_modules/ticket-workflow/dist/test-run/globalSetup.js']`,
+      `globalSetup: "./src/test-run/globalSetup.mjs"`,
+    ]) {
+      const res = run({ 'vitest.config.ts': config(HOLD, release) });
+      expect(res.status, release).toBe('pass');
+    }
+  });
+
+  it('FAILS a release that is only commented out or quoted', () => {
+    expect(run({ 'vitest.config.ts': config(HOLD, `/* ${RELEASE} */`) }).status).toBe('fail');
+    expect(run({ 'vitest.config.ts': config(`const s = '${RELEASE}';`, '') }).status).toBe('fail');
+  });
+
+  it('FAILS a lookalike key, identifier or path', () => {
+    for (const release of [
+      'myGlobalSetup: [TEST_RUN_GLOBAL_SETUP]',
+      'globalSetup: [TEST_RUN_GLOBAL_SETUP_OLD]',
+      `globalSetup: ['./src/test-run/globalSetupHelper.ts']`,
+    ]) {
+      const res = run({ 'vitest.config.ts': config(HOLD, release) });
+      expect(res.status, release).toBe('fail');
+    }
+  });
+
+  /** The release must not mask an earlier cause: each of these is a hold defect, not a release one. */
+  it('keeps the hold message when the hold itself is absent, un-awaited or nested', () => {
+    for (const [preamble, expected] of [
+      ['', 'does not call holdTestRun'],
+      ['void holdTestRun();', 'without `await`'],
+      [`if (process.env.X) { ${HOLD} }`, 'inside a block, call or condition'],
+    ]) {
+      const res = run({ 'vitest.config.ts': config(preamble, '') });
+      expect(res.status, preamble).toBe('fail');
+      expect(res.detail, preamble).toContain(expected);
+    }
+  });
+
+  /** Undeterminable is BLOCKED, never a pass: the permissive answer here admits a literal from a
+   *  neighbouring property, and this repo's own config carries a matching one in coverage.exclude. */
+  it('BLOCKS when the value cannot be delimited, rather than reading past it', () => {
+    expect(run({ 'vitest.config.ts': config(HOLD, 'globalSetup: [./unterminated') }).status).toBe('blocked');
+    expect(run({ 'vitest.config.ts': `${HOLD}\nexport default { test: { globalSetup:` }).status).toBe('blocked');
+  });
+
+  it('BLOCKS on an unbalanced value instead of adopting a neighbour literal', () => {
+    const res = run({
+      'vitest.config.ts': rawConfig(`{
+  test: {
+    globalSetup: mk(,
+    coverage: { exclude: ['src/test-run/globalSetup.ts'] },
+  },
+}`),
+    });
+    expect(res.status, res.detail).toBe('blocked');
+  });
+
+  it('reads past a call and a nested object in the value without stopping early', () => {
+    const res = run({ 'vitest.config.ts': config(HOLD, 'globalSetup: withDb({ reset: true }, TEST_RUN_GLOBAL_SETUP)') });
+    expect(res.status, res.detail).toBe('pass');
+  });
+
+  /** vitest reads `test.globalSetup` and nothing else, so mere presence is not the release. The
+   *  WIRING message does not say "under test:", which is how a user lands on the first shape. */
+  it('FAILS a globalSetup that is not a direct child of the test block', () => {
+    for (const body of [
+      `{ globalSetup: [TEST_RUN_GLOBAL_SETUP], test: { environment: 'node' } }`,
+      `{ test: { typecheck: { globalSetup: [TEST_RUN_GLOBAL_SETUP] } } }`,
+      `{ build: { rollupOptions: { test: { globalSetup: [TEST_RUN_GLOBAL_SETUP] } } }, test: {} }`,
+    ]) {
+      const res = run({ 'vitest.config.ts': rawConfig(body) });
+      expect(res.status, body).toBe('fail');
+    }
+  });
+
+  it('FAILS a globalSetup sitting in a dead object beside the config', () => {
+    const src = `${rawConfig('{ test: {} }')}\nconst unused = { globalSetup: [TEST_RUN_GLOBAL_SETUP] };\n`;
+    expect(run({ 'vitest.config.ts': src }).status).toBe('fail');
+  });
+
+  /** JS keeps the LAST duplicate key, so `some` over occurrences is the wrong quantifier. */
+  it('reads the last globalSetup in the block, which is the one that runs', () => {
+    const res = run({ 'vitest.config.ts': config(HOLD, `globalSetup: [TEST_RUN_GLOBAL_SETUP], globalSetup: ['./db.ts']`) });
+    expect(res.status, res.detail).toBe('fail');
+  });
+
+  it('ignores a quoted globalSetup token that is not a key', () => {
+    const res = run({ 'vitest.config.ts': config(`const k = 'globalSetup';`, '') });
+    expect(res.status, res.detail).toBe('fail');
+  });
+
+  /** A known gap, pinned so it cannot later be mistaken for coverage: the check reads the config
+   *  and never follows the reference, so a consumer's own globalSetup that calls releaseTestRun
+   *  reads as unreleased. No repo wires it that way today; the message names the shape to use. */
+  it('does NOT follow a local globalSetup file that might release the slot itself', () => {
+    const res = run({
+      'vitest.config.ts': config(HOLD, `globalSetup: ['./vitest.globalSetup.ts']`),
+      'vitest.globalSetup.ts': `import { releaseTestRun } from 'ticket-workflow/test-run';\nexport default () => releaseTestRun;`,
+    });
+    expect(res.status, res.detail).toBe('fail');
+  });
+
+  it("PASSES this package's own config, which wires the release by path", () => {
+    const own = readFileSync(new URL('../../../vitest.config.ts', import.meta.url), 'utf8');
+    const res = run({ 'vitest.config.ts': own });
+    expect(res.status, res.detail).toBe('pass');
   });
 });
 
