@@ -26,14 +26,45 @@ export function lockedVersions(name) {
     .map(([, v]) => v.version);
 }
 
-/** Numeric, not lexical: '3.9.0' > '3.15.1' as strings. Throws rather than guessing on an odd shape. */
+/**
+ * Semver precedence (semver.org §10–11), not lexical: '3.9.0' > '3.15.1' as strings. Fields compare
+ * independently rather than weighted into one number, and a prerelease ranks below its own release.
+ * Both were fail-open in a floor whose whole job is to stop a vulnerable version landing: packed at
+ * 1e6/1e3/1 a minor or patch reaching 1000 carried into the field above, and an unanchored parse read
+ * '3.15.2-beta.1' as its own release (tkt-9a6d76e61642). Throws on both arguments rather than
+ * guessing, but the shape it accepts is laxer than the semver grammar — it still admits empty
+ * prerelease identifiers and leading zeros, which is a fail-open no npm-written lockfile reaches
+ * (measured 0/3513 real version strings). Tightening it is its own ticket.
+ */
 export function atLeast(version, floor) {
   const parse = (s) => {
-    const m = /^(\d+)\.(\d+)\.(\d+)/.exec(s);
+    const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(s);
     if (!m) throw new Error(`unparseable version ${JSON.stringify(s)}`);
-    return Number(m[1]) * 1e6 + Number(m[2]) * 1e3 + Number(m[3]);
+    return { nums: [Number(m[1]), Number(m[2]), Number(m[3])], pre: m[4] };
   };
-  return parse(version) >= parse(floor);
+  const comparePre = (a, b) => {
+    // Absent outranks present: 1.0.0 is above every 1.0.0-x.
+    if (a === undefined || b === undefined) return a === b ? 0 : a === undefined ? 1 : -1;
+    const as = a.split('.');
+    const bs = b.split('.');
+    for (let i = 0; i < Math.max(as.length, bs.length); i++) {
+      // A prefix ranks below the longer set it prefixes: 1.0.0-alpha < 1.0.0-alpha.1.
+      if (as[i] === undefined || bs[i] === undefined) return as[i] === undefined ? -1 : 1;
+      const an = /^\d+$/.test(as[i]);
+      const bn = /^\d+$/.test(bs[i]);
+      // Numeric identifiers compare numerically, and always rank below alphanumeric ones.
+      if (an !== bn) return an ? -1 : 1;
+      if (an && Number(as[i]) !== Number(bs[i])) return Number(as[i]) < Number(bs[i]) ? -1 : 1;
+      if (!an && as[i] !== bs[i]) return as[i] < bs[i] ? -1 : 1;
+    }
+    return 0;
+  };
+  const a = parse(version);
+  const b = parse(floor);
+  for (let i = 0; i < 3; i++) {
+    if (a.nums[i] !== b.nums[i]) return a.nums[i] > b.nums[i];
+  }
+  return comparePre(a.pre, b.pre) >= 0;
 }
 
 // GHSA-2883-xcg3-v3hh — maxTotalMergeKeys does not bound CPU for empty merge sources; supersedes
@@ -67,6 +98,40 @@ describe('security advisories answered in the lockfile', () => {
     expect(atLeast('3.15.0', '3.15.1')).toBe(false);
     expect(atLeast('4.0.0', '3.15.1')).toBe(true);
     expect(() => atLeast('latest', '3.15.1')).toThrow(/unparseable/);
+  });
+
+  it('ranks a prerelease below its own release, and does not let a field overflow the next', () => {
+    // Both directions of the prerelease rule (semver §11). Only the first was fail-open, but a fix
+    // that blanket-rejected prereleases would redden the gate on a version that is genuinely patched,
+    // so the second is asserted to pin that the floor is compared, not the shape (tkt-9a6d76e61642).
+    expect(atLeast('3.15.2-beta.1', '3.15.2')).toBe(false);
+    expect(atLeast('3.15.3-rc.1', '3.15.2')).toBe(true);
+    expect(atLeast('3.15.2', '3.15.2-beta.1')).toBe(true);
+    expect(atLeast('3.15.2-beta.2', '3.15.2-beta.11')).toBe(false);
+
+    // Fields are compared independently. Weighted into one number at 1e6/1e3/1, a minor or patch
+    // reaching 1000 carries into the field above and reports a vulnerable version as patched.
+    expect(atLeast('1.1000.0', '2.0.0')).toBe(false);
+    expect(atLeast('1.0.1000', '1.1.0')).toBe(false);
+
+    // Build metadata is not part of precedence (semver §10); a trailing fourth field is not a
+    // version at all, and the unanchored parse used to truncate it silently.
+    expect(atLeast('3.15.2+build.7', '3.15.2')).toBe(true);
+    expect(() => atLeast('3.15.2.4', '3.15.2')).toThrow(/unparseable/);
+
+    // The floor is parsed too. Pinned because a short-circuit added later — an early return once the
+    // numeric fields decide, say — would leave a typo'd floor in ADVISORIES silently uncompared.
+    expect(() => atLeast('3.15.2', 'latest')).toThrow(/unparseable/);
+  });
+
+  it('applies every prerelease precedence rule, not just the numeric one', () => {
+    // One assertion per §11 rule. Without these, three of the four survive inversion with the suite
+    // green — the same fail-open class this ticket closes, one level up: a later refactor flips a
+    // comparison and a prerelease-floored package reports as patched (found reviewing this diff).
+    expect(atLeast('1.0.0-1', '1.0.0-a')).toBe(false); // numeric ranks below alphanumeric
+    expect(atLeast('1.0.0-a', '1.0.0-1')).toBe(true);
+    expect(atLeast('1.0.0-alpha', '1.0.0-alpha.1')).toBe(false); // a prefix ranks below the longer set
+    expect(atLeast('1.0.0-beta', '1.0.0-alpha')).toBe(true); // alphanumeric compares ASCII-lexically
   });
 
   it('finds nested copies, not just the top-level one', () => {
