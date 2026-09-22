@@ -16,6 +16,7 @@ import { vitestCollection } from './checks/vitestCollection.js';
 import { nodeVersionSync } from './checks/nodeVersionSync.js';
 import { npmVersion } from './checks/npmVersion.js';
 import { tmpdirCleanup } from './checks/tmpdirCleanup.js';
+import { testRunHold } from './checks/testRunHold.js';
 import { pinParity } from './checks/pinParity.js';
 import { pinFreshness } from './checks/pinFreshness.js';
 import { loadRepoConfig, CONFIG_FILE } from './config.js';
@@ -44,6 +45,7 @@ export const AUDIT_CHECKS: readonly AuditCheck[] = [
   nodeVersionSync,
   npmVersion,
   tmpdirCleanup,
+  testRunHold,
 ];
 
 /** Prefixes the detail of a check that THREW (as opposed to one that answered BLOCKED). One shared
