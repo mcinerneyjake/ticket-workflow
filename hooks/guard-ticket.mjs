@@ -36,13 +36,16 @@
 // So "guarded everywhere" is true of this machine, not of this repository
 // (tkt-05ebe3a365cf).
 //
-// CONTRAST with guard-bash: guard-bash matches ALL Bash and fails OPEN on a
-// parse error (most Bash is legitimate — a guardrail must never wedge real work).
-// This hook is routed by the settings matcher to EXACTLY ONE tool
-// (mcp__kanban__create_ticket), so it fails CLOSED: an unreadable/absent tool
-// name is treated as the create call and blocked — the matcher is the evidence
-// it IS create_ticket, and blocking the one guarded tool can't wedge anything
-// else. (A guard that can't check must never return the permissive answer.)
+// CONTRAST with guard-bash runs at TWO levels — do not collapse them into one.
+// Unreadable PAYLOAD: both fail CLOSED (guard-bash since v0.25.0, tkt-92360b0e2079).
+// Missing FIELD on a payload that parsed: they diverge, deliberately. guard-bash
+// ALLOWS a command-less event (its `decide`), because matching ALL Bash means it
+// also fires for BashOutput, whose events legitimately carry no command — blocking
+// there would wedge the session. This hook's matcher routes EXACTLY ONE tool
+// (mcp__kanban__create_ticket), so an absent tool_name can only be the routed create
+// call: blocking it costs that one tool and nothing else. REACH is what makes the
+// two differ — not one of them taking "I cannot tell" less seriously than the other.
+// (A guard that can't check must never return the permissive answer.)
 //
 // Protocol: read the hook payload as JSON on stdin, inspect `tool_name`. Exit 0
 // to allow; exit 2 to block (stderr is surfaced to Claude so it self-corrects).
