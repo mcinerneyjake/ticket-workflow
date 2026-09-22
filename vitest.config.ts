@@ -9,9 +9,29 @@ export default defineConfig({
     // than replace them; .claude/worktrees/ can hold full second checkouts whose suites would
     // double-collect.
     exclude: [...configDefaults.exclude, 'dist/**', '.claude/worktrees/**'],
+    // ONE worker, deliberately. Most suites here reach a `child_process` spawn — directly, or
+    // through `defaultExec` in `src/audit/types.ts` — and concurrent spawn-heavy files starve each
+    // other past `testTimeout` while the machine looks idle. Measured solo on 14 cores, same
+    // commit (tkt-2eb570851bad): 13 workers -> 20 failures; 3 -> 1; 2 -> 1 on a DIFFERENT test;
+    // 1 -> 0. Every failure was a 20s timeout or a `probeMcp` budget expiry, never an assertion,
+    // and each victim passed alone.
+    //
+    // The moving victim at 2 and 3 is why this is 1 and not a tuned number: any co-running worker
+    // inflates `src/audit/audit.test.ts` (104s alone, 173s at 3) past the timeout. At 1 no two
+    // FILES overlap — but note `maxWorkers` bounds files, not tests within one, so an
+    // `it.concurrent` in a spawn-heavy suite would reintroduce the overlap. None uses it today.
+    //
+    // Unconditional, deliberately: CI's only test leg, the husky pre-commit hook and watch mode all
+    // serialize too. One code path beats a `process.env.CI` branch that no local run exercises.
+    // Costs ~46s of wall clock here (238s vs 192s, against a baseline that was RED). The gain is
+    // not fewer CPU-seconds — roughly the same work spread wider — it is holding ONE core instead
+    // of 13, which is what stops a run here starving the other agent sessions on this machine.
+    // Raising `testTimeout` instead would mask the contention rather than remove it.
+    maxWorkers: 1,
     // The audit/init suites spawn real subprocesses (the repo's own tsc, git); under a loaded
     // machine a multi-audit test measured >5s purely from contention, failing as a timeout while
     // passing in isolation — a false negative about the code. 20s still catches a genuine hang.
+    // Raising it further would mask oversubscription rather than fix it; maxWorkers is the lever.
     testTimeout: 20_000,
     coverage: {
       provider: 'v8',
