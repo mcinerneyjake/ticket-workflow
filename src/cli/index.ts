@@ -15,6 +15,7 @@ import { createWorktree, branchName, PREFIX_BY_TYPE } from '../worktree/create.j
 import { provisionFailed, provisionWorktree } from '../worktree/provision.js';
 import { sweep } from '../vacuous/probe.js';
 import { checkRoot, vacuousExitCode, EXIT as VACUOUS_EXIT } from '../vacuous/ratchet.js';
+import { cmdTestContention } from './contention.js';
 
 // Lightweight per-repo board viewer. Resolves the board from the cwd/
 // CLAUDE_PROJECT_DIR (see paths.ts), so it shows whichever repo it runs in.
@@ -435,6 +436,9 @@ export async function main(): Promise<void> {
     case 'test-slots':
       cmdTestSlots(rest);
       break;
+    case 'test-contention':
+      await cmdTestContention(rest);
+      break;
     case 'show': {
       const id = rest[0];
       if (id === undefined) throw new Error('usage: ticket-workflow show <id>');
@@ -445,7 +449,7 @@ export async function main(): Promise<void> {
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
           'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json] | ' +
-          'vacuous <path> [--check] | test-slots [status|clear-stale] [--json] | ' +
+          'vacuous <path> [--check] | test-slots [status|clear-stale] [--json] | test-contention [--runs <N>] [--control] | ' +
           'worktree <ticket-id> [--branch <name>] [--base <ref>] [--name <dir>] [--repo <path>]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;

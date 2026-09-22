@@ -1,0 +1,460 @@
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  armResult,
+  cmdTestContention,
+  CONTENTION_EXIT,
+  contentionStateDir,
+  decide,
+  contentionShaped,
+  defaultGit,
+  defaultOnSignal,
+  defaultProcessList,
+  defaultRunTest,
+  foreignVitest,
+  formatTable,
+  localDay,
+  parseContentionArgs,
+  parseHistory,
+  parseReport,
+  runContention,
+  summarizeRun,
+  type ContentionDeps,
+  type GitResult,
+  type HistoryEntry,
+  type RunOutcome,
+} from './contention.js';
+
+const tempDirs: string[] = [];
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
+}
+
+function report(files: { name: string; failed?: string[]; fileMessage?: string }[]): string {
+  return JSON.stringify({
+    success: files.every((f) => (f.failed ?? []).length === 0 && f.fileMessage === undefined),
+    testResults: files.map((f) => ({
+      name: f.name,
+      status: (f.failed ?? []).length > 0 || f.fileMessage !== undefined ? 'failed' : 'passed',
+      message: f.fileMessage ?? '',
+      assertionResults: (f.failed ?? []).map((m) => ({ status: 'failed', failureMessages: [m] })),
+    })),
+  });
+}
+
+const green = (index: number, slots: number | null = 2): RunOutcome => ({ kind: 'determined', index, exitCode: 0, green: true, files: [], slots });
+const red = (index: number, slots: number | null = 2): RunOutcome => ({
+  kind: 'determined',
+  index,
+  exitCode: 1,
+  green: false,
+  files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1 }],
+  slots,
+});
+
+const control = (over: Partial<HistoryEntry> = {}): HistoryEntry => ({
+  version: 1,
+  repo: 'r',
+  root: '/r',
+  arm: 'control',
+  runs: 4,
+  day: '2026-09-22',
+  at: '2026-09-22T10:00:00.000Z',
+  head: 'abcdef1234',
+  result: 'red',
+  ...over,
+});
+
+describe('parseContentionArgs', () => {
+  it('defaults to four bounded runs', () => {
+    expect(parseContentionArgs([])).toEqual({ runs: 4, control: false });
+  });
+  it('reads --runs and --control', () => {
+    expect(parseContentionArgs(['--runs', '3', '--control'])).toEqual({ runs: 3, control: true });
+  });
+  it.each([[['--runs']], [['--runs', '1']], [['--runs', '2.5']], [['--runs', 'x']], [['--verbose']], [['4']]])('rejects %j', (args) => {
+    expect(parseContentionArgs(args)).toHaveProperty('error');
+  });
+});
+
+describe('foreignVitest', () => {
+  const self = '    1     0 node ticket-workflow test-contention';
+  it('matches the vitest entrypoint and its workers outside our process tree', () => {
+    const ps = [
+      self,
+      '  101    50 node /repo/node_modules/.bin/vitest run',
+      '  102   101 /usr/bin/node /repo/node_modules/vitest/dist/workers/forks.js',
+      '  103    50 node /repo/node_modules/vitest/vitest.mjs run',
+    ].join('\n');
+    expect(foreignVitest(ps, 1)).toHaveLength(3);
+  });
+  it('ignores our own descendants, however deep', () => {
+    const ps = [self, '   10     1 npm test', '   11    10 sh -c vitest run', '   12    11 node /wt/node_modules/.bin/vitest run', '   13    12 node /p/node_modules/vitest/dist/workers/forks.js'].join('\n');
+    expect(foreignVitest(ps, 1)).toEqual([]);
+  });
+  it('ignores processes that merely mention vitest', () => {
+    const ps = [self, '  201     5 /bin/zsh -c pgrep -fl vitest', '  202     5 rg vitest src', '  203     5 node /repo/node_modules/.bin/vitestish', ''].join('\n');
+    expect(foreignVitest(ps, 1)).toEqual([]);
+  });
+  it('cannot vouch for a list that does not contain this process', () => {
+    expect(foreignVitest('  101    50 node /repo/node_modules/.bin/vitest run', 1)).toBeNull();
+    expect(foreignVitest('', 1)).toBeNull();
+  });
+});
+
+describe('parseReport', () => {
+  it('counts failing tests and timeouts per file, relative to the worktree', () => {
+    const text = report([
+      { name: '/wt/run-1/src/a.test.ts', failed: ['Error: Test timed out in 20000ms.', 'AssertionError: expected 1'] },
+      { name: '/wt/run-1/src/b.test.ts' },
+    ]);
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 1 }] });
+  });
+  it('counts a file that failed with no failing test, e.g. a hook timeout', () => {
+    const text = report([{ name: '/private/wt/src/c.test.ts', fileMessage: 'Hook timed out in 10000ms.' }]);
+    expect(parseReport(text, ['/wt', '/private/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1 }] });
+  });
+  it.each([
+    ['not JSON', '{'],
+    ['no success', JSON.stringify({ testResults: [] })],
+    ['no testResults', JSON.stringify({ success: true })],
+    ['a nameless entry', JSON.stringify({ success: true, testResults: [{ status: 'passed' }] })],
+  ])('refuses %s', (_label, text) => {
+    expect(typeof parseReport(text, [])).toBe('string');
+  });
+});
+
+describe('summarizeRun', () => {
+  it('is undetermined with no report', () => {
+    expect(summarizeRun({ index: 0, exitCode: 75, report: null, log: '', roots: [] }).kind).toBe('undetermined');
+  });
+  it('reads the slot bound from the hold line', () => {
+    const r = summarizeRun({ index: 0, exitCode: 0, report: report([]), log: '[test-run] slot 2/3 · TMPDIR=/t', roots: [] });
+    expect(r).toMatchObject({ kind: 'determined', green: true, slots: 3 });
+  });
+  it('is red when the run exits non-zero with every file passing', () => {
+    const r = summarizeRun({ index: 0, exitCode: 1, report: report([{ name: '/a.test.ts' }]), log: '', roots: [] });
+    expect(r).toMatchObject({ kind: 'determined', green: false, slots: null });
+    expect(formatTable([r]).join('\n')).toContain('<run exited 1 with no failing file>');
+  });
+});
+
+describe('armResult', () => {
+  it('never reads zero runs as green', () => {
+    expect(armResult([])).toBe('undetermined');
+  });
+  it('is undetermined if any run is', () => {
+    expect(armResult([green(0), { kind: 'undetermined', index: 1, exitCode: null, reason: 'x', slots: null }])).toBe('undetermined');
+  });
+});
+
+describe('decide — bounded arm', () => {
+  const base = { arm: 'bounded' as const, n: 4, root: '/r', head: 'abcdef1234', today: '2026-09-22', contaminated: [] };
+  const allGreen = [0, 1, 2, 3].map((i) => green(i));
+  const oneRed = [green(0), green(1), green(2), red(3)];
+
+  it('passes green runs against a same-day red control', () => {
+    const d = decide({ ...base, runs: allGreen, history: [control()] });
+    expect(d.exit).toBe(CONTENTION_EXIT.PASS);
+    expect(d.lines.join('\n')).toContain('PASS');
+  });
+  it('fails red runs against a same-day red control', () => {
+    expect(decide({ ...base, runs: oneRed, history: [control()] }).exit).toBe(CONTENTION_EXIT.FAIL);
+  });
+  it.each([
+    ['no control at all', []],
+    ['a control from yesterday', [control({ day: '2026-09-21' })]],
+    ['a control at a different N', [control({ runs: 2 })]],
+    ['a control for another checkout', [control({ root: '/other' })]],
+    ['a control at another commit', [control({ head: '0123456789' })]],
+    ['a green control', [control({ result: 'green' })]],
+    ['an undetermined control', [control({ result: 'undetermined' })]],
+    ['only a bounded record', [control({ arm: 'bounded' })]],
+  ])('withholds the verdict with %s', (_label, history) => {
+    expect(decide({ ...base, runs: allGreen, history }).exit).toBe(CONTENTION_EXIT.NO_VERDICT);
+    expect(decide({ ...base, runs: oneRed, history }).exit).toBe(CONTENTION_EXIT.NO_VERDICT);
+  });
+  it('withholds the verdict when a foreign vitest ran during the arm', () => {
+    const d = decide({ ...base, runs: allGreen, history: [control()], contaminated: ['  9 1 node /x/node_modules/.bin/vitest run'] });
+    expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+  });
+  it('withholds the verdict when a run held no slot', () => {
+    const runs = [green(0), green(1), green(2), green(3, null)];
+    expect(decide({ ...base, runs, history: [control()] }).exit).toBe(CONTENTION_EXIT.NO_VERDICT);
+  });
+  it('withholds the verdict when K admits every run', () => {
+    const runs = [0, 1, 2, 3].map((i) => green(i, 4));
+    expect(decide({ ...base, runs, history: [control()] }).exit).toBe(CONTENTION_EXIT.NO_VERDICT);
+  });
+  it('withholds the verdict when runs disagree on K', () => {
+    const runs = [green(0, 2), green(1, 2), green(2, 3), green(3, 2)];
+    expect(decide({ ...base, runs, history: [control()] }).exit).toBe(CONTENTION_EXIT.NO_VERDICT);
+  });
+  it('withholds the verdict when a run is undetermined', () => {
+    const runs: RunOutcome[] = [green(0), green(1), green(2), { kind: 'undetermined', index: 3, exitCode: 75, reason: 'no report', slots: 2 }];
+    expect(decide({ ...base, runs, history: [control()] }).exit).toBe(CONTENTION_EXIT.NO_VERDICT);
+  });
+});
+
+describe('decide — control arm', () => {
+  const base = { arm: 'control' as const, n: 2, root: '/r', head: 'abcdef1234', today: '2026-09-22', history: [], contaminated: [] };
+  it('exits 0 and records red when the control reproduces contention', () => {
+    expect(decide({ ...base, runs: [red(0, null), green(1, null)] })).toMatchObject({ exit: CONTENTION_EXIT.PASS, recorded: 'red' });
+  });
+  it('rejects a control red on an assertion: HEAD is broken, not contended', () => {
+    const broken: RunOutcome = { kind: 'determined', index: 0, exitCode: 1, green: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0 }], slots: null };
+    expect(decide({ ...base, runs: [broken, red(1, null)] })).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+  });
+  it('exits 2 when the control stays green: no instrument', () => {
+    expect(decide({ ...base, runs: [green(0, 2), green(1, 2)] }).lines.join('')).toContain('CONTROL GREEN');
+    expect(decide({ ...base, runs: [green(0, 2), green(1, 2)] }).exit).toBe(CONTENTION_EXIT.NO_VERDICT);
+  });
+  it('exits 2, and never records red, when a control run was still bounded below N', () => {
+    expect(decide({ ...base, runs: [red(0, 1), red(1, 1)] })).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+  });
+});
+
+describe('contentionShaped', () => {
+  it('needs at least one failure, all of them timeouts', () => {
+    expect(contentionShaped([red(0)])).toBe(true);
+    expect(contentionShaped([green(0)])).toBe(false);
+    expect(contentionShaped([{ kind: 'determined', index: 0, exitCode: 1, green: false, files: [{ file: 'x', failed: 2, timeouts: 1 }], slots: null }])).toBe(false);
+  });
+});
+
+describe('parseHistory and localDay', () => {
+  it('keeps well-formed entries and skips the rest', () => {
+    const rootless = { ...control(), root: undefined }; // JSON.stringify drops the key
+    const text = [JSON.stringify(control()), '{', JSON.stringify({ ...control(), result: 'maybe' }), JSON.stringify(rootless), '', JSON.stringify(control({ runs: 2 }))].join('\n');
+    expect(parseHistory(text).map((h) => h.runs)).toEqual([4, 2]);
+  });
+  it('uses the local calendar day, not UTC', () => {
+    expect(localDay(new Date(2026, 8, 22, 23, 59))).toBe('2026-09-22');
+    expect(localDay(new Date(2026, 0, 1, 0, 0))).toBe('2026-01-01');
+  });
+});
+
+// End to end over real git worktrees and a real `npm test`, which runs a stub instead of vitest: it
+// logs a hold line, writes a vitest-shaped JSON report and exits per STUB_* env.
+const STUB = `
+import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+const out = process.argv.find((a) => a.startsWith('--outputFile='))?.slice('--outputFile='.length);
+const control = process.env.TEST_SLOTS !== undefined;
+const mode = (control ? process.env.STUB_CONTROL : process.env.STUB_BOUNDED) ?? 'green';
+if (process.env.STUB_TRACE) appendFileSync(process.env.STUB_TRACE, process.cwd() + ' ' + existsSync('node_modules/marker') + '\\n');
+console.error('[test-run] slot 1/' + (process.env.TEST_SLOTS ?? '1') + ' · TMPDIR=x');
+await new Promise((r) => setTimeout(r, 100));
+if (mode === 'noreport') process.exit(75);
+const bad = mode === 'red';
+const file = (n, failed) => ({ name: path.join(process.cwd(), n), status: failed ? 'failed' : 'passed', message: '',
+  assertionResults: [{ status: failed ? 'failed' : 'passed', failureMessages: failed ? ['Error: Test timed out in 20000ms.'] : [] }] });
+writeFileSync(out, JSON.stringify({ success: !bad, testResults: [file('src/a.test.ts', bad), file('src/b.test.ts', false)] }));
+process.exit(bad ? 1 : 0);
+`;
+
+/** A git runner that cannot reach the enclosing repo through a hook-exported GIT_DIR. */
+function scrubbedEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  for (const k of ['GIT_DIR', 'GIT_INDEX_FILE', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_PREFIX', 'TEST_SLOTS', 'CI']) delete env[k];
+  return env;
+}
+
+function git(args: readonly string[], cwd: string): GitResult {
+  const r = spawnSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd, encoding: 'utf8', env: scrubbedEnv() });
+  return { ok: r.status === 0, stdout: r.stdout ?? '', stderr: r.stderr ?? '' };
+}
+
+function stubRepo(): string {
+  const repo = tempDir('tw-contention-repo-');
+  writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ name: 'stub-repo', private: true, scripts: { test: 'node stub.mjs' } }));
+  writeFileSync(path.join(repo, 'stub.mjs'), STUB);
+  writeFileSync(path.join(repo, '.gitignore'), 'node_modules\n');
+  mkdirSync(path.join(repo, 'node_modules'));
+  writeFileSync(path.join(repo, 'node_modules', 'marker'), '');
+  for (const args of [['init', '-q'], ['add', '.'], ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init']]) {
+    const r = git(args, repo);
+    if (!r.ok) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+  }
+  return repo;
+}
+
+const SELF = '    1     0 node ticket-workflow test-contention';
+const FOREIGN = `${SELF}\n    9     2 node /x/node_modules/.bin/vitest run`;
+
+function deps(repo: string, stateDir: string, over: Partial<ContentionDeps> & { stub?: NodeJS.ProcessEnv } = {}): ContentionDeps & { out: string[] } {
+  const out: string[] = [];
+  return {
+    cwd: repo,
+    env: scrubbedEnv(over.stub),
+    tmpRoot: tempDir('tw-contention-wt-'),
+    stateDir,
+    pid: 1,
+    pollMs: 20,
+    now: () => new Date(2026, 8, 22, 12, 0),
+    git,
+    processList: () => SELF,
+    runTest: defaultRunTest,
+    onSignal: () => () => {},
+    exit: () => {},
+    log: (l) => out.push(l),
+    err: (l) => out.push(`ERR ${l}`),
+    ...over,
+    out,
+  };
+}
+
+function worktreeCount(repo: string): number {
+  return git(['worktree', 'list', '--porcelain'], repo).stdout.split('\n').filter((l) => l.startsWith('worktree ')).length;
+}
+
+describe('runContention end to end (stub npm test)', () => {
+  it('records a red control, then passes a green bounded arm against it, leaving no worktree behind', async () => {
+    const repo = stubRepo();
+    const stateDir = tempDir('tw-contention-state-');
+    const trace = path.join(stateDir, 'trace');
+    const stub = { STUB_CONTROL: 'red', STUB_BOUNDED: 'green', STUB_TRACE: trace };
+
+    const gitCalls: string[][] = [];
+    const envs: NodeJS.ProcessEnv[] = [];
+    const spy = {
+      git: (args: readonly string[], cwd: string) => {
+        gitCalls.push([...args]);
+        return git(args, cwd);
+      },
+      runTest: (o: Parameters<ContentionDeps['runTest']>[0]) => {
+        envs.push(o.env);
+        return defaultRunTest(o);
+      },
+    };
+    const sha = git(['rev-parse', 'HEAD'], repo).stdout.trim();
+
+    const c = deps(repo, stateDir, { stub, ...spy });
+    expect(await runContention({ runs: 2, control: true }, c)).toBe(CONTENTION_EXIT.PASS);
+    expect(c.out.join('\n')).toContain('CONTROL RED');
+    expect(c.out.join('\n')).toMatch(/src\/a\.test\.ts\s+2\/2\s+2/);
+
+    const b = deps(repo, stateDir, { stub, ...spy });
+    expect(await runContention({ runs: 2, control: false }, b)).toBe(CONTENTION_EXIT.PASS);
+    expect(b.out.join('\n')).toContain('PASS: 2 runs green at K=1');
+
+    const adds = gitCalls.filter((a) => a[0] === 'worktree' && a[1] === 'add');
+    expect(adds).toHaveLength(4);
+    expect(adds.every((a) => a.at(-1) === sha)).toBe(true);
+    expect(envs.map((e) => e.TEST_SLOTS)).toEqual(['2', '2', undefined, undefined]);
+    expect(envs.every((e) => e.TEST_SLOTS_WAIT_MS === String(2 * 30 * 60_000))).toBe(true);
+
+    const cwds = readFileSync(trace, 'utf8').trim().split('\n');
+    expect(cwds).toHaveLength(4);
+    expect(new Set(cwds).size).toBe(4);
+    expect(cwds.every((l) => l.endsWith(' true'))).toBe(true);
+    expect(worktreeCount(repo)).toBe(1);
+    expect(parseHistory(readFileSync(path.join(stateDir, 'history.jsonl'), 'utf8')).map((h) => `${h.arm}:${h.result}`)).toEqual(['control:red', 'bounded:green']);
+  });
+
+  it('withholds the verdict when a run writes no report, and still removes every worktree', async () => {
+    const repo = stubRepo();
+    const stateDir = tempDir('tw-contention-state-');
+    const d = deps(repo, stateDir, { stub: { STUB_BOUNDED: 'noreport' } });
+    expect(await runContention({ runs: 2, control: false }, d)).toBe(CONTENTION_EXIT.NO_VERDICT);
+    expect(d.out.join('\n')).toContain('UNDETERMINED');
+    expect(worktreeCount(repo)).toBe(1);
+  });
+
+  it.each([
+    ['a live foreign vitest', () => FOREIGN],
+    ['an unreadable process list', () => null],
+    ['a process list without this process', () => '    9     2 node something'],
+  ])('refuses to start with %s, creating nothing', async (_label, processList) => {
+    const repo = stubRepo();
+    const stateDir = tempDir('tw-contention-state-');
+    const d = deps(repo, stateDir, { processList });
+    expect(await runContention({ runs: 2, control: false }, d)).toBe(CONTENTION_EXIT.NO_VERDICT);
+    expect(d.out.join('\n')).toContain('ERR refused');
+    expect(worktreeCount(repo)).toBe(1);
+    expect(existsSync(path.join(stateDir, 'history.jsonl'))).toBe(false);
+  });
+});
+
+describe('runContention mid-run', () => {
+  it('withholds the verdict when a foreign vitest appears during the runs', async () => {
+    const repo = stubRepo();
+    const stateDir = tempDir('tw-contention-state-');
+    let calls = 0;
+    const d = deps(repo, stateDir, { processList: () => (++calls === 1 ? SELF : FOREIGN) });
+    expect(await runContention({ runs: 2, control: true }, d)).toBe(CONTENTION_EXIT.NO_VERDICT);
+    expect(d.out.join('\n')).toContain('foreign vitest ran during the arm');
+    expect(parseHistory(readFileSync(path.join(stateDir, 'history.jsonl'), 'utf8')).map((h) => h.result)).toEqual(['undetermined']);
+  });
+
+  it('removes every worktree on SIGINT and exits 130', async () => {
+    const repo = stubRepo();
+    const stateDir = tempDir('tw-contention-state-');
+    let handler: ((s: 'SIGINT' | 'SIGTERM') => void) | undefined;
+    let unregistered = false;
+    const exits: number[] = [];
+    let atSignal = -1;
+    const d = deps(repo, stateDir, {
+      onSignal: (fn) => {
+        handler = fn;
+        return () => {
+          unregistered = true;
+        };
+      },
+      exit: (code) => exits.push(code),
+      runTest: async () => {
+        handler?.('SIGINT');
+        atSignal = worktreeCount(repo);
+        return null;
+      },
+    });
+    await runContention({ runs: 2, control: false }, d);
+    expect(atSignal).toBe(1);
+    expect(exits).toEqual([130, 130]);
+    expect(unregistered).toBe(true);
+    expect(d.out.join('\n')).toContain('interrupted by SIGINT');
+  });
+});
+
+describe('the real process list, git and CLI entry', () => {
+  it('registers and removes its signal handlers', () => {
+    const before = process.listenerCount('SIGINT') + process.listenerCount('SIGTERM');
+    const off = defaultOnSignal(() => {});
+    expect(process.listenerCount('SIGINT') + process.listenerCount('SIGTERM')).toBe(before + 2);
+    off();
+    expect(process.listenerCount('SIGINT') + process.listenerCount('SIGTERM')).toBe(before);
+  });
+  it('reads a real process list that foreignVitest can vouch for', () => {
+    const ps = defaultProcessList();
+    expect(ps).not.toBeNull();
+    expect(foreignVitest(ps ?? '', process.pid)).not.toBeNull();
+  });
+  it('reports a git failure outside a work tree', () => {
+    expect(defaultGit(['rev-parse', '--show-toplevel'], tempDir('tw-contention-nogit-')).ok).toBe(false);
+  });
+  it('keeps its state under ~/.claude/state unless TEST_CONTENTION_DIR says otherwise', () => {
+    expect(contentionStateDir({})).toMatch(/\.claude[\\/]state[\\/]test-contention$/);
+    expect(contentionStateDir({ TEST_CONTENTION_DIR: '/x' })).toBe('/x');
+  });
+  it('exits 2 on a usage error without running anything', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const before = process.exitCode;
+    try {
+      await cmdTestContention(['--runs', '1']);
+      expect(process.exitCode).toBe(CONTENTION_EXIT.NO_VERDICT);
+      expect(errSpy.mock.calls.flat().join('')).toContain('usage: ticket-workflow test-contention');
+    } finally {
+      process.exitCode = before;
+      errSpy.mockRestore();
+    }
+  });
+});
