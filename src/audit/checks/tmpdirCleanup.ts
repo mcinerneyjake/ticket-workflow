@@ -343,6 +343,12 @@ function describe(leak: Leak): string {
  * Scope is test files: they own their fixtures' lifecycle. Production code that creates a tmpdir
  * scratch directory (this repo's own gitignore and tsconfig-strict checks do) is deliberately out,
  * because a library returning a temp directory for its CALLER to remove is not a leak.
+ *
+ * A PASS is not "this repo leaks nothing": only `mkdtemp`/`mkdtempSync` is matched, so a directory
+ * built by `mkdirSync` under a computed name is invisible here. That is not hypothetical — the
+ * fleet's single largest pile is hardpack's pid-keyed `mkdirSync` in test-support/vitest.setup.ts
+ * (11,277 directories, measured 2026-09-22), which this check cannot see. Weigh that before reading
+ * a clean fleet as grounds for promoting this to gating (tkt-5d922d998de4).
  */
 export const tmpdirCleanup: AuditCheck = {
   id: 'tmpdir-cleanup',
