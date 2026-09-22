@@ -59,4 +59,12 @@ describe('the vitest config keeps the settings the serial cap depends on', () =>
     // Splitting is allowed; this is the reminder that each project must restate them.
     expect(Object.keys(config.test ?? {})).not.toContain('projects');
   });
+
+  it('releases the test-run slot through the globalSetup, which is excluded from coverage', () => {
+    // The acquire is a top-level await this test cannot see (tmpdir.reach pins it end to end).
+    const declared = config.test?.globalSetup;
+    const globalSetup = typeof declared === 'string' ? [declared] : (declared ?? []);
+    expect(globalSetup).toContain('./src/test-run/globalSetup.ts');
+    expect(config.test?.coverage?.exclude ?? []).toContain('src/test-run/globalSetup.ts');
+  });
 });

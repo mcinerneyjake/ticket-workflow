@@ -20,6 +20,10 @@
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     },
+    "./test-run": {
+      "types": "./dist/test-run/index.d.ts",
+      "default": "./dist/test-run/index.js"
+    },
     "./hooks/guard-bash.mjs": "./hooks/guard-bash.mjs",
     "./hooks/guard-review-target.mjs": "./hooks/guard-review-target.mjs",
     "./hooks/guard-subagent-gates.mjs": "./hooks/guard-subagent-gates.mjs",

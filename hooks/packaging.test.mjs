@@ -186,8 +186,13 @@ describe('hooks/ packaging contract', () => {
     const keys = Object.keys(pkg.exports);
     // Pinned OUTSIDE the loop: an emptied `exports` map contains no wildcard and no test file, so it
     // satisfies every assertion below while exporting nothing at all. The count is the real claim —
-    // one subpath per hook, plus the root entry, and no fourth kind of export nobody reviewed.
-    expect(keys).toHaveLength(hookFiles.length + 1);
+    // one subpath per hook plus the non-hook entries reviewed by name here, and nothing else.
+    const NON_HOOK_EXPORTS = ['.', './test-run'];
+    expect(keys).toHaveLength(hookFiles.length + NON_HOOK_EXPORTS.length);
+    for (const key of NON_HOOK_EXPORTS) {
+      expect(pkg.exports[key]?.default).toMatch(/^\.\/dist\//);
+      expect(pkg.exports[key]?.types).toMatch(/^\.\/dist\/.*\.d\.ts$/);
+    }
     for (const key of keys) {
       expect(key).not.toContain('*');
       expect(key).not.toContain('.test.');
