@@ -14,6 +14,7 @@ import { tsconfigStrict } from './checks/tsconfigStrict.js';
 import { vitestCoverage } from './checks/vitestCoverage.js';
 import { vitestCollection } from './checks/vitestCollection.js';
 import { nodeVersionSync } from './checks/nodeVersionSync.js';
+import { npmVersion } from './checks/npmVersion.js';
 import { pinParity } from './checks/pinParity.js';
 import { pinFreshness } from './checks/pinFreshness.js';
 import { loadRepoConfig, CONFIG_FILE } from './config.js';
@@ -40,6 +41,7 @@ export const AUDIT_CHECKS: readonly AuditCheck[] = [
   vitestCoverage,
   vitestCollection,
   nodeVersionSync,
+  npmVersion,
 ];
 
 /** Prefixes the detail of a check that THREW (as opposed to one that answered BLOCKED). One shared
