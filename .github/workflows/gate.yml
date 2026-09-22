@@ -37,6 +37,12 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
 
+      # `.npmrc`'s engine-strict makes whichever npm this runner bundles a gate-critical input, and
+      # nothing here pins it — the runner image's cached Node decides. Checked before `npm ci` so a
+      # runner below `engines.npm` fails by name instead of as an opaque mid-install EBADENGINE.
+      # Not a pin on purpose: running stock Node 24 is what proves the floor is still satisfiable for
+      # consumers, who inherit .npmrc (tkt-61ec9c048684). Pinned by ci.npm.test.mjs.
+      - run: node scripts/checkCiNpm.mjs
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
