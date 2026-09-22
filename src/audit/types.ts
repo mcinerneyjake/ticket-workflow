@@ -12,14 +12,23 @@ export interface AuditResult {
   /** One line. For fail/blocked, say what to do about it. */
   readonly detail: string;
   /**
-   * Advisory results are always reported but never move the exit code. Three checks use it, all for
-   * answers that are not conformance facts about the audited repo: hook-arming (machine-local
-   * wiring is invisible from a repository, so PASS is unreachable and gating would redden every CI
-   * forever), pin-freshness (a newer tag upstream is an upgrade backlog, and gating on it would
-   * fail every open PR in an untouched repo the moment someone cuts a tag elsewhere) and npm-version
-   * (the INSTALLED npm is a property of the machine, so CI would be grading its own runner rather
-   * than the repo). Everything else that cannot be determined still fails the gate — "can't check"
-   * is not conformance.
+   * Advisory results are always reported but never move the exit code. Four checks use it. Three
+   * are advisory because their answer is not a conformance fact about the audited repo at all:
+   * hook-arming (machine-local wiring is invisible from a repository, so PASS is unreachable and
+   * gating would redden every CI forever), pin-freshness (a newer tag upstream is an upgrade
+   * backlog, and gating on it would fail every open PR in an untouched repo the moment someone cuts
+   * a tag elsewhere) and npm-version (the INSTALLED npm is a property of the machine, so CI would
+   * be grading its own runner rather than the repo).
+   *
+   * tmpdir-cleanup is the deliberate exception, not a fourth instance: whether a repo removes its
+   * own test fixtures IS a conformance fact about it. It is advisory for blast radius
+   * (tkt-91002085c4fd) — every node-tier consumer fails it today, so gating would redden every open
+   * PR in the fleet on a diff that changed nothing. Promotion to gating is a separate decision once
+   * the fleet is clean, and adding a fifth advisory check on THIS precedent needs the same argument
+   * made explicitly rather than inherited.
+   *
+   * Everything else that cannot be determined still fails the gate — "can't check" is not
+   * conformance.
    */
   readonly advisory: boolean;
 }
