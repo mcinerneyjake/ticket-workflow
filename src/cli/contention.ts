@@ -69,6 +69,8 @@ export interface FileFailure {
   readonly file: string;
   readonly failed: number;
   readonly timeouts: number;
+  /** Failing tests with a timeout beside some other error. Undecidable from the report, so never contention-shaped. */
+  readonly mixed: readonly string[];
 }
 
 export type RunOutcome =
@@ -113,18 +115,23 @@ export function parseReport(text: string, root: readonly string[]): { readonly s
     const assertions: unknown[] = 'assertionResults' in tr && Array.isArray(tr.assertionResults) ? tr.assertionResults : [];
     let failed = 0;
     let timeouts = 0;
+    const mixed: string[] = [];
     for (const a of assertions) {
       if (!isObject(a) || !('status' in a) || a.status !== 'failed') continue;
       failed++;
       const messages: unknown[] = 'failureMessages' in a && Array.isArray(a.failureMessages) ? a.failureMessages : [];
-      if (messages.some((m) => typeof m === 'string' && isTimeoutMessage(m))) timeouts++;
+      const timedOut = messages.filter((m) => typeof m === 'string' && isTimeoutMessage(m)).length;
+      if (timedOut === 0) continue;
+      timeouts++;
+      // A timeout's own cleanup error and a real bug beside it read identically, so fail closed (tkt-ea601ec924ed).
+      if (timedOut < messages.length) mixed.push('fullName' in a && typeof a.fullName === 'string' ? a.fullName : '<unnamed test>');
     }
     // A file can fail with no failing test: an import error, or a hook that timed out.
     if (failed === 0) {
       failed = 1;
       if ('message' in tr && typeof tr.message === 'string' && isTimeoutMessage(tr.message)) timeouts = 1;
     }
-    files.push({ file: relativeTo(tr.name, root), failed, timeouts });
+    files.push({ file: relativeTo(tr.name, root), failed, timeouts, mixed });
   }
   return { success: raw.success, files };
 }
@@ -160,7 +167,7 @@ export function summarizeRun(input: {
   if (typeof parsed === 'string') return { kind: 'undetermined', index, exitCode, slots, reason: parsed };
   // A non-zero exit with every file passing (a coverage threshold, a teardown error) is still red.
   const files =
-    exitCode !== 0 && parsed.files.length === 0 ? [{ file: `<run exited ${exitCode ?? 'by signal'} with no failing file>`, failed: 1, timeouts: 0 }] : parsed.files;
+    exitCode !== 0 && parsed.files.length === 0 ? [{ file: `<run exited ${exitCode ?? 'by signal'} with no failing file>`, failed: 1, timeouts: 0, mixed: [] }] : parsed.files;
   return { kind: 'determined', index, exitCode, slots, files, green: exitCode === 0 && parsed.success && files.length === 0 };
 }
 
@@ -212,7 +219,24 @@ export function armResult(runs: readonly RunOutcome[]): ArmResult {
 /** Every failure a timeout — the contention signature. An assertion failure means HEAD is red on its own. */
 export function contentionShaped(runs: readonly RunOutcome[]): boolean {
   const files = runs.flatMap((r) => (r.kind === 'determined' ? r.files : []));
-  return files.length > 0 && files.every((f) => f.failed > 0 && f.timeouts === f.failed);
+  return files.length > 0 && files.every((f) => f.failed > 0 && f.timeouts === f.failed && f.mixed.length === 0);
+}
+
+/** Each mixed test once across runs; `(×k)` when k distinct tests in one run share that name. */
+export function mixedTests(runs: readonly RunOutcome[]): string[] {
+  const most = new Map<string, number>();
+  for (const r of runs) {
+    if (r.kind !== 'determined') continue;
+    const inRun = new Map<string, number>();
+    for (const f of r.files) {
+      for (const t of f.mixed) {
+        const key = `${f.file} › ${t.replace(/\r?\n/g, '\\n')}`;
+        inRun.set(key, (inRun.get(key) ?? 0) + 1);
+      }
+    }
+    for (const [key, k] of inRun) most.set(key, Math.max(most.get(key) ?? 0, k));
+  }
+  return [...most].map(([key, k]) => (k > 1 ? `${key} (×${k})` : key));
 }
 
 export interface HistoryEntry {
@@ -295,7 +319,16 @@ export function decide(input: {
       };
     }
     if (!contentionShaped(runs)) {
-      return noVerdict('NO VERDICT: the control failed on something other than timeouts, so HEAD is red on its own — fix that first.');
+      const mixed = mixedTests(runs);
+      const headRed = runs.some((r) => r.kind === 'determined' && r.files.some((f) => f.timeouts < f.failed));
+      const lines: string[] = [];
+      if (headRed || mixed.length === 0) lines.push('NO VERDICT: the control failed on something other than timeouts, so HEAD is red on its own — fix that first.');
+      if (mixed.length > 0) {
+        lines.push(
+          `NO VERDICT: these tests timed out beside another error or an unreadable report entry — a cleanup that assumes setup finished, or a real bug; the report cannot tell which:\n  ${mixed.join('\n  ')}`,
+        );
+      }
+      return { exit: CONTENTION_EXIT.NO_VERDICT, lines, recorded: 'undetermined' };
     }
     return { exit: CONTENTION_EXIT.PASS, recorded: 'red', lines: [`CONTROL RED: contention reproduced at N=${n}. Now run the bounded arm: test-contention --runs ${n}`] };
   }
