@@ -16,6 +16,19 @@ It ships three pieces:
   by mistyping a field on an ordinary edit, and the tool stays out of any
   name-allowlisted agent toolset. It is reversible — `update_ticket` back to
   `backlog`, and `list_tickets` with `status: "archived"` to find it again.
+
+  `start_ticket` **refuses a ticket that is already `in-progress`**, since
+  another session may be working it: the error carries the ticket's last
+  `## Checkpoint` block and the ticket is not modified. Call it again with
+  `force: true` only when the branch or worktree that checkpoint names is
+  yours, or its holder is gone — a clean `git status` is not evidence either
+  way. Resuming your own ticket after a `/clear` therefore needs `force`. The
+  check is serialized within one MCP server process only, so two sessions (each
+  with its own server) starting the same free ticket at the same instant can
+  both succeed. A refused start has still **armed** `guard-worktree`, whose
+  `PreToolUse` hook runs before the tool, and the refused ticket is recorded in
+  the session's marker like any other — so the post-merge cleanups below stay
+  closed until it, too, is merged.
 - **Hooks** (`hooks/`) — a `PreToolUse` **guard** (`guard-bash.mjs`) that blocks
   whole-tree staging and commits/pushes to `main`; a `PostToolUse` **tracker**
   (`track-steps.mjs`) that records pipeline milestones (branch, typecheck, lint,
