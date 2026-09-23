@@ -4,7 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardrailTemplates } from '../templates.js';
-import { runAudit, auditExitCode, formatAudit, AUDIT_CHECKS } from './run.js';
+import { runAudit, runOneCheck, auditExitCode, formatAudit, AUDIT_CHECKS } from './run.js';
 import { defaultExec, type Exec, type ExecResult } from './types.js';
 
 const PKG_ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -67,8 +67,14 @@ const execWithEslint: Exec = (cmd, args, opts) => {
   return defaultExec(cmd, args, opts);
 };
 
+/**
+ * Runs ONLY the check under test. The full audit spends ~1.35s of its ~1.4s in two subprocess
+ * spawns — tsconfig-strict's tsc and hook-launcher's node — that a test naming any other id then
+ * discards (tkt-884c11f02d73). Same wrapper as runAudit, so tier, exemptions and crash containment
+ * still apply; tests asserting on a whole report keep calling runAudit.
+ */
 function statusOf(dir: string, id: string, exec: Exec = execWithEslint): { status: string; detail: string } {
-  const r = runAudit(dir, exec).results.find((x) => x.id === id);
+  const r = runOneCheck(dir, id, exec);
   if (!r) throw new Error(`check ${id} missing from report`);
   return r;
 }
@@ -978,3 +984,80 @@ describe('pin checks end-to-end through runAudit', () => {
   });
 });
 
+
+/**
+ * runOneCheck is what every statusOf test above now goes through, so its agreement with runAudit is
+ * load-bearing: if the two ever diverge, ~45 tests are asserting about something that is not the
+ * audit. The first case is that equivalence, swept over every check rather than sampled at one.
+ */
+describe('runOneCheck: the same verdict as runAudit, for one check instead of twenty-one', () => {
+  it('agrees with runAudit on every check id, over a repo where the answers are mixed', () => {
+    const dir = makeConformingRepo();
+    // Mixed on purpose: a pass-heavy repo would agree even if runOneCheck ignored its id and
+    // answered about a different check.
+    rmSync(path.join(dir, '.gitignore'));
+    rmSync(path.join(dir, 'node_modules', '.bin', 'tsc'));
+    const report = runAudit(dir, execWithEslint);
+    expect(report.results.length).toBe(AUDIT_CHECKS.length);
+    // Each status pinned to the id that earns it, never as a set over statuses: hook-arming answers
+    // BLOCKED in every fixture, so a `seen.has('blocked')` precondition stays true with the tsc
+    // removal above deleted — the sweep would lose its only gating blocked sample and stay green.
+    const byId = new Map(report.results.map((r) => [r.id, r.status]));
+    expect(byId.get('gitignore'), 'removed .gitignore').toBe('fail');
+    expect(byId.get('tsconfig-strict'), 'removed node_modules/.bin/tsc').toBe('blocked');
+    expect(byId.get('branch-protection'), 'exempted by the fixture config').toBe('exempt');
+    expect(byId.get('claude-md'), 'untouched template').toBe('pass');
+    for (const expected of report.results) {
+      expect(runOneCheck(dir, expected.id, execWithEslint), expected.id).toEqual(expected);
+    }
+  });
+
+  it('THROWS on an id no check declares, rather than reusing the tier-skip sentinel', () => {
+    expect(() => runOneCheck(makeConformingRepo(), 'no-such-check', execWithEslint)).toThrow(/no-such-check/);
+  });
+
+  it('returns undefined for a check the repo tier excludes, mirroring its absence from the report', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(path.join(dir, '.ticket-workflow.json'), JSON.stringify({ tier: 'core', exempt: { 'branch-protection': 'fixture repo, no remote' } }));
+    expect(runOneCheck(dir, 'tsconfig-strict', execWithEslint)).toBeUndefined();
+    expect(runOneCheck(dir, 'claude-md', execWithEslint)?.status).toBe('pass');
+  });
+
+  it('BLOCKS on a corrupt config rather than auditing against a tier it could not read', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(path.join(dir, '.ticket-workflow.json'), '{ tier: node'); // not JSON
+    const r = runOneCheck(dir, 'gitignore', execWithEslint);
+    expect(r?.status).toBe('blocked');
+    // The check itself would PASS here — the fixture's .gitignore is untouched — so a permissive
+    // reading of an unreadable config is exactly the answer this must not give.
+    expect(runOneCheck(makeConformingRepo(), 'gitignore', execWithEslint)?.status).toBe('pass');
+  });
+
+  it('honours an exemption, and still FAILS one carrying no reason', () => {
+    const dir = makeConformingRepo();
+    expect(runOneCheck(dir, 'branch-protection', execWithEslint)?.status).toBe('exempt');
+    writeFileSync(path.join(dir, '.ticket-workflow.json'), JSON.stringify({ tier: 'node', exempt: { 'branch-protection': '' } }));
+    const r = runOneCheck(dir, 'branch-protection', execWithEslint);
+    expect(r?.status).toBe('fail');
+    expect(r?.detail).toContain('NO reason');
+  });
+
+  it('contains a crashing check as BLOCKED, exactly as the full report does', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(path.join(dir, '.ticket-workflow.json'), JSON.stringify({ tier: 'node', exempt: {} }));
+    const exec: Exec = (cmd, args, opts) => {
+      if (cmd === 'git') throw new Error('boom');
+      if (cmd.endsWith('eslint')) return { kind: 'ran', ok: true, stdout: ESLINT_CONFORMING, stderr: '' };
+      return defaultExec(cmd, args, opts);
+    };
+    const r = runOneCheck(dir, 'branch-protection', exec);
+    expect(r?.status).toBe('blocked');
+    expect(r?.detail).toContain('crashed');
+  });
+
+  it('resolves a relative repoDir once, like runAudit — no false BLOCKED from double resolution', () => {
+    const dir = makeConformingRepo();
+    const r = runOneCheck(path.relative(process.cwd(), dir), 'eslint-rules', execWithEslint);
+    expect(r?.status, r?.detail).toBe('pass');
+  });
+});

@@ -59,12 +59,33 @@ export interface AuditReport {
   readonly results: readonly AuditResult[];
 }
 
-export function runAudit(repoDirInput: string, exec: Exec = defaultExec): AuditReport {
+function prepare(repoDirInput: string, exec: Exec): { repoDir: string; ctx: AuditContext; config: ReturnType<typeof loadRepoConfig> } {
   // Resolved ONCE: checks join binaries onto repoDir AND pass cwd: repoDir to spawn, and a relative
   // path double-resolves through that pair (projects/foo/projects/foo/…) into a false BLOCKED.
   const repoDir = path.resolve(repoDirInput);
   const ctx: AuditContext = { repoDir, read: (rel) => readRepoFile(repoDir, rel), exec };
-  const config = loadRepoConfig(ctx);
+  return { repoDir, ctx, config: loadRepoConfig(ctx) };
+}
+
+function evaluate(check: AuditCheck, ctx: AuditContext, exempt: Readonly<Record<string, string>>): AuditResult {
+  const reason = exempt[check.id];
+  if (reason !== undefined) {
+    if (reason.trim() === '') {
+      return makeResult(check, 'fail', `${CONFIG_FILE} exempts ${check.id} with NO reason — an exemption nobody can justify is a hole, not a waiver`);
+    }
+    return makeResult(check, 'exempt', `exempt: ${reason}`);
+  }
+  try {
+    return check.run(ctx);
+  } catch (err) {
+    // A crashing check must surface as BLOCKED, never vanish from the report — an uncaught throw
+    // that aborts the audit mid-list reports nothing about the checks after it.
+    return makeResult(check, 'blocked', `${CRASH_MARKER}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+export function runAudit(repoDirInput: string, exec: Exec = defaultExec): AuditReport {
+  const { repoDir, ctx, config } = prepare(repoDirInput, exec);
   if (config.kind === 'invalid') {
     // A config that cannot be trusted blocks EVERY check rather than silently defaulting the tier:
     // a corrupt exemption map read as "no exemptions declared" would flip EXEMPTs to FAILs and vice
@@ -77,23 +98,28 @@ export function runAudit(repoDirInput: string, exec: Exec = defaultExec): AuditR
     };
   }
   const applicable = AUDIT_CHECKS.filter((c) => tierIncludes(config.tier, c.tier));
-  const results = applicable.map((check) => {
-    const reason = config.exempt[check.id];
-    if (reason !== undefined) {
-      if (reason.trim() === '') {
-        return makeResult(check, 'fail', `${CONFIG_FILE} exempts ${check.id} with NO reason — an exemption nobody can justify is a hole, not a waiver`);
-      }
-      return makeResult(check, 'exempt', `exempt: ${reason}`);
-    }
-    try {
-      return check.run(ctx);
-    } catch (err) {
-      // A crashing check must surface as BLOCKED, never vanish from the report — an uncaught throw
-      // that aborts the audit mid-list reports nothing about the checks after it.
-      return makeResult(check, 'blocked', `${CRASH_MARKER}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  });
-  return { repoDir, tier: config.tier, tierDeclared: config.declared, results };
+  return { repoDir, tier: config.tier, tierDeclared: config.declared, results: applicable.map((check) => evaluate(check, ctx, config.exempt)) };
+}
+
+/**
+ * One check, through the exact config/tier/exemption/crash wrapper `runAudit` applies, for a caller
+ * that would otherwise pay for 20 verdicts it discards. Module-internal — deliberately not in
+ * `src/index.ts`, since its only caller today is this module's own test helper.
+ *
+ * Never an AuditReport: a report holding one check reads as complete to `auditExitCode`, which
+ * answers 0 when nothing it can see is red.
+ *
+ * `undefined` means one thing only — this repo's tier excludes the check, mirroring its absence from
+ * `runAudit`'s results. An unknown id throws instead, because sharing that sentinel is how a renamed
+ * check gets read as "not applicable here" and silently stops being audited.
+ */
+export function runOneCheck(repoDirInput: string, id: string, exec: Exec = defaultExec): AuditResult | undefined {
+  const check = AUDIT_CHECKS.find((c) => c.id === id);
+  if (!check) throw new Error(`no audit check declares the id ${JSON.stringify(id)}`);
+  const { ctx, config } = prepare(repoDirInput, exec);
+  if (config.kind === 'invalid') return makeResult(check, 'blocked', config.detail);
+  if (!tierIncludes(config.tier, check.tier)) return undefined;
+  return evaluate(check, ctx, config.exempt);
 }
 
 /** 0 only when every gating check is PASS or EXEMPT. FAIL beats BLOCKED in the code so a red gate
