@@ -17,6 +17,7 @@ import {
   foreignVitest,
   formatTable,
   localDay,
+  mixedTests,
   parseContentionArgs,
   parseHistory,
   parseReport,
@@ -40,14 +41,15 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
-function report(files: { name: string; failed?: string[]; fileMessage?: string }[]): string {
+// One entry per failing test; an array is one test carrying several messages (a retry, a throwing afterEach).
+function report(files: { name: string; failed?: (string | string[])[]; fileMessage?: string }[]): string {
   return JSON.stringify({
     success: files.every((f) => (f.failed ?? []).length === 0 && f.fileMessage === undefined),
     testResults: files.map((f) => ({
       name: f.name,
       status: (f.failed ?? []).length > 0 || f.fileMessage !== undefined ? 'failed' : 'passed',
       message: f.fileMessage ?? '',
-      assertionResults: (f.failed ?? []).map((m) => ({ status: 'failed', failureMessages: [m] })),
+      assertionResults: (f.failed ?? []).map((m, i) => ({ status: 'failed', fullName: `t${i}`, failureMessages: Array.isArray(m) ? m : [m] })),
     })),
   });
 }
@@ -58,7 +60,7 @@ const red = (index: number, slots: number | null = 2): RunOutcome => ({
   index,
   exitCode: 1,
   green: false,
-  files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1 }],
+  files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1, mixed: [] }],
   slots,
 });
 
@@ -118,11 +120,11 @@ describe('parseReport', () => {
       { name: '/wt/run-1/src/a.test.ts', failed: ['Error: Test timed out in 20000ms.', 'AssertionError: expected 1'] },
       { name: '/wt/run-1/src/b.test.ts' },
     ]);
-    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 1 }] });
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 1, mixed: [] }] });
   });
   it('counts a file that failed with no failing test, e.g. a hook timeout', () => {
     const text = report([{ name: '/private/wt/src/c.test.ts', fileMessage: 'Hook timed out in 10000ms.' }]);
-    expect(parseReport(text, ['/wt', '/private/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1 }] });
+    expect(parseReport(text, ['/wt', '/private/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1, mixed: [] }] });
   });
   // Verbatim shape of a vitest 4.1 test timeout in the JSON report: the stack is all that survives (tkt-366b0bf01713).
   const VITEST4_TIMEOUT = [
@@ -132,15 +134,15 @@ describe('parseReport', () => {
   ].join('\n');
   it('counts a vitest 4 timeout, whose report carries only the STACK_TRACE_ERROR stack', () => {
     const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [VITEST4_TIMEOUT, VITEST4_TIMEOUT] }]);
-    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 2 }] });
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 2, mixed: [] }] });
   });
   it('counts a vitest 4 timeout with CRLF line endings, and a bare header', () => {
     const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [VITEST4_TIMEOUT.replaceAll('\n', '\r\n'), 'Error: STACK_TRACE_ERROR'] }]);
-    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 2 }] });
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 2, mixed: [] }] });
   });
   it('counts a file-level vitest 4 timeout header', () => {
     const text = report([{ name: '/wt/src/c.test.ts', fileMessage: VITEST4_TIMEOUT }]);
-    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1 }] });
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1, mixed: [] }] });
   });
   it.each([
     ['a plain assertion', 'AssertionError: expected 1 to be 2\n    at /wt/run-1/src/a.test.ts:1:1'],
@@ -153,7 +155,7 @@ describe('parseReport', () => {
     ['a vitest header below the first line', 'Error: fetch failed\n    Caused by: Error: Test timed out in 5000ms.\n    at x'],
   ])('does not count %s as a timeout', (_label, message) => {
     const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [message] }]);
-    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0 }] });
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0, mixed: [] }] });
   });
   it.each([
     ['connection timeout', 'Connection timed out'],
@@ -161,15 +163,15 @@ describe('parseReport', () => {
     ['message quoting a vitest header mid-text', 'fetch failed: Hook timed out in 5ms.'],
   ])('does not count a file-level %s as a timeout', (_label, message) => {
     const text = report([{ name: '/wt/src/c.test.ts', fileMessage: message }]);
-    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 0 }] });
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 0, mixed: [] }] });
   });
   it('counts a file-level aroundAll setup timeout', () => {
     const text = report([{ name: '/wt/src/c.test.ts', fileMessage: 'The setup phase of "aroundAll" hook timed out after 10000ms.' }]);
-    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1 }] });
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1, mixed: [] }] });
   });
   it('does not count a vitest header behind a class vitest never uses for it', () => {
     const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: ['AssertionError: Test timed out in 5ms.\n    at x'] }]);
-    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0 }] });
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0, mixed: [] }] });
   });
   // 4.1 grafts STACK_TRACE_ERROR onto test and hook timeout stacks, so these prefixed headers are vitest ≤3 or a
   // stackless error; an around-hook timeout keeps its header, with the subclass name only when no stack was grafted.
@@ -181,7 +183,43 @@ describe('parseReport', () => {
     ['an aroundAll teardown timeout with no grafted stack', 'AroundHookTeardownError: The teardown phase of "aroundAll" hook timed out after 10000ms.\n    at x'],
   ])('counts %s', (_label, message) => {
     const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [message] }]);
-    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1 }] });
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1, mixed: [] }] });
+  });
+  // Shapes measured on vitest 4.1.11: a beforeEach timeout then an afterEach cleanup error; a retry's timeout then its assertion.
+  it.each([
+    ['a cleanup error', [VITEST4_TIMEOUT, "TypeError: Cannot read properties of undefined (reading 'close')\n    at x"]],
+    ['a retried assertion', [VITEST4_TIMEOUT, 'AssertionError: expected 2 to be 1\n    at x']],
+    ['a vitest 3 timeout and an assertion', ['Error: Test timed out in 20000ms.', 'AssertionError: expected 1 to be 2\n    at x']],
+  ])('names a timeout beside %s as mixed, still counting the timeout', (_label, messages) => {
+    expect(parseReport(report([{ name: '/wt/src/a.test.ts', failed: [messages] }]), ['/wt'])).toEqual({
+      success: false,
+      files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1, mixed: ['t0'] }],
+    });
+  });
+  it.each([
+    ['vitest 4', [VITEST4_TIMEOUT, VITEST4_TIMEOUT]],
+    ['vitest 3', ['Error: Test timed out in 20000ms.', 'Error: Test timed out in 20000ms.']],
+  ])('does not call a %s test that timed out on every retry mixed', (_label, messages) => {
+    expect(parseReport(report([{ name: '/wt/src/a.test.ts', failed: [messages] }]), ['/wt'])).toEqual({
+      success: false,
+      files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1, mixed: [] }],
+    });
+  });
+  const raw = (assertion: object): string =>
+    JSON.stringify({ success: false, testResults: [{ name: '/wt/src/a.test.ts', status: 'failed', message: '', assertionResults: [{ status: 'failed', ...assertion }] }] });
+  it('treats a non-string entry beside a timeout as mixed, and names an unnamed test', () => {
+    expect(parseReport(raw({ failureMessages: [VITEST4_TIMEOUT, null] }), ['/wt'])).toEqual({
+      success: false,
+      files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1, mixed: ['<unnamed test>'] }],
+    });
+  });
+  it.each([
+    ['an empty list', { failureMessages: [] }],
+    ['a missing key', {}],
+    ['a non-array', { failureMessages: 'Error: Test timed out in 20000ms.' }],
+    ['a timeout header nested in an array', { failureMessages: [['Test timed out in 5ms.']] }],
+  ])('counts a failed test whose failureMessages is %s as neither timeout nor mixed', (_label, assertion) => {
+    expect(parseReport(raw(assertion), ['/wt'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0, mixed: [] }] });
   });
   it.each([
     ['not JSON', '{'],
@@ -271,8 +309,29 @@ describe('decide — control arm', () => {
     expect(decide({ ...base, runs: [red(0, null), green(1, null)] })).toMatchObject({ exit: CONTENTION_EXIT.PASS, recorded: 'red' });
   });
   it('rejects a control red on an assertion: HEAD is broken, not contended', () => {
-    const broken: RunOutcome = { kind: 'determined', index: 0, exitCode: 1, green: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0 }], slots: null };
-    expect(decide({ ...base, runs: [broken, red(1, null)] })).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+    const broken: RunOutcome = { kind: 'determined', index: 0, exitCode: 1, green: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0, mixed: [] }], slots: null };
+    const d = decide({ ...base, runs: [broken, red(1, null)] });
+    expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+    expect(d.lines.join('\n')).toContain('HEAD is red on its own');
+  });
+  it('refuses a control red only on timeouts beside another error, naming each test once', () => {
+    const text = report([{ name: '/wt/src/a.test.ts', failed: [['Error: Test timed out in 20000ms.', 'TypeError: x']] }]);
+    const runs = [0, 1].map((index) => summarizeRun({ index, exitCode: 1, report: text, log: '', roots: ['/wt'] }));
+    const d = decide({ ...base, runs });
+    expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+    expect(d.lines).toHaveLength(1);
+    expect(d.lines.join('\n')).toContain('timed out beside another error');
+    expect(d.lines.join('\n').match(/src\/a\.test\.ts › t0/g)).toHaveLength(1);
+  });
+  it('reports HEAD red as well when a plain assertion failure sits beside a mixed test', () => {
+    const text = report([
+      { name: '/wt/src/a.test.ts', failed: [['Error: Test timed out in 20000ms.', 'TypeError: x']] },
+      { name: '/wt/src/b.test.ts', failed: ['AssertionError: expected 1 to be 2'] },
+    ]);
+    const d = decide({ ...base, runs: [0, 1].map((index) => summarizeRun({ index, exitCode: 1, report: text, log: '', roots: ['/wt'] })) });
+    expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+    expect(d.lines[0]).toContain('HEAD is red on its own');
+    expect(d.lines[1]).toContain('src/a.test.ts › t0');
   });
   it('exits 2 when the control stays green: no instrument', () => {
     expect(decide({ ...base, runs: [green(0, 2), green(1, 2)] }).lines.join('')).toContain('CONTROL GREEN');
@@ -287,7 +346,31 @@ describe('contentionShaped', () => {
   it('needs at least one failure, all of them timeouts', () => {
     expect(contentionShaped([red(0)])).toBe(true);
     expect(contentionShaped([green(0)])).toBe(false);
-    expect(contentionShaped([{ kind: 'determined', index: 0, exitCode: 1, green: false, files: [{ file: 'x', failed: 2, timeouts: 1 }], slots: null }])).toBe(false);
+    expect(contentionShaped([{ kind: 'determined', index: 0, exitCode: 1, green: false, files: [{ file: 'x', failed: 2, timeouts: 1, mixed: [] }], slots: null }])).toBe(false);
+    expect(contentionShaped([{ kind: 'determined', index: 0, exitCode: 1, green: false, files: [{ file: 'x', failed: 1, timeouts: 1, mixed: ['t'] }], slots: null }])).toBe(false);
+  });
+});
+
+describe('mixedTests', () => {
+  const run = (index: number, ...files: { file: string; mixed: string[] }[]): RunOutcome => ({
+    kind: 'determined',
+    index,
+    exitCode: 1,
+    green: false,
+    files: files.map((f) => ({ ...f, failed: f.mixed.length, timeouts: f.mixed.length })),
+    slots: null,
+  });
+  it('names a test once however many runs it failed in', () => {
+    expect(mixedTests([run(0, { file: 'a', mixed: ['t'] }), run(1, { file: 'a', mixed: ['t'] })])).toEqual(['a › t']);
+  });
+  it('keeps distinct tests that share a name in one run apart, by count', () => {
+    expect(mixedTests([run(0, { file: 'a', mixed: ['<unnamed test>', '<unnamed test>'] }), run(1, { file: 'a', mixed: ['<unnamed test>'] })])).toEqual(['a › <unnamed test> (×2)']);
+  });
+  it('keeps one test per line when a name carries a newline', () => {
+    expect(mixedTests([run(0, { file: 'a', mixed: ['row\nsplit', 'crlf\r\nrow'] })])).toEqual(['a › row\\nsplit', 'a › crlf\\nrow']);
+  });
+  it('ignores undetermined runs and files with no mixed test', () => {
+    expect(mixedTests([{ kind: 'undetermined', index: 0, exitCode: null, reason: 'x', slots: null }, run(1, { file: 'a', mixed: [] })])).toEqual([]);
   });
 });
 

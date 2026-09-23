@@ -700,7 +700,11 @@ npx ticket-workflow test-contention --runs 4             # the bound in force
 The bounded arm prints a verdict **only** against a control that went red the same local day, for
 the same checkout, commit and N. A green run on a machine that cannot show contention proves nothing.
 A control counts as red only when every failure is a timeout. An assertion failure means `HEAD` is
-broken on its own, and that control is not recorded as red.
+broken on its own, and that control is not recorded as red. Nor is one with a test that timed out
+**and** hit another error (a retry's assertion, an `afterEach` that assumed setup finished, or a report
+entry that cannot be read): the report cannot tell a timeout's side effect from a real bug, so the
+verdict is withheld and each such test is named, `(×k)` when k tests in one run share a name. The
+`timeouts` column still counts it.
 
 The verdict is also withheld when any run wrote no readable report, or when a run held no slot or
 K ≥ N. A repo whose vitest config does not await `holdTestRun` is unbounded. It is withheld as well
