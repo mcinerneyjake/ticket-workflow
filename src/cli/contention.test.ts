@@ -124,6 +124,33 @@ describe('parseReport', () => {
     const text = report([{ name: '/private/wt/src/c.test.ts', fileMessage: 'Hook timed out in 10000ms.' }]);
     expect(parseReport(text, ['/wt', '/private/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1 }] });
   });
+  // Verbatim shape of a vitest 4.1 test timeout in the JSON report: the stack is all that survives (tkt-366b0bf01713).
+  const VITEST4_TIMEOUT = [
+    'Error: STACK_TRACE_ERROR',
+    '    at task (file:///wt/node_modules/@vitest/runner/dist/chunk-artifact.js:1784:27)',
+    '    at /wt/run-1/src/a.test.ts:179:3',
+  ].join('\n');
+  it('counts a vitest 4 timeout, whose report carries only the STACK_TRACE_ERROR stack', () => {
+    const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [VITEST4_TIMEOUT, VITEST4_TIMEOUT] }]);
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 2 }] });
+  });
+  it('counts a vitest 4 timeout with CRLF line endings, and a bare header', () => {
+    const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [VITEST4_TIMEOUT.replaceAll('\n', '\r\n'), 'Error: STACK_TRACE_ERROR'] }]);
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 2, timeouts: 2 }] });
+  });
+  it('counts a file-level vitest 4 timeout header', () => {
+    const text = report([{ name: '/wt/src/c.test.ts', fileMessage: VITEST4_TIMEOUT }]);
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1 }] });
+  });
+  it.each([
+    ['a plain assertion', 'AssertionError: expected 1 to be 2\n    at /wt/run-1/src/a.test.ts:1:1'],
+    ['STACK_TRACE_ERROR below the first line', 'Error: fixture failed\n    at Error: STACK_TRACE_ERROR\n    at x'],
+    ['STACK_TRACE_ERROR with more on the first line', 'Error: STACK_TRACE_ERROR in my own code\n    at x'],
+    ['STACK_TRACE_ERROR not at the start', 'TypeError: Error: STACK_TRACE_ERROR\n    at x'],
+  ])('does not count %s as a timeout', (_label, message) => {
+    const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [message] }]);
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0 }] });
+  });
   it.each([
     ['not JSON', '{'],
     ['no success', JSON.stringify({ testResults: [] })],
