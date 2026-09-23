@@ -1,5 +1,5 @@
 import { configDefaults, defineConfig } from 'vitest/config';
-import { holdTestRun, TEST_RUN_GLOBAL_SETUP } from 'ticket-workflow/test-run';
+import { holdTestRun, TEST_RUN_GLOBAL_SETUP, TestRunSlotReporter } from 'ticket-workflow/test-run';
 
 // One of K machine-wide test-run slots plus a per-run TMPDIR, taken before vitest starts, so
 // concurrent runs on one machine queue instead of starving each other. No-op on CI.
@@ -10,6 +10,9 @@ export default defineConfig({
     environment: 'node',
     // Releases the slot taken above.
     globalSetup: [TEST_RUN_GLOBAL_SETUP],
+    // The config resolves once, so without this a `vitest` watcher would hold its slot for the
+    // whole session, idle or not. Inert under `vitest run`.
+    reporters: ['default', new TestRunSlotReporter()],
     // Extend the defaults, never replace them (they carry **/node_modules/** and **/.git/**).
     // dist/**: a local build emits compiled *.test.js that vitest would collect twice.
     // .claude/worktrees/** can hold full checkouts — same double-collection failure.

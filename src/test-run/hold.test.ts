@@ -78,7 +78,9 @@ function harness(over: Partial<HoldTestRunOptions> = {}, env: NodeJS.ProcessEnv 
     },
     log: (l) => log.push(l),
     setExitCode: (c) => exitCodes.push(c),
-    registerExit: (fn) => exitHooks.push(fn),
+    registerExit: (fn) => {
+      exitHooks.push(fn);
+    },
     registry: reg,
     ...over,
   };
@@ -360,5 +362,96 @@ describe('the process-level defaults, exercised directly because the main proces
     expect(defaultRepoName(bare)).toBe(path.basename(bare));
     writeFileSync(path.join(bare, 'package.json'), '{not json');
     expect(defaultRepoName(bare)).toBe(path.basename(bare));
+  });
+});
+
+// Re-acquiring in ONE process is the dimension watch mode introduced (tkt-43881f6840ad): every case
+// above holds once and exits, so none of them can see what a second hold inherits from the first.
+describe('re-acquiring the slot in one process', () => {
+  it('restores env.TMPDIR to the value it had before the hold', async () => {
+    const h = harness({}, { TMPDIR: '/outer/tmp' });
+    await holdTestRun(h.opts);
+    expect(h.env.TMPDIR).not.toBe('/outer/tmp');
+    await releaseTestRun(h.registry);
+    expect(h.env.TMPDIR).toBe('/outer/tmp');
+  });
+
+  it('leaves no env.TMPDIR behind when there was none before the hold', async () => {
+    const h = harness({}, {});
+    await holdTestRun(h.opts);
+    expect(h.env.TMPDIR).toBeDefined();
+    await releaseTestRun(h.registry);
+    expect('TMPDIR' in h.env).toBe(false);
+  });
+
+  it('restores env.TMPDIR even when the slot itself cannot be released', async () => {
+    const h = harness({}, { TMPDIR: '/outer/tmp' });
+    await holdTestRun(h.opts);
+    rmSync(h.stateDir, { recursive: true, force: true });
+    mkdirSync(h.stateDir, { recursive: true });
+    chmodSync(h.stateDir, 0o500);
+    await releaseTestRun(h.registry).catch(() => undefined);
+    chmodSync(h.stateDir, 0o700);
+    expect(h.env.TMPDIR).toBe('/outer/tmp');
+  });
+
+  // The real default path: `tmpRoot` falls back to os.tmpdir(), which RE-READS process.env.TMPDIR on
+  // every call, so without the restore above the second run dir lands inside the deleted first one.
+  it('roots the second run dir beside the first, never inside it', async () => {
+    const outer = temp('tw-hold-outer-');
+    vi.stubEnv('VITEST_WORKER_ID', undefined);
+    vi.stubEnv('CI', undefined);
+    vi.stubEnv('TMPDIR', outer);
+    try {
+      const h = harness({ tmpRoot: undefined, env: process.env });
+      const first = await holdTestRun(h.opts);
+      expect(first.kind).toBe('held');
+      const firstDir = first.kind === 'held' ? first.tmpDir : '';
+      expect(path.dirname(firstDir)).toBe(path.join(outer, 'demo-test'));
+      await releaseTestRun(h.registry);
+
+      const second = await holdTestRun(h.opts);
+      const secondDir = second.kind === 'held' ? second.tmpDir : '';
+      expect(secondDir.startsWith(firstDir)).toBe(false);
+      expect(path.dirname(secondDir)).toBe(path.dirname(firstDir));
+      await releaseTestRun(h.registry);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('unregisters its exit hook on release, so N cycles leave no listener behind', async () => {
+    const before = process.listenerCount('exit');
+    for (let i = 0; i < 12; i += 1) {
+      const h = harness({ registerExit: undefined });
+      await holdTestRun(h.opts);
+      await releaseTestRun(h.registry);
+    }
+    expect(process.listenerCount('exit')).toBe(before);
+  });
+});
+
+// `registerExit` is public API returning caller-supplied code, so the release path must survive
+// whatever it hands back. Both shapes below used to be silently absorbed (tkt-43881f6840ad review).
+describe('a hostile registerExit cannot cost the release', () => {
+  it('still restores TMPDIR and frees the slot when the remover throws, and says so', async () => {
+    const h = harness({ registerExit: () => () => { throw new Error('remover blew up'); } }, { TMPDIR: '/outer/tmp' });
+    await holdTestRun(h.opts);
+    await releaseTestRun(h.registry);
+    expect(h.env.TMPDIR).toBe('/outer/tmp');
+    expect(readdirSync(h.stateDir)).toEqual([]);
+    expect(h.log.some((l) => l.includes('could not unregister the exit hook'))).toBe(true);
+  });
+
+  it('names a non-function return rather than treating it as "no remover"', async () => {
+    // Typed against the OLD `=> void` contract, which TypeScript lets return a value: this is the
+    // shape `registerExit: (fn) => process.on('exit', fn)` has, returning `process`. A consumer on
+    // the new types gets a compile error instead, so this guard exists for the ones who don't.
+    const legacy: (fn: () => void) => void = () => ({ not: 'a function' });
+    const h = harness({ registerExit: legacy });
+    await holdTestRun(h.opts);
+    expect(h.log.some((l) => l.includes('registerExit returned a non-function'))).toBe(true);
+    await releaseTestRun(h.registry);
+    expect(readdirSync(h.stateDir)).toEqual([]);
   });
 });

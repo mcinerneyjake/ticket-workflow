@@ -590,12 +590,13 @@ per-repo worker cap bounds one run; it cannot see across runs. This does (`tkt-1
 
 ```ts
 // vitest.config.ts — before `export default defineConfig`
-import { holdTestRun, TEST_RUN_GLOBAL_SETUP } from 'ticket-workflow/test-run';
+import { holdTestRun, TEST_RUN_GLOBAL_SETUP, TestRunSlotReporter } from 'ticket-workflow/test-run';
 await holdTestRun({ repo: 'my-repo' });
 
 export default defineConfig({
   test: {
     globalSetup: [TEST_RUN_GLOBAL_SETUP], // releases the slot; ROOT `test` block only under a projects split
+    reporters: ['default', new TestRunSlotReporter({ repo: 'my-repo' })], // frees it between watch runs
     // ...
   },
 });
@@ -621,6 +622,40 @@ a no-op inside a vitest worker (`VITEST_WORKER_ID`, so a test may import the con
 slot is held by a live holder and the wait ran out · **78** the state directory or a slot file cannot
 be read or trusted, or an override is invalid · **74** the per-run TMPDIR cannot be created. A
 refused run holds nothing.
+
+### Watch mode: `TestRunSlotReporter` (`tkt-43881f6840ad`)
+
+Vitest resolves the config **once**, so `holdTestRun` alone gives a watcher a slot on launch and
+keeps it for the whole interactive session — idle or not. Two idle watchers exhaust the default pool
+of two, and every other run on the machine, the husky gate included, waits its budget and then exits
+75. `TestRunSlotReporter` closes that: it releases at the end of each run and takes a slot again at
+the start of the next, so a watcher holds one only while it is actually running tests.
+
+It is **inert unless `config.watch` is true**, and inert until `onInit` has said so. Under
+`vitest run` nothing changes — the release stays with `globalSetup`, after coverage is written.
+Wire it in addition to the two lines above, never instead of them.
+
+**A re-acquire that finds every slot taken stops the watcher.** It rejects rather than run
+unguarded, and vitest turns a rejected `onTestRunStart` into an unhandled rejection that exits the
+process — so the session ends and has to be restarted. That is the fail-closed direction and is
+deliberate, but it is a session lost, not merely a run skipped. Because it now runs on every save
+rather than once per process, the re-acquire waits **30 s** by default instead of
+`TEST_SLOTS_WAIT_MS`'s ten minutes; an explicit `waitMs`, or an explicit `TEST_SLOTS_WAIT_MS`,
+still wins.
+
+Three cases it deliberately does **not** cover, each of which keeps the slot rather than risking an
+unguarded run:
+
+- **`vitest --standalone`** reports `onInit` and then runs nothing until you trigger it, so the
+  config-time hold is held while idle exactly as before. Standalone is the mode chosen to sit idle,
+  so the headline problem survives there.
+- **Typecheck watch** dispatches `onTestRunEnd` on a TSC rebuild with no `onTestRunStart` before it.
+  An unpaired end releases nothing, so the slot stays held for the session.
+- **An embedder** calling `runTestSpecifications` directly never gets `onInit`; the reporter warns
+  once and holds.
+
+Playwright holds a slot from its own config load and needs the equivalent per-run seam in the
+consumer's config; this reporter covers vitest only.
 
 A holder is reclaimed only when its pid is gone (`ESRCH`); a pid another user owns reads as alive,
 and a live holder whose heartbeat stopped is reclaimed after the TTL. The claim is an atomic
