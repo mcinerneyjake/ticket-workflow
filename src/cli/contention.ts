@@ -76,6 +76,13 @@ export type RunOutcome =
   | { readonly kind: 'undetermined'; readonly index: number; readonly exitCode: number | null; readonly reason: string; readonly slots: number | null };
 
 const TIMED_OUT = /timed out/i;
+// vitest 4's makeTimeoutError grafts its registration-time `new Error("STACK_TRACE_ERROR")` stack onto the timeout,
+// and the JSON reporter prefers `stack`, so this header is all a timeout leaves in failureMessages (tkt-366b0bf01713).
+const VITEST4_TIMEOUT_HEADER = /^Error: STACK_TRACE_ERROR(?:\r?\n|$)/;
+
+function isTimeoutMessage(m: string): boolean {
+  return TIMED_OUT.test(m) || VITEST4_TIMEOUT_HEADER.test(m);
+}
 
 function isObject(v: unknown): v is object {
   return typeof v === 'object' && v !== null;
@@ -106,12 +113,12 @@ export function parseReport(text: string, root: readonly string[]): { readonly s
       if (!isObject(a) || !('status' in a) || a.status !== 'failed') continue;
       failed++;
       const messages: unknown[] = 'failureMessages' in a && Array.isArray(a.failureMessages) ? a.failureMessages : [];
-      if (messages.some((m) => typeof m === 'string' && TIMED_OUT.test(m))) timeouts++;
+      if (messages.some((m) => typeof m === 'string' && isTimeoutMessage(m))) timeouts++;
     }
     // A file can fail with no failing test: an import error, or a hook that timed out.
     if (failed === 0) {
       failed = 1;
-      if ('message' in tr && typeof tr.message === 'string' && TIMED_OUT.test(tr.message)) timeouts = 1;
+      if ('message' in tr && typeof tr.message === 'string' && isTimeoutMessage(tr.message)) timeouts = 1;
     }
     files.push({ file: relativeTo(tr.name, root), failed, timeouts });
   }
