@@ -147,9 +147,41 @@ describe('parseReport', () => {
     ['STACK_TRACE_ERROR below the first line', 'Error: fixture failed\n    at Error: STACK_TRACE_ERROR\n    at x'],
     ['STACK_TRACE_ERROR with more on the first line', 'Error: STACK_TRACE_ERROR in my own code\n    at x'],
     ['STACK_TRACE_ERROR not at the start', 'TypeError: Error: STACK_TRACE_ERROR\n    at x'],
+    ['an assertion quoting the phrase', "AssertionError: expected 'request timed out' to be 'ok'\n    at x"],
+    ['a connection timeout', 'Error: Connection timed out\n    at x'],
+    ["vi.waitFor's own timeout", 'Error: Timed out in waitFor!\n    at x'],
+    ['a vitest header below the first line', 'Error: fetch failed\n    Caused by: Error: Test timed out in 5000ms.\n    at x'],
   ])('does not count %s as a timeout', (_label, message) => {
     const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [message] }]);
     expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0 }] });
+  });
+  it.each([
+    ['connection timeout', 'Connection timed out'],
+    ['vi.waitFor timeout', 'Timed out in waitFor!'],
+    ['message quoting a vitest header mid-text', 'fetch failed: Hook timed out in 5ms.'],
+  ])('does not count a file-level %s as a timeout', (_label, message) => {
+    const text = report([{ name: '/wt/src/c.test.ts', fileMessage: message }]);
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 0 }] });
+  });
+  it('counts a file-level aroundAll setup timeout', () => {
+    const text = report([{ name: '/wt/src/c.test.ts', fileMessage: 'The setup phase of "aroundAll" hook timed out after 10000ms.' }]);
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1 }] });
+  });
+  it('does not count a vitest header behind a class vitest never uses for it', () => {
+    const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: ['AssertionError: Test timed out in 5ms.\n    at x'] }]);
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0 }] });
+  });
+  // 4.1 grafts STACK_TRACE_ERROR onto test and hook timeout stacks, so these prefixed headers are vitest ≤3 or a
+  // stackless error; an around-hook timeout keeps its header, with the subclass name only when no stack was grafted.
+  it.each([
+    ['a vitest 3 test timeout stack', 'Error: Test timed out in 20000ms.\nIf this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".\n    at x'],
+    ['a vitest 3 hook timeout stack', 'Error: Hook timed out in 10000ms.\n    at x'],
+    ['a computed, non-integer timeout', 'Error: Test timed out in 5500.000000000001ms.\n    at x'],
+    ['an aroundEach setup timeout with a grafted stack', 'Error: The setup phase of "aroundEach" hook timed out after 10000ms.\n    at x'],
+    ['an aroundAll teardown timeout with no grafted stack', 'AroundHookTeardownError: The teardown phase of "aroundAll" hook timed out after 10000ms.\n    at x'],
+  ])('counts %s', (_label, message) => {
+    const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: [message] }]);
+    expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1 }] });
   });
   it.each([
     ['not JSON', '{'],
