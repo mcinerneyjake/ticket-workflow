@@ -231,16 +231,18 @@ function acquireReclaimLock(lock: string, now: number): boolean {
 }
 
 /**
- * Removes a dead or expired slot, deciding INSIDE a per-slot lock: judging from an earlier read then
- * renaming let a reclaimer rename a live winner's fresh record (3 of 8 granted, tkt-14788b3fc356).
+ * Removes a dead, expired or self-orphaned slot, deciding INSIDE a per-slot lock: judging from an
+ * earlier read then renaming let a reclaimer rename a live winner's fresh record (3 of 8 granted,
+ * tkt-14788b3fc356). `selfPid` must match the caller's out-of-lock decision, or this re-check vetoes
+ * it and the reclaim silently never happens.
  */
-function reclaim(view: SlotView, opts: ReadOptions): boolean {
+function reclaim(view: SlotView, opts: ReadOptions, selfPid: number | null): boolean {
   const lock = `${view.file}.reclaim`;
   if (!acquireReclaimLock(lock, opts.now)) return false;
   try {
     const current = readSlot(path.dirname(view.file), view.slot, opts.probe, opts.now, opts.ttlMs);
     if (current === null) return false;
-    if (current.liveness !== 'dead' && !current.expired) return false;
+    if (current.liveness !== 'dead' && !current.expired && current.record.pid !== selfPid) return false;
     const stale = `${view.file}.stale-${current.record.pid}-${opts.now}`;
     try {
       renameSync(view.file, stale);
@@ -277,6 +279,29 @@ export function formatSlot(v: SlotView): string {
 }
 
 /**
+ * Clears any OTHER slot recording our own pid once we hold one. The in-loop branch below only sees
+ * slots we actually contend for, so a leak in a slot we never reached would survive — two slots on
+ * one live pid, which `clear-stale` will not touch and which reads as full to every other repo for
+ * the whole TTL (tkt-0ce4d4313ce7). Read errors are swallowed deliberately: before this sweep a
+ * corrupt slot elsewhere never refused a valid claim, and it must not start.
+ */
+function clearOwnOrphans(opts: ClaimOptions, keepSlot: number): void {
+  for (let slot = 0; slot < opts.slots; slot += 1) {
+    if (slot === keepSlot) continue;
+    let view: SlotView | null;
+    try {
+      view = readSlot(opts.stateDir, slot, opts.probe, opts.now, opts.ttlMs);
+    } catch {
+      continue;
+    }
+    if (view === null || view.record.pid !== opts.record.pid) continue;
+    if (reclaim(view, opts, opts.record.pid)) {
+      opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — our own orphaned slot from a failed release`);
+    }
+  }
+}
+
+/**
  * One attempt over all K slots. `null` when every slot is held by a live (or unknowable) holder
  * inside its TTL. Dead holders are reclaimed on sight; live ones past the TTL with a warning.
  */
@@ -294,6 +319,7 @@ export function claimSlot(opts: ClaimOptions): Claim | null {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           linkSync(draft, target); // AUTHORIZING: the only line that grants a slot
+          clearOwnOrphans(opts, slot);
           return { slot, file: target };
         } catch (err) {
           if (errnoCode(err) !== 'EEXIST') throw unreadable(`link ${target}`, err);
@@ -301,11 +327,20 @@ export function claimSlot(opts: ClaimOptions): Claim | null {
         const view = readSlot(opts.stateDir, slot, opts.probe, opts.now, opts.ttlMs);
         if (view === null) continue; // freed between the link and the read; retry the link
         if (view.liveness === 'dead') {
-          if (reclaim(view, opts)) opts.log(`[test-run] reclaimed ${formatSlot(view)} — process is gone`);
+          if (reclaim(view, opts, null)) opts.log(`[test-run] reclaimed ${formatSlot(view)} — process is gone`);
           continue;
         }
         if (view.expired) {
-          if (reclaim(view, opts)) opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — no heartbeat within the TTL`);
+          if (reclaim(view, opts, null)) opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — no heartbeat within the TTL`);
+          continue;
+        }
+        if (view.record.pid === opts.record.pid) {
+          // Our own live pid in a slot we are trying to claim is a leak from a failed release in this
+          // process, not a peer: holdTestRun grants once per process, so we can never contend with
+          // ourselves. Without this the run blocks on itself until the TTL (tkt-0ce4d4313ce7).
+          if (reclaim(view, opts, opts.record.pid)) {
+            opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — our own orphaned slot from a failed release`);
+          }
           continue;
         }
         break; // held by a live holder; try the next slot
@@ -344,7 +379,7 @@ export function clearStaleSlots(stateDir: string, opts: ReadOptions): SlotView[]
   const removed: SlotView[] = [];
   for (const view of listSlots(stateDir, opts)) {
     if (view.liveness === 'dead' || view.expired) {
-      if (reclaim(view, opts)) removed.push(view);
+      if (reclaim(view, opts, null)) removed.push(view);
     }
   }
   return removed;

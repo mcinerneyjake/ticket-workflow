@@ -48,6 +48,14 @@ function exitedPid(): number {
   return r.pid;
 }
 
+/**
+ * A live pid that is never ours. `claimSlot` reclaims a slot recording the CLAIMANT's own pid
+ * (tkt-0ce4d4313ce7), so a case meaning "somebody else holds this" must not spell it `process.pid`.
+ * pid 1 answers EPERM — which `pidLiveness` maps to 'alive' — or succeeds outright as root.
+ */
+const FOREIGN_PID = 1;
+if (FOREIGN_PID === process.pid) throw new Error('FOREIGN_PID must not be this process: the cases below would invert silently');
+
 function record(pid: number, repo = 'repo-a'): SlotRecord {
   return { version: 1, pid, repo, cwd: `/work/${repo}`, startedAt: '2026-09-22T00:00:00.000Z', tmpDir: `/tmp/${repo}` };
 }
@@ -136,7 +144,7 @@ describe('claimSlot — the slot dimension', () => {
 
   it('refuses (null) when the only slot is held by a live holder, and leaves that slot untouched', () => {
     const dir = stateDir();
-    const held = plant(dir, 0, record(process.pid, 'other'));
+    const held = plant(dir, 0, record(FOREIGN_PID, 'other'));
     const before = readFileSync(held, 'utf8');
     const { result } = claim(dir, record(process.pid));
     expect(result).toBeNull();
@@ -163,7 +171,7 @@ describe('claimSlot — the slot dimension', () => {
 
   it('takes the next slot when slot 0 is held by another repo, and lists both holders', () => {
     const dir = stateDir();
-    plant(dir, 0, record(process.pid, 'repo-a'));
+    plant(dir, 0, record(FOREIGN_PID, 'repo-a'));
     const { result } = claim(dir, record(process.pid, 'repo-b'), { slots: 2 });
     expect(result?.slot).toBe(1);
     const views = listSlots(dir, { probe: pidLiveness, now: NOW, ttlMs: TTL });
@@ -238,24 +246,84 @@ describe('claimSlot — the holder dimension', () => {
 
   it('does NOT reclaim an unknown-liveness holder inside its TTL', () => {
     const dir = stateDir();
-    plant(dir, 0, record(process.pid, 'mystery'));
+    plant(dir, 0, record(FOREIGN_PID, 'mystery'));
     const { result } = claim(dir, record(process.pid), { probe: fixedProbe('unknown') });
     expect(result).toBeNull();
   });
 
   it('reclaims a live holder whose heartbeat is older than the TTL, with a WARNING', () => {
     const dir = stateDir();
-    plant(dir, 0, record(process.pid, 'wedged'), TTL + 60_000);
+    plant(dir, 0, record(FOREIGN_PID, 'wedged'), TTL + 60_000);
     const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive) });
     expect(result?.slot).toBe(0);
-    expect(log.some((l) => l.includes('WARNING') && l.includes('wedged'))).toBe(true);
+    // The suffix, not the repo name: the self-reclaim line also carries WARNING and the repo.
+    expect(log.some((l) => l.includes('no heartbeat within the TTL'))).toBe(true);
   });
 
   it('keeps a live holder whose heartbeat is fresh', () => {
     const dir = stateDir();
-    plant(dir, 0, record(process.pid, 'busy'), TTL - 60_000);
+    plant(dir, 0, record(FOREIGN_PID, 'busy'), TTL - 60_000);
     const { result } = claim(dir, record(process.pid), { probe: fixedProbe(alive) });
     expect(result).toBeNull();
+  });
+
+  it('reclaims a fresh, live slot recording OUR OWN pid — a leak from a failed release, not a peer', () => {
+    const dir = stateDir();
+    plant(dir, 0, record(process.pid, 'ourself'), TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive) });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(true);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('repo-a');
+  });
+
+  it('reuses our own orphan rather than leaking a second slot beside it', () => {
+    const dir = stateDir();
+    plant(dir, 0, record(process.pid, 'ourself'), TTL - 60_000);
+    const { result } = claim(dir, record(process.pid), { slots: 2, probe: fixedProbe(alive) });
+    expect(result?.slot).toBe(0);
+    expect(readdirSync(dir)).toEqual(['slot-0']); // not slot-0 AND slot-1
+  });
+
+  it('clears our own orphan from a LATER slot when it grants an earlier free one', () => {
+    // The leak need not sit in the slot we contend for first: a run that held slot 1 behind a peer,
+    // failed its release, then found slot 0 free would otherwise hold two slots and wedge the machine
+    // for the full TTL — the very symptom this ticket removes (tkt-0ce4d4313ce7).
+    const dir = stateDir();
+    plant(dir, 1, record(process.pid, 'orphan'), TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid, 'me'), { slots: 2, probe: fixedProbe(alive) });
+    expect(result?.slot).toBe(0);
+    expect(readdirSync(dir)).toEqual(['slot-0']);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(true);
+  });
+
+  it('does not sweep somebody else’s DEAD slot as ours, which would also mislabel the log line', () => {
+    // The sweep's own ownership test, isolated: for a LIVE foreign holder reclaim's in-lock veto
+    // refuses anyway, so only a dead one can tell the two checks apart. Left for its owner or for
+    // `clear-stale`, which is where a foreign dead slot belongs.
+    const dir = stateDir();
+    plant(dir, 1, record(exitedPid(), 'gone'));
+    const { result, log } = claim(dir, record(process.pid, 'me'), { slots: 2 });
+    expect(result?.slot).toBe(0);
+    expect(readdirSync(dir).sort()).toEqual(['slot-0', 'slot-1']);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(false);
+  });
+
+  it('leaves a LATER slot held by somebody else alone when it grants an earlier free one', () => {
+    const dir = stateDir();
+    plant(dir, 1, record(FOREIGN_PID, 'peer'), TTL - 60_000);
+    const { result } = claim(dir, record(process.pid, 'me'), { slots: 2, probe: fixedProbe(alive) });
+    expect(result?.slot).toBe(0);
+    expect(readdirSync(dir).sort()).toEqual(['slot-0', 'slot-1']);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-1'), 'utf8'))?.repo).toBe('peer');
+  });
+
+  it('defers a self-reclaim to a reclaim already in progress, exactly as for a dead holder', () => {
+    const dir = stateDir();
+    const held = plant(dir, 0, record(process.pid, 'ourself'), TTL - 60_000);
+    mkdirSync(`${held}.reclaim`);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive) });
+    expect(result).toBeNull();
+    expect(log).toEqual([]);
   });
 
   it('defers to a reclaim already in progress: a fresh reclaim lock leaves the dead holder for its owner', () => {
@@ -289,7 +357,7 @@ describe('claimSlot — the holder dimension', () => {
     // The probe answers "dead" for the read that justifies the reclaim and "alive" for the re-read
     // inside the lock — the shape of the race the lock exists for.
     const dir = stateDir();
-    plant(dir, 0, record(process.pid, 'revived'));
+    plant(dir, 0, record(FOREIGN_PID, 'revived'));
     const answers: Liveness[] = ['dead', 'alive', 'alive', 'alive'];
     const { result, log } = claim(dir, record(process.pid), { probe: () => answers.shift() ?? 'alive' });
     expect(result).toBeNull();

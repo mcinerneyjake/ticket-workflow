@@ -6,6 +6,13 @@ import { holdTestRun, releaseTestRun, type HoldTestRunOptions, type Registry, ty
 import { INTERACTIVE_WAIT_MS, TestRunSlotReporter, type TestRunReporterContext } from './reporter.js';
 import { EXIT, TestRunRefusal } from './slots.js';
 
+/**
+ * A live pid that is never ours. `claimSlot` reclaims a slot recording the CLAIMANT's own pid
+ * (tkt-0ce4d4313ce7), so a case meaning "somebody else holds this" must not spell it `process.pid`.
+ */
+const FOREIGN_PID = 1;
+if (FOREIGN_PID === process.pid) throw new Error('FOREIGN_PID must not be this process: the cases below would invert silently');
+
 // The dimensions a watcher moves through: watch on/off · onInit seen or not · first run/RE-RUN ·
 // slot free/full at re-acquire · hold granted/skipped. Every case injects its own state dir.
 
@@ -119,7 +126,7 @@ describe('TestRunSlotReporter — watch mode releases between runs', () => {
     for (const slot of [0, 1]) {
       writeFileSync(
         path.join(f.stateDir, `slot-${slot}`),
-        JSON.stringify({ version: 1, pid: process.pid, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
+        JSON.stringify({ version: 1, pid: FOREIGN_PID, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
       );
     }
     const err: unknown = await r.onTestRunStart().then(() => null, (e: unknown) => e);
@@ -236,7 +243,7 @@ describe('TestRunSlotReporter — the unpaired and unknowable cases keep the slo
     for (const slot of [0, 1]) {
       writeFileSync(
         path.join(f.stateDir, `slot-${slot}`),
-        JSON.stringify({ version: 1, pid: process.pid, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
+        JSON.stringify({ version: 1, pid: FOREIGN_PID, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
       );
     }
     const err: unknown = await r.onTestRunStart().then(() => null, (e: unknown) => e);
@@ -252,11 +259,11 @@ describe('TestRunSlotReporter — the re-acquire budget', () => {
     r.onInit(watching(true));
     writeFileSync(
       path.join(f.stateDir, 'slot-0'),
-      JSON.stringify({ version: 1, pid: process.pid, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
+      JSON.stringify({ version: 1, pid: FOREIGN_PID, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
     );
     writeFileSync(
       path.join(f.stateDir, 'slot-1'),
-      JSON.stringify({ version: 1, pid: process.pid, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
+      JSON.stringify({ version: 1, pid: FOREIGN_PID, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
     );
     const err: unknown = await r.onTestRunStart().then(() => null, (e: unknown) => e);
     if (!(err instanceof TestRunRefusal)) throw new Error(`expected a TestRunRefusal, got ${String(err)}`);
@@ -272,7 +279,7 @@ describe('TestRunSlotReporter — the re-acquire budget', () => {
     for (const slot of [0, 1]) {
       writeFileSync(
         path.join(f.stateDir, `slot-${slot}`),
-        JSON.stringify({ version: 1, pid: process.pid, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
+        JSON.stringify({ version: 1, pid: FOREIGN_PID, repo: 'other', cwd: '/work/other', startedAt: new Date().toISOString(), tmpDir: '/x' }),
       );
     }
     const err: unknown = await r.onTestRunStart().then(() => null, (e: unknown) => e);

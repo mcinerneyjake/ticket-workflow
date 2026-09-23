@@ -87,6 +87,13 @@ function harness(over: Partial<HoldTestRunOptions> = {}, env: NodeJS.ProcessEnv 
   return { opts, env, stateDir, tmpRoot, log, exitCodes, exitHooks, registry: reg, clock, sleeps };
 }
 
+/**
+ * A live pid that is never ours. `claimSlot` reclaims a slot recording the CLAIMANT's own pid
+ * (tkt-0ce4d4313ce7), so a case meaning "somebody else holds this" must not spell it `process.pid`.
+ */
+const FOREIGN_PID = 1;
+if (FOREIGN_PID === process.pid) throw new Error('FOREIGN_PID must not be this process: the cases below would invert silently');
+
 function plantHeld(stateDir: string, slot: number, pid: number, repo = 'other'): string {
   mkdirSync(stateDir, { recursive: true });
   const file = path.join(stateDir, `slot-${slot}`);
@@ -161,8 +168,8 @@ describe('holdTestRun — a granted run', () => {
 
   it('honours TEST_SLOTS from env: with slots 0 and 1 held, TEST_SLOTS=3 grants slot 2', async () => {
     const h = harness({}, { TEST_SLOTS: '3' });
-    plantHeld(h.stateDir, 0, process.pid);
-    plantHeld(h.stateDir, 1, process.pid);
+    plantHeld(h.stateDir, 0, FOREIGN_PID);
+    plantHeld(h.stateDir, 1, FOREIGN_PID);
     const outcome = await holdTestRun(h.opts);
     expect(outcome).toMatchObject({ kind: 'held', slot: 2 });
     await releaseTestRun(h.registry);
@@ -235,7 +242,7 @@ describe('holdTestRun — waiting and refusing', () => {
 
   it('waitMs=0 tries exactly once and refuses', async () => {
     const h = harness({ slots: 1 }, { TEST_SLOTS_WAIT_MS: '0' });
-    plantHeld(h.stateDir, 0, process.pid);
+    plantHeld(h.stateDir, 0, FOREIGN_PID);
     const err = await refusal(holdTestRun(h.opts));
     expect(err.code).toBe(EXIT.SLOTS_FULL);
     expect(h.sleeps).toEqual([]);
@@ -297,6 +304,23 @@ describe('releaseTestRun — the release dimension', () => {
     await expect(releaseTestRun(h.registry)).rejects.toThrow();
     expect(h.exitCodes).toEqual([1]);
     chmodSync(h.stateDir, 0o700);
+  });
+
+  it.skipIf(isRoot)('re-acquires after a failed release instead of blocking on its own orphaned slot', async () => {
+    const h = harness({ slots: 1 });
+    await holdTestRun(h.opts);
+    chmodSync(h.stateDir, 0o500);
+    await expect(releaseTestRun(h.registry)).rejects.toThrow();
+    chmodSync(h.stateDir, 0o700); // the transient failure clears; the orphan it left does not
+    expect(readdirSync(h.stateDir)).toEqual(['slot-0']);
+
+    // Watch mode re-resolves the config: fresh registry, same process, only slot held by our own pid.
+    const second = harness({ slots: 1, stateDir: h.stateDir, tmpRoot: h.tmpRoot });
+    const outcome = await holdTestRun(second.opts);
+    expect(outcome.kind).toBe('held');
+    expect(second.sleeps).toEqual([]); // granted on sight, not after waiting out TEST_SLOTS_WAIT_MS
+    expect(second.log.some((l) => l.includes('own orphaned slot'))).toBe(true);
+    await releaseTestRun(second.registry);
   });
 
   it('is a no-op on an empty registry and on a registry whose acquire was refused', async () => {
