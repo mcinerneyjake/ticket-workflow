@@ -75,7 +75,11 @@ export type RunOutcome =
   | { readonly kind: 'determined'; readonly index: number; readonly exitCode: number | null; readonly green: boolean; readonly files: readonly FileFailure[]; readonly slots: number | null }
   | { readonly kind: 'undetermined'; readonly index: number; readonly exitCode: number | null; readonly reason: string; readonly slots: number | null };
 
-const TIMED_OUT = /timed out/i;
+// Anchored to the header vitest writes: a bare /timed out/ counted any failure quoting the phrase as contention
+// (tkt-63b4af5ab879). A file-level `message` is unprefixed; a stack names only vitest's own error classes.
+// `\S+ms` because a computed timeout prints as a float.
+const TIMED_OUT =
+  /^(?:(?:Error|AroundHook(?:Setup|Teardown)Error): )?(?:(?:Test|Hook) timed out in \S+ms\.|The (?:setup|teardown) phase of "\w+" hook timed out after \S+ms\.)/;
 // vitest 4's makeTimeoutError grafts its registration-time `new Error("STACK_TRACE_ERROR")` stack onto the timeout,
 // and the JSON reporter prefers `stack`, so this header is all a timeout leaves in failureMessages (tkt-366b0bf01713).
 const VITEST4_TIMEOUT_HEADER = /^Error: STACK_TRACE_ERROR(?:\r?\n|$)/;
