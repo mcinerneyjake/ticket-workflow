@@ -8,7 +8,8 @@ import * as testRun from './index.js';
 describe('the test-run export surface', () => {
   it('exports the consumer entry points by name', () => {
     const names = Object.keys(testRun).sort();
-    expect(names).toEqual(['EXIT', 'TEST_RUN_GLOBAL_SETUP', 'TestRunRefusal', 'clearStaleSlots', 'formatSlot', 'holdTestRun', 'listSlots', 'pidLiveness', 'releaseTestRun']);
+    expect(names).toEqual(['EXIT', 'TEST_RUN_GLOBAL_SETUP', 'TestRunRefusal', 'TestRunSlotReporter', 'clearStaleSlots', 'formatSlot', 'holdTestRun', 'listSlots', 'pidLiveness', 'releaseTestRun']);
+    expect(typeof testRun.TestRunSlotReporter).toBe('function');
     expect(typeof testRun.holdTestRun).toBe('function');
     expect(typeof testRun.releaseTestRun).toBe('function');
     expect(testRun.EXIT).toEqual({ SLOTS_FULL: 75, STATE_UNREADABLE: 78, TMPDIR_UNAVAILABLE: 74 });

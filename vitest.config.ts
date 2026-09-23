@@ -1,5 +1,6 @@
 import { configDefaults, defineConfig } from 'vitest/config';
 import { holdTestRun } from './src/test-run/hold.js';
+import { TestRunSlotReporter } from './src/test-run/reporter.js';
 
 // One of K machine-wide test-run slots, and a per-run TMPDIR, taken at config resolution so a
 // refused run has touched nothing (tkt-14788b3fc356). Released by src/test-run/globalSetup.ts.
@@ -13,6 +14,9 @@ export default defineConfig({
     setupFiles: ['src/test-support/silenceLogger.ts'],
     // Releases the slot and TMPDIR above. Only the release lives here — see holdTestRun.
     globalSetup: ['./src/test-run/globalSetup.ts'],
+    // Config resolution happens once, so the hold above would outlive every watch re-run; this
+    // hands the slot back between them. Inert under `vitest run` (tkt-43881f6840ad).
+    reporters: ['default', new TestRunSlotReporter({ repo: 'ticket-workflow' })],
     // Default glob picks up src/**/*.test.ts AND hooks/**/*.test.mjs. Extend the defaults rather
     // than replace them; .claude/worktrees/ can hold full second checkouts whose suites would
     // double-collect.

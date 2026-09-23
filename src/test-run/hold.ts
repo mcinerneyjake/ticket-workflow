@@ -50,7 +50,8 @@ export interface HoldTestRunOptions {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly log?: (line: string) => void;
   readonly setExitCode?: (code: number) => void;
-  readonly registerExit?: (fn: () => void) => void;
+  /** Returns a remover where it can: a re-acquiring holder must unregister before registering again. */
+  readonly registerExit?: (fn: () => void) => (() => void) | void;
   readonly registry?: Registry;
 }
 
@@ -63,6 +64,9 @@ interface Held {
   readonly timer: NodeJS.Timeout;
   readonly log: (line: string) => void;
   readonly setExitCode: (code: number) => void;
+  readonly env: NodeJS.ProcessEnv;
+  readonly prevTmpDir: string | undefined;
+  unregisterExit: (() => void) | undefined;
   released: boolean;
 }
 
@@ -88,8 +92,11 @@ export function defaultSetExitCode(code: number): void {
   process.exitCode = code;
 }
 
-export function defaultRegisterExit(fn: () => void): void {
+export function defaultRegisterExit(fn: () => void): () => void {
   process.once('exit', fn);
+  return () => {
+    process.removeListener('exit', fn);
+  };
 }
 
 function sanitizeRepo(name: string): string {
@@ -121,6 +128,19 @@ function releaseHeld(held: Held): void {
   if (held.released) return;
   held.released = true;
   clearInterval(held.timer);
+  // FIRST, because `released` is already true: nothing above this line may throw, or the restore is
+  // lost for good. os.tmpdir() RE-READS TMPDIR on every call, so a value left pointing at this run's
+  // (now deleted) dir roots the next hold inside it (tkt-43881f6840ad; nesting = tkt-c0c46f02a1f9).
+  if (held.prevTmpDir === undefined) delete held.env.TMPDIR;
+  else held.env.TMPDIR = held.prevTmpDir;
+  const unregister = held.unregisterExit;
+  held.unregisterExit = undefined;
+  try {
+    unregister?.();
+  } catch (err) {
+    // A consumer-supplied remover is arbitrary code; losing the slot release to it would be worse.
+    held.log(`[test-run] WARNING: could not unregister the exit hook: ${err instanceof Error ? err.message : String(err)}`);
+  }
   let outcome;
   try {
     outcome = releaseSlot(held.file, held.pid);
@@ -194,6 +214,7 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
       claim = claimSlot({ stateDir, slots, record, probe, now: now(), ttlMs, log });
     }
 
+    const prevTmpDir = env.TMPDIR;
     env.TMPDIR = runDir;
     const timer = setInterval(() => {
       try {
@@ -203,8 +224,15 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
       }
     }, heartbeatMs);
     timer.unref();
-    const held: Held = { slot: claim.slot, file: claim.file, pid, tmpDir: runDir, stateDir, timer, log, setExitCode, released: false };
-    registerExit(() => releaseHeld(held));
+    const held: Held = { slot: claim.slot, file: claim.file, pid, tmpDir: runDir, stateDir, timer, log, setExitCode, env, prevTmpDir, unregisterExit: undefined, released: false };
+    const remove = registerExit(() => releaseHeld(held));
+    // `registerExit` used to be declared `=> void`, so a consumer written against that may return
+    // something else entirely (`process.on` returns `process`). Under a re-acquiring watcher that
+    // silently leaks one exit listener per re-run, so name it rather than treating it as "no remover".
+    if (remove !== undefined && typeof remove !== 'function') {
+      log('[test-run] WARNING: registerExit returned a non-function, so its exit hook cannot be unregistered; a watch re-run leaks one listener per run');
+    }
+    held.unregisterExit = typeof remove === 'function' ? remove : undefined;
     log(`[test-run] slot ${claim.slot + 1}/${slots} · TMPDIR=${runDir}`);
     return { outcome: { kind: 'held', slot: claim.slot, tmpDir: runDir, stateDir }, held };
   } catch (err) {
