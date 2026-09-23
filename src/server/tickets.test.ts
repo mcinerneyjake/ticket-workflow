@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { listTickets, listBoard, listProjects, getTicket, createTicket, updateTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, HttpError } from './tickets.js';
+import { listTickets, listBoard, listProjects, getTicket, createTicket, updateTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, lastCheckpoint, HttpError } from './tickets.js';
 import { readEvents } from './events.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 import { setLogger } from '../logger.js';
@@ -1439,5 +1439,49 @@ describe('NUL guard scope and wording (tkt-5b2a1fbd011b review)', () => {
     expect(bodyErr.message).toMatch(/binary/);
     expect(titleErr.message).not.toMatch(/binary/);
     expect(titleErr.message).toMatch(/must not contain a raw NUL byte/);
+  });
+});
+
+describe('lastCheckpoint', () => {
+  it('returns null when the body has no checkpoint (edge: empty and plain bodies)', () => {
+    expect(lastCheckpoint('')).toBeNull();
+    expect(lastCheckpoint('## Done when\n- a checkpoint is mentioned in prose')).toBeNull();
+  });
+
+  it('returns the only checkpoint through the end of the body', () => {
+    expect(lastCheckpoint('Intro\n\n## Checkpoint 2026-09-22\nbranch: x\nnext: y\n\n')).toBe('## Checkpoint 2026-09-22\nbranch: x\nnext: y');
+  });
+
+  it('returns the LAST of several, stopping at the next same-level heading', () => {
+    const body = '## Checkpoint 1\nold\n\n## Checkpoint 2\nnew\n\n## Implementation summary\nafter';
+    expect(lastCheckpoint(body)).toBe('## Checkpoint 2\nnew');
+  });
+
+  it('keeps deeper subheadings inside the block and stops at a shallower one', () => {
+    const body = '### Checkpoint\na\n#### Detail\nb\n## Next section\nc';
+    expect(lastCheckpoint(body)).toBe('### Checkpoint\na\n#### Detail\nb');
+  });
+
+  it.each(['# Checkpoint', '## checkpoint 2026-09-22', '###### CHECKPOINT', '## Checkpoint'])('matches heading variant %j', (heading) => {
+    expect(lastCheckpoint(`${heading}\nstate`)).toBe(`${heading}\nstate`);
+  });
+
+  it.each(['## Checkpoints', '####### Checkpoint', '##Checkpoint', 'Checkpoint', '## Before checkpoint'])('does not match %j (rejection)', (heading) => {
+    expect(lastCheckpoint(`${heading}\nstate`)).toBeNull();
+  });
+
+  it('ignores a checkpoint heading quoted inside a code fence', () => {
+    const body = '## Checkpoint real\nkeep\n\n```md\n## Checkpoint quoted\n```\n\n~~~\n## Checkpoint tilde\n~~~';
+    expect(lastCheckpoint(body)).toContain('## Checkpoint real\nkeep');
+    expect(lastCheckpoint(body)).not.toMatch(/^## Checkpoint (quoted|tilde)/);
+  });
+
+  it('does not close a fence on a line carrying an info string', () => {
+    const body = '## Checkpoint real\nkeep\n## Next\n```\ncode\n```md\n## Checkpoint quoted\n```';
+    expect(lastCheckpoint(body)).toBe('## Checkpoint real\nkeep');
+  });
+
+  it('handles CRLF line endings', () => {
+    expect(lastCheckpoint('## Checkpoint\r\nstate\r\n## Next\r\n')).toBe('## Checkpoint\nstate');
   });
 });

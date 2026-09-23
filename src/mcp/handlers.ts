@@ -1,6 +1,6 @@
 import { type Tool } from '@modelcontextprotocol/sdk/types.js';
 import {
-  listBoard, getTicket, createTicket, updateTicket, deleteTicket, HttpError, errnoCode,
+  listBoard, getTicket, createTicket, updateTicket, startTicket, deleteTicket, HttpError, errnoCode,
   type UnreadableTicketFile,
 } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
@@ -195,10 +195,13 @@ export const TOOLS: Tool[] = [
   },
   {
     name: 'start_ticket',
-    description: 'Mark a ticket in-progress and return its full details including body. Use this when the user picks a ticket to work on — it sets the status and loads everything needed to begin implementation in one call.',
+    description: 'Mark a ticket in-progress and return its full details including body. Use this when the user picks a ticket to work on — it sets the status and loads everything needed to begin implementation in one call. REFUSES a ticket that is already in-progress (another session may hold it): the error carries the ticket\'s last `## Checkpoint` block and changes nothing. Pass force: true only when that checkpoint\'s branch/worktree is yours or its holder is gone — never on the strength of a clean git status.',
     inputSchema: {
       type: 'object',
-      properties: { id: { type: 'string', description: 'Ticket ID' } },
+      properties: {
+        id: { type: 'string', description: 'Ticket ID' },
+        force: { type: 'boolean', description: 'Start even though the ticket is already in-progress. Only the literal true forces.' },
+      },
       required: ['id'],
     },
   },
@@ -318,7 +321,7 @@ export async function handleToolCall(
       case 'start_ticket': {
         const id = extractId(args);
         if (!id) throw new HttpError(400, 'Missing required field: id');
-        return { content: [textContent(JSON.stringify(await updateTicket(id, { status: 'in-progress' }), null, 2))] };
+        return { content: [textContent(JSON.stringify(await startTicket(id, { force: args?.force === true }), null, 2))] };
       }
 
       case 'record_review': {
