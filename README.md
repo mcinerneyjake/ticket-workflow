@@ -658,7 +658,10 @@ Playwright holds a slot from its own config load and needs the equivalent per-ru
 consumer's config; this reporter covers vitest only.
 
 A holder is reclaimed only when its pid is gone (`ESRCH`); a pid another user owns reads as alive,
-and a live holder whose heartbeat stopped is reclaimed after the TTL. The claim is an atomic
+and a live holder whose heartbeat stopped is reclaimed after the TTL. One further case: a slot
+recording the *claimant's own* pid is reclaimed on sight, whatever its age, because a process takes
+at most one slot — a second one bearing its pid is a leak from a release that threw, and left there
+it reads as a live holder to every other repo until the TTL. The claim is an atomic
 `link(2)` and the reclaim decides under a per-slot lock — measured on the race test, a reclaim that
 judged from an earlier read could rename a live winner's fresh record.
 
