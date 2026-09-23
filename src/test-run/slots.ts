@@ -53,6 +53,12 @@ export interface SlotRecord {
   readonly cwd: string;
   readonly startedAt: string;
   readonly tmpDir: string;
+  /**
+   * Per-hold nonce, so ownership can be decided WITHIN one pid (tkt-a99209bedbb9). Optional on
+   * purpose: several pinned versions of this package share one state dir on a machine, so a record
+   * written by one without tokens must still parse and still release here.
+   */
+  readonly token?: string;
 }
 
 export interface SlotView {
@@ -119,7 +125,10 @@ export function parseSlotRecord(text: string): SlotRecord | null {
   if (!Number.isSafeInteger(o.pid) || typeof o.pid !== 'number' || o.pid <= 0) return null;
   if (typeof o.repo !== 'string' || typeof o.cwd !== 'string' || typeof o.tmpDir !== 'string') return null;
   if (typeof o.startedAt !== 'string' || Number.isNaN(Date.parse(o.startedAt))) return null;
-  return { version: 1, pid: o.pid, repo: o.repo, cwd: o.cwd, startedAt: o.startedAt, tmpDir: o.tmpDir };
+  // An empty token would compare equal to an absent one, silently restoring pid-only ownership.
+  if (o.token !== undefined && (typeof o.token !== 'string' || o.token === '')) return null;
+  const token = typeof o.token === 'string' ? o.token : undefined;
+  return { version: 1, pid: o.pid, repo: o.repo, cwd: o.cwd, startedAt: o.startedAt, tmpDir: o.tmpDir, token };
 }
 
 function unreadable(what: string, err: unknown): TestRunRefusal {
@@ -230,19 +239,41 @@ function acquireReclaimLock(lock: string, now: number): boolean {
   return false;
 }
 
+/** Who is claiming: the pid, plus the tokens of the slots this process still holds. */
+interface SelfClaim {
+  readonly pid: number;
+  readonly heldTokens: ReadonlySet<string>;
+}
+
+/**
+ * Whether a slot recording our own pid is a LEAK from a failed release rather than a live sibling
+ * hold. A token we still hold belongs to a run that is about to use it: reclaiming that would delete
+ * a live record and over-grant `slots` (tkt-a99209bedbb9). Both the out-of-lock decision and
+ * reclaim's in-lock re-check go through here, so the two cannot disagree and half-apply the reclaim.
+ *
+ * Two cases it does NOT distinguish, neither of them new and neither improved here:
+ * a token-less record (the pre-token rule, pid alone — wrong if a second *version* of this package is
+ * live in this process, tkt-a51a84902cc9), and a foreign process wearing our pid, whose token is
+ * absent from our set for the same reason a leak's is (tkt-f5dae96f0298).
+ */
+function isSelfOrphan(record: SlotRecord, self: SelfClaim | null): boolean {
+  if (self === null || record.pid !== self.pid) return false;
+  return record.token === undefined || !self.heldTokens.has(record.token);
+}
+
 /**
  * Removes a dead, expired or self-orphaned slot, deciding INSIDE a per-slot lock: judging from an
  * earlier read then renaming let a reclaimer rename a live winner's fresh record (3 of 8 granted,
- * tkt-14788b3fc356). `selfPid` must match the caller's out-of-lock decision, or this re-check vetoes
+ * tkt-14788b3fc356). `self` must match the caller's out-of-lock decision, or this re-check vetoes
  * it and the reclaim silently never happens.
  */
-function reclaim(view: SlotView, opts: ReadOptions, selfPid: number | null): boolean {
+function reclaim(view: SlotView, opts: ReadOptions, self: SelfClaim | null): boolean {
   const lock = `${view.file}.reclaim`;
   if (!acquireReclaimLock(lock, opts.now)) return false;
   try {
     const current = readSlot(path.dirname(view.file), view.slot, opts.probe, opts.now, opts.ttlMs);
     if (current === null) return false;
-    if (current.liveness !== 'dead' && !current.expired && current.record.pid !== selfPid) return false;
+    if (current.liveness !== 'dead' && !current.expired && !isSelfOrphan(current.record, self)) return false;
     const stale = `${view.file}.stale-${current.record.pid}-${opts.now}`;
     try {
       renameSync(view.file, stale);
@@ -266,6 +297,8 @@ export interface ClaimOptions extends ReadOptions {
   readonly slots: number;
   readonly record: SlotRecord;
   readonly log: (line: string) => void;
+  /** Tokens of slots this process still holds: live siblings, never leaks to reclaim. */
+  readonly heldTokens?: ReadonlySet<string>;
 }
 
 export interface Claim {
@@ -279,13 +312,13 @@ export function formatSlot(v: SlotView): string {
 }
 
 /**
- * Clears any OTHER slot recording our own pid once we hold one. The in-loop branch below only sees
+ * Clears any OTHER slot this process has orphaned once we hold one. The in-loop branch below only sees
  * slots we actually contend for, so a leak in a slot we never reached would survive — two slots on
  * one live pid, which `clear-stale` will not touch and which reads as full to every other repo for
  * the whole TTL (tkt-0ce4d4313ce7). Read errors are swallowed deliberately: before this sweep a
  * corrupt slot elsewhere never refused a valid claim, and it must not start.
  */
-function clearOwnOrphans(opts: ClaimOptions, keepSlot: number): void {
+function clearOwnOrphans(opts: ClaimOptions, self: SelfClaim, keepSlot: number): void {
   for (let slot = 0; slot < opts.slots; slot += 1) {
     if (slot === keepSlot) continue;
     let view: SlotView | null;
@@ -294,8 +327,8 @@ function clearOwnOrphans(opts: ClaimOptions, keepSlot: number): void {
     } catch {
       continue;
     }
-    if (view === null || view.record.pid !== opts.record.pid) continue;
-    if (reclaim(view, opts, opts.record.pid)) {
+    if (view === null || !isSelfOrphan(view.record, self)) continue;
+    if (reclaim(view, opts, self)) {
       opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — our own orphaned slot from a failed release`);
     }
   }
@@ -307,6 +340,7 @@ function clearOwnOrphans(opts: ClaimOptions, keepSlot: number): void {
  */
 export function claimSlot(opts: ClaimOptions): Claim | null {
   ensureStateDir(opts.stateDir);
+  const self: SelfClaim = { pid: opts.record.pid, heldTokens: opts.heldTokens ?? new Set() };
   const draft = path.join(opts.stateDir, `slot.draft-${opts.record.pid}-${Math.random().toString(36).slice(2, 8)}`);
   try {
     writeFileSync(draft, JSON.stringify(opts.record), { mode: 0o644 });
@@ -319,7 +353,7 @@ export function claimSlot(opts: ClaimOptions): Claim | null {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         try {
           linkSync(draft, target); // AUTHORIZING: the only line that grants a slot
-          clearOwnOrphans(opts, slot);
+          clearOwnOrphans(opts, self, slot);
           return { slot, file: target };
         } catch (err) {
           if (errnoCode(err) !== 'EEXIST') throw unreadable(`link ${target}`, err);
@@ -334,11 +368,12 @@ export function claimSlot(opts: ClaimOptions): Claim | null {
           if (reclaim(view, opts, null)) opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — no heartbeat within the TTL`);
           continue;
         }
-        if (view.record.pid === opts.record.pid) {
-          // Our own live pid in a slot we are trying to claim is a leak from a failed release in this
-          // process, not a peer: holdTestRun grants once per process, so we can never contend with
-          // ourselves. Without this the run blocks on itself until the TTL (tkt-0ce4d4313ce7).
-          if (reclaim(view, opts, opts.record.pid)) {
+        if (isSelfOrphan(view.record, self)) {
+          // Our own pid in a slot we are trying to claim, with a token we no longer hold, is a leak
+          // from a failed release — not a peer. Without this the run blocks on itself until the TTL
+          // (tkt-0ce4d4313ce7). A token we DO still hold falls through to the break below and is
+          // treated as the live holder it is (tkt-a99209bedbb9).
+          if (reclaim(view, opts, self)) {
             opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — our own orphaned slot from a failed release`);
           }
           continue;
@@ -359,8 +394,18 @@ export function heartbeat(file: string, now: number): void {
 
 export type ReleaseOutcome = 'released' | 'missing' | 'foreign';
 
-/** Unlinks the slot only while it still records `pid`; a reissued or vanished slot is reported, not deleted. */
-export function releaseSlot(file: string, pid: number): ReleaseOutcome {
+/**
+ * Unlinks the slot only while it still records THIS hold; a reissued or vanished slot is reported,
+ * not deleted. The token is what makes that true within one pid: on pid alone a released hold deleted
+ * the record of a second hold that had since taken the same slot, reporting `released` and leaving
+ * that run unguarded (tkt-a99209bedbb9).
+ *
+ * `undefined` on both sides matches on pid alone. `releaseHeld` always passes a token, so that is not
+ * a path this package takes — it is tolerance for a record written by an older pinned copy, kept so
+ * such a record cannot wedge a slot. The reverse direction is NOT guarded and cannot be from here: an
+ * older copy's two-argument `releaseSlot` still deletes one of our records on a pid match.
+ */
+export function releaseSlot(file: string, pid: number, token?: string): ReleaseOutcome {
   let text: string;
   try {
     text = readFileSync(file, 'utf8');
@@ -369,7 +414,8 @@ export function releaseSlot(file: string, pid: number): ReleaseOutcome {
     throw err;
   }
   const record = parseSlotRecord(text);
-  if (record === null || record.pid !== pid) return 'foreign';
+  // AUTHORIZING: the only line that permits the unlink.
+  if (record === null || record.pid !== pid || record.token !== token) return 'foreign';
   unlinkSync(file);
   return 'released';
 }

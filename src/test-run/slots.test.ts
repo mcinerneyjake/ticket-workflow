@@ -131,6 +131,23 @@ describe('parseSlotRecord', () => {
       expect(parseSlotRecord(text)).toBeNull();
     },
   );
+
+  it('round-trips a token', () => {
+    const rec = { ...record(process.pid), token: 'tok-1' };
+    expect(parseSlotRecord(JSON.stringify(rec))).toEqual(rec);
+  });
+
+  it('reads a record written before tokens as having none, rather than rejecting it', () => {
+    // Several pinned versions share one state dir, so a token-less record must stay readable here.
+    expect(parseSlotRecord(JSON.stringify(record(process.pid)))?.token).toBeUndefined();
+  });
+
+  // An empty or non-string token compares equal to an absent one somewhere in the ownership tests,
+  // which would silently restore pid-only ownership for that record.
+  it.each(['""', '123', 'null', '{}'])('rejects a record whose token is %s', (tok) => {
+    const text = `{"version":1,"pid":1,"repo":"a","cwd":"b","startedAt":"2026-01-01T00:00:00Z","tmpDir":"c","token":${tok}}`;
+    expect(parseSlotRecord(text)).toBeNull();
+  });
 });
 
 describe('claimSlot — the slot dimension', () => {
@@ -364,6 +381,60 @@ describe('claimSlot — the holder dimension', () => {
     expect(log).toEqual([]);
     expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('revived');
   });
+
+  // The self-reclaim's veto (tkt-a99209bedbb9). Each case below pairs with the one after it: the only
+  // difference is whether the planted token is one we still hold, so a broken veto cannot read green.
+  it('does NOT reclaim our own pid when the token is one we still hold — a live sibling, not a leak', () => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'sibling'), token: 'tok-live' }, TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive), heldTokens: new Set(['tok-live']) });
+    expect(result).toBeNull();
+    expect(log).toEqual([]);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('sibling');
+  });
+
+  it('DOES reclaim our own pid when the token is one we no longer hold', () => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'orphan'), token: 'tok-gone' }, TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive), heldTokens: new Set(['tok-live']) });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(true);
+  });
+
+  it('takes the next free slot rather than a live sibling’s, so the pool is never over-granted', () => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'sibling'), token: 'tok-live' }, TTL - 60_000);
+    const { result } = claim(dir, record(process.pid, 'me'), { slots: 2, probe: fixedProbe(alive), heldTokens: new Set(['tok-live']) });
+    expect(result?.slot).toBe(1);
+    expect(readdirSync(dir).sort()).toEqual(['slot-0', 'slot-1']);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('sibling');
+  });
+
+  it('does not sweep a live sibling’s LATER slot when it grants an earlier free one', () => {
+    // clearOwnOrphans runs after the grant, so the veto has to hold on that path too.
+    const dir = stateDir();
+    plant(dir, 1, { ...record(process.pid, 'sibling'), token: 'tok-live' }, TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid, 'me'), { slots: 2, probe: fixedProbe(alive), heldTokens: new Set(['tok-live']) });
+    expect(result?.slot).toBe(0);
+    expect(readdirSync(dir).sort()).toEqual(['slot-0', 'slot-1']);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(false);
+  });
+
+  it('still reclaims a live sibling’s slot once its heartbeat is past the TTL', () => {
+    // The TTL is the backstop for a hold whose process is wedged; the veto must not outrank it.
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'wedged-sibling'), token: 'tok-live' }, TTL + 60_000);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive), heldTokens: new Set(['tok-live']) });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('no heartbeat within the TTL'))).toBe(true);
+  });
+
+  it('refuses a corrupt record rather than treating it as our own orphan', () => {
+    const dir = stateDir();
+    plant(dir, 0, '{not json');
+    expect(refusalOf(() => claim(dir, record(process.pid))).code).toBe(EXIT.STATE_UNREADABLE);
+    expect(readdirSync(dir)).toEqual(['slot-0']);
+  });
 });
 
 describe('releaseSlot', () => {
@@ -382,6 +453,35 @@ describe('releaseSlot', () => {
     const dir = stateDir();
     const file = plant(dir, 0, record(1));
     expect(releaseSlot(file, process.pid)).toBe('foreign');
+    expect(readdirSync(dir)).toEqual(['slot-0']);
+  });
+
+  // tkt-a99209bedbb9: the pair pid alone could not tell apart. Both records carry OUR pid.
+  it('reports, and does not delete, a slot reissued to another hold in the same process', () => {
+    const dir = stateDir();
+    const file = plant(dir, 0, { ...record(process.pid, 'the-new-holder'), token: 'tok-2' });
+    expect(releaseSlot(file, process.pid, 'tok-1')).toBe('foreign');
+    expect(readdirSync(dir)).toEqual(['slot-0']);
+  });
+
+  it('unlinks the slot when the token matches', () => {
+    const dir = stateDir();
+    const file = plant(dir, 0, { ...record(process.pid), token: 'tok-1' });
+    expect(releaseSlot(file, process.pid, 'tok-1')).toBe('released');
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('releases a pre-token record on a pid match, so an older pinned version’s slot is not stranded', () => {
+    const dir = stateDir();
+    const file = plant(dir, 0, record(process.pid));
+    expect(releaseSlot(file, process.pid, undefined)).toBe('released');
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('reports a pre-token record when WE hold a token: ours was replaced by an older writer', () => {
+    const dir = stateDir();
+    const file = plant(dir, 0, record(process.pid));
+    expect(releaseSlot(file, process.pid, 'tok-1')).toBe('foreign');
     expect(readdirSync(dir)).toEqual(['slot-0']);
   });
 });

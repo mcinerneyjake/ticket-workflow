@@ -659,11 +659,25 @@ consumer's config; this reporter covers vitest only.
 
 A holder is reclaimed only when its pid is gone (`ESRCH`); a pid another user owns reads as alive,
 and a live holder whose heartbeat stopped is reclaimed after the TTL. One further case: a slot
-recording the *claimant's own* pid is reclaimed on sight, whatever its age, because a process takes
-at most one slot — a second one bearing its pid is a leak from a release that threw, and left there
-it reads as a live holder to every other repo until the TTL. The claim is an atomic
-`link(2)` and the reclaim decides under a per-slot lock — measured on the race test, a reclaim that
-judged from an earlier read could rename a live winner's fresh record.
+recording the *claimant's own* pid **and a per-hold token the claimant no longer holds** is reclaimed
+on sight, whatever its age — that is a leak from a release that threw, and left there it reads as a
+live holder to every other repo until the TTL.
+
+The token is what makes that judgement safe. A process can hold **more than one** slot — the config and
+globalSetup load through separate module registries, and `registry` is a caller-supplied option — so
+*own pid* alone let one hold reclaim a live sibling's record, over-granting the pool, and let a
+released hold delete the record of the hold that had since taken the same slot (`tkt-a99209bedbb9`).
+Releasing matches the token too, so a hold whose slot was reissued **reports** it rather than deleting
+the new owner's record.
+
+Two cases the token does **not** settle. A record written before tokens carries none and falls back to
+pid alone — kept so a record from an older pinned copy cannot wedge a slot, but wrong if two *versions*
+of this package are live in one process (`tkt-a51a84902cc9`). And a foreign process that happens to
+share our pid writes a token absent from our set, which reads the same as a leak, so a shared
+`TEST_SLOTS_DIR` across a pid-namespace boundary is still unguarded (`tkt-f5dae96f0298`).
+
+The claim is an atomic `link(2)` and the reclaim decides under a per-slot lock — measured on the race
+test, a reclaim that judged from an earlier read could rename a live winner's fresh record.
 
 ```bash
 npx ticket-workflow test-slots            # who holds what, with liveness and age

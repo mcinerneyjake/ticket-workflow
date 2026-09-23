@@ -479,3 +479,89 @@ describe('a hostile registerExit cannot cost the release', () => {
     expect(readdirSync(h.stateDir)).toEqual([]);
   });
 });
+
+// Two live holds in one process (tkt-a99209bedbb9). `registry` is public API and the config and
+// globalSetup load through different module registries, so "one hold per process" was an assumption
+// the reclaim branch relied on and nothing enforced.
+//
+// SLOT layer only. Two live holds still corrupt each other's per-run TMPDIR — the second nests inside
+// the first and the first's release deletes it (tkt-6d494a02f2f3). `harness` gives each hold its own
+// `env` and an explicit `tmpRoot`, so nothing here would notice; do not read these as blessing the
+// configuration end to end.
+describe('two live holds in one process', () => {
+  it('gives the second hold its own slot instead of cannibalising the first', async () => {
+    const first = harness({ slots: 2 });
+    const second = harness({ stateDir: first.stateDir, tmpRoot: first.tmpRoot, slots: 2 });
+
+    expect((await holdTestRun(first.opts)).kind).toBe('held');
+    expect((await holdTestRun(second.opts)).kind).toBe('held');
+
+    expect(readdirSync(first.stateDir).sort()).toEqual(['slot-0', 'slot-1']);
+
+    await releaseTestRun(first.registry);
+    await releaseTestRun(second.registry);
+    expect(readdirSync(first.stateDir)).toEqual([]);
+  });
+
+  it('leaves the second hold’s slot alone when the first releases', async () => {
+    // What makes this hold is the reclaim veto above, which keeps the two on DIFFERENT slots, so the
+    // first release only ever reads its own record. Mutating releaseSlot's token clause leaves this
+    // green — the release-side guard is covered by the planted case below and by slots.test.ts.
+    const first = harness({ slots: 2 });
+    const second = harness({ stateDir: first.stateDir, tmpRoot: first.tmpRoot, slots: 2 });
+    await holdTestRun(first.opts);
+    await holdTestRun(second.opts);
+    const secondSlot = readdirSync(first.stateDir).find((n) => n !== 'slot-0') ?? 'slot-1';
+
+    await releaseTestRun(first.registry);
+
+    expect(readdirSync(first.stateDir)).toEqual([secondSlot]);
+    expect(parseSlotRecord(readFileSync(path.join(first.stateDir, secondSlot), 'utf8'))?.pid).toBe(process.pid);
+    await releaseTestRun(second.registry);
+  });
+
+  it('reports rather than deletes when its own slot was reissued to another hold mid-run', async () => {
+    // The release-side guard end to end, on the state a degraded veto would produce: two holds on ONE
+    // slot file. Planted, because the veto correctly prevents reaching it through holdTestRun — but it
+    // is reachable if globalThis is not shared (separate realms), which is the veto's one assumption.
+    const h = harness({ slots: 1 });
+    await holdTestRun(h.opts);
+    const file = path.join(h.stateDir, 'slot-0');
+    const mine = parseSlotRecord(readFileSync(file, 'utf8'));
+    expect(mine?.token).toBeDefined();
+    writeFileSync(file, JSON.stringify({ ...mine, token: 'a-different-hold' }));
+
+    await releaseTestRun(h.registry);
+
+    expect(readdirSync(h.stateDir)).toEqual(['slot-0']);
+    expect(parseSlotRecord(readFileSync(file, 'utf8'))?.token).toBe('a-different-hold');
+    expect(h.log.some((l) => l.includes('reissued to another run'))).toBe(true);
+  });
+
+  it('refuses a second hold rather than stealing the only slot from a live sibling', async () => {
+    // The availability side of the veto, asserted deliberately: with the pool full of our OWN live
+    // holds the second one refuses, exactly as it would behind a peer. Stealing is the permissive
+    // answer, and it is the defect.
+    const first = harness({ slots: 1 });
+    await holdTestRun(first.opts);
+    const second = harness({ stateDir: first.stateDir, tmpRoot: first.tmpRoot, slots: 1, waitMs: 0 });
+    expect((await refusal(holdTestRun(second.opts))).code).toBe(EXIT.SLOTS_FULL);
+    expect(readdirSync(first.stateDir)).toEqual(['slot-0']);
+    await releaseTestRun(first.registry);
+  });
+
+  it('still reclaims a genuine self-orphan left by a failed release', async () => {
+    // tkt-0ce4d4313ce7's behaviour, as a negative control on the veto added above: once a hold is
+    // released its slot is no longer a live sibling, so a leaked file must still be reclaimed.
+    const h = harness({ slots: 1 });
+    await holdTestRun(h.opts);
+    const leaked = readFileSync(path.join(h.stateDir, 'slot-0'), 'utf8');
+    await releaseTestRun(h.registry);
+    writeFileSync(path.join(h.stateDir, 'slot-0'), leaked);
+
+    const next = harness({ stateDir: h.stateDir, tmpRoot: h.tmpRoot, slots: 1 });
+    expect((await holdTestRun(next.opts)).kind).toBe('held');
+    expect(next.log.some((l) => l.includes('own orphaned slot'))).toBe(true);
+    await releaseTestRun(next.registry);
+  });
+});

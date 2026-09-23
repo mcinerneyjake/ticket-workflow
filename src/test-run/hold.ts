@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -59,6 +60,8 @@ interface Held {
   readonly slot: number;
   readonly file: string;
   readonly pid: number;
+  /** Distinguishes this hold from any other in the same pid, at both reclaim and release. */
+  readonly token: string;
   readonly tmpDir: string;
   readonly stateDir: string;
   readonly timer: NodeJS.Timeout;
@@ -79,6 +82,7 @@ declare global {
   // The config file and globalSetup load through different module registries; only globalThis is
   // shared between them (measured in copart-filter's testDbLock, the shape this mirrors).
   var __ticketWorkflowTestRun: Promise<RunState> | undefined;
+  var __ticketWorkflowHeldTokens: Set<string> | undefined;
 }
 
 export const globalRegistry: Registry = {
@@ -87,6 +91,16 @@ export const globalRegistry: Registry = {
     globalThis.__ticketWorkflowTestRun = p;
   },
 };
+
+/**
+ * Tokens of the slots this process still holds. On globalThis for the same reason the registry is,
+ * and not injectable for a reason the registry is: two of these would each read the other's live hold
+ * as an orphan to reclaim, which is the defect (tkt-a99209bedbb9).
+ */
+function heldTokens(): Set<string> {
+  globalThis.__ticketWorkflowHeldTokens ??= new Set();
+  return globalThis.__ticketWorkflowHeldTokens;
+}
 
 export function defaultSetExitCode(code: number): void {
   process.exitCode = code;
@@ -133,6 +147,9 @@ function releaseHeld(held: Held): void {
   // (now deleted) dir roots the next hold inside it (tkt-43881f6840ad; nesting = tkt-c0c46f02a1f9).
   if (held.prevTmpDir === undefined) delete held.env.TMPDIR;
   else held.env.TMPDIR = held.prevTmpDir;
+  // Also before anything that can throw: a slot file left behind by the release below must look like
+  // an orphan to the next claim, or tkt-0ce4d4313ce7's self-reclaim never fires for it.
+  heldTokens().delete(held.token);
   const unregister = held.unregisterExit;
   held.unregisterExit = undefined;
   try {
@@ -143,7 +160,7 @@ function releaseHeld(held: Held): void {
   }
   let outcome;
   try {
-    outcome = releaseSlot(held.file, held.pid);
+    outcome = releaseSlot(held.file, held.pid, held.token);
   } catch (err) {
     // Vitest swallows a globalSetup teardown rejection and exits 0; the exit code is what survives.
     held.setExitCode(1);
@@ -176,6 +193,7 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
   const registerExit = opts.registerExit ?? defaultRegisterExit;
   const stateDir = opts.stateDir ?? testSlotsStateDir(env);
   const pid = process.pid;
+  const token = randomUUID();
   let runDir: string | null = null;
 
   try {
@@ -190,13 +208,13 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
     // TMPDIR first: a run refused on tmpdir grounds must not be holding a slot.
     const prepared = prepareRunTmpDir({ tmpRoot, repo, pid, probe, now: now(), tmpTtlMs, log });
     runDir = prepared.runDir;
-    const record: SlotRecord = { version: 1, pid, repo, cwd, startedAt: new Date(now()).toISOString(), tmpDir: runDir };
+    const record: SlotRecord = { version: 1, pid, repo, cwd, startedAt: new Date(now()).toISOString(), tmpDir: runDir, token };
     const holders = (): string => listSlots(stateDir, { probe, now: now(), ttlMs }).map(formatSlot).join('\n  ');
 
     const start = now();
     let delay = 1000;
     let lastReport = Number.NEGATIVE_INFINITY;
-    let claim = claimSlot({ stateDir, slots, record, probe, now: now(), ttlMs, log });
+    let claim = claimSlot({ stateDir, slots, record, probe, now: now(), ttlMs, log, heldTokens: heldTokens() });
     while (claim === null) {
       const t = now();
       if (t - lastReport >= 60_000) {
@@ -211,9 +229,12 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
       }
       await sleep(Math.min(delay, Math.max(0, waitMs - (t - start))));
       delay = Math.min(delay * 2, 10_000);
-      claim = claimSlot({ stateDir, slots, record, probe, now: now(), ttlMs, log });
+      claim = claimSlot({ stateDir, slots, record, probe, now: now(), ttlMs, log, heldTokens: heldTokens() });
     }
 
+    // No `await` between claimSlot linking the slot and this line, so a concurrent acquire in this
+    // process can never observe the slot before its token counts as live and reclaim it as an orphan.
+    heldTokens().add(token);
     const prevTmpDir = env.TMPDIR;
     env.TMPDIR = runDir;
     const timer = setInterval(() => {
@@ -224,7 +245,7 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
       }
     }, heartbeatMs);
     timer.unref();
-    const held: Held = { slot: claim.slot, file: claim.file, pid, tmpDir: runDir, stateDir, timer, log, setExitCode, env, prevTmpDir, unregisterExit: undefined, released: false };
+    const held: Held = { slot: claim.slot, file: claim.file, pid, token, tmpDir: runDir, stateDir, timer, log, setExitCode, env, prevTmpDir, unregisterExit: undefined, released: false };
     const remove = registerExit(() => releaseHeld(held));
     // `registerExit` used to be declared `=> void`, so a consumer written against that may return
     // something else entirely (`process.on` returns `process`). Under a re-acquiring watcher that
@@ -236,7 +257,10 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
     log(`[test-run] slot ${claim.slot + 1}/${slots} · TMPDIR=${runDir}`);
     return { outcome: { kind: 'held', slot: claim.slot, tmpDir: runDir, stateDir }, held };
   } catch (err) {
-    // A refused run holds nothing: whatever refused it, the run dir prepared above goes too.
+    // A refused run holds nothing: whatever refused it, the run dir prepared above goes too. The
+    // token goes with it, so a slot file linked before the throw is reclaimable rather than wedged
+    // behind a token no Held will ever release.
+    heldTokens().delete(token);
     if (runDir !== null) removeRunTmpDir(runDir);
     if (err instanceof TestRunRefusal) setExitCode(err.code);
     throw err;
