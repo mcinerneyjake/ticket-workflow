@@ -30,6 +30,7 @@ import {
 
 const tempDirs: string[] = [];
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -262,11 +263,11 @@ writeFileSync(out, JSON.stringify({ success: !bad, testResults: [file('src/a.tes
 process.exit(bad ? 1 : 0);
 `;
 
-/** A git runner that cannot reach the enclosing repo through a hook-exported GIT_DIR. */
+/** Inherited env minus hook-exported git state and ambient slot config; `extra` may still set either (tkt-947fdf0a6d73). */
 function scrubbedEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
-  for (const k of ['GIT_DIR', 'GIT_INDEX_FILE', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_PREFIX', 'TEST_SLOTS', 'CI']) delete env[k];
-  return env;
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const k of ['GIT_DIR', 'GIT_INDEX_FILE', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY', 'GIT_PREFIX', 'TEST_SLOTS', 'TEST_SLOTS_WAIT_MS', 'CI']) delete env[k];
+  return { ...env, ...extra };
 }
 
 function git(args: readonly string[], cwd: string): GitResult {
@@ -359,6 +360,22 @@ describe('runContention end to end (stub npm test)', () => {
     expect(cwds.every((l) => l.endsWith(' true'))).toBe(true);
     expect(worktreeCount(repo)).toBe(1);
     expect(parseHistory(readFileSync(path.join(stateDir, 'history.jsonl'), 'utf8')).map((h) => `${h.arm}:${h.result}`)).toEqual(['control:red', 'bounded:green']);
+  });
+
+  it.each([
+    ['a caller-set value reaches every run unchanged', { TEST_SLOTS_WAIT_MS: '4321' }, '4321'],
+    ['an ambient shell value is scrubbed, so the wait is derived', {}, String(2 * 30 * 60_000)],
+  ])('TEST_SLOTS_WAIT_MS: %s', async (_label, stub, expected) => {
+    vi.stubEnv('TEST_SLOTS_WAIT_MS', '777');
+    const repo = stubRepo();
+    const stateDir = tempDir('tw-contention-state-');
+    const envs: NodeJS.ProcessEnv[] = [];
+    const runTest = async (o: Parameters<ContentionDeps['runTest']>[0]) => {
+      envs.push(o.env);
+      return 0;
+    };
+    await runContention({ runs: 2, control: false }, deps(repo, stateDir, { stub, runTest }));
+    expect(envs.map((e) => e.TEST_SLOTS_WAIT_MS)).toEqual([expected, expected]);
   });
 
   it('withholds the verdict when a run writes no report, and still removes every worktree', async () => {
