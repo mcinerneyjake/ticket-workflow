@@ -115,10 +115,51 @@ writes nothing to `.history/`. Successive edits accumulate one snapshot per prio
 version, and `list_tickets` ignores `.history/`, so snapshots never surface on the
 board.
 
-**Recovery is manual — there is no restore UI.** To roll a body back, read the
-relevant `.history/<id>/<timestamp>.md` and copy its body into the live ticket (e.g.
-via `update_ticket`). Snapshotting is best-effort: a failure is logged but never
-blocks the edit, so a write can still land without a backup.
+`deleteTicket` records too, and does it **fail-closed**: it snapshots the ticket's
+final state — the raw bytes, so a file whose frontmatter won't parse is still
+deletable — and writes a `deleted.json` tombstone naming that snapshot and the
+blocker/parent edges its cleanup strips from other tickets. If either write fails,
+**the delete is refused and the ticket is left alone.** That is deliberately the
+opposite of the update path's posture: a refused edit wedges work in progress, while
+a refused delete costs only a retry, and after an unlink there is nothing left to
+recover from.
+
+### Restoring
+
+```
+ticket-workflow history <id>                      # snapshots newest-first; works for a DELETED id
+ticket-workflow restore <id> --at <snapshot>      # roll the body back
+ticket-workflow restore <id> --at <snapshot> --full   # …and every other writable field
+ticket-workflow restore <id> --undelete           # recreate a deleted ticket
+```
+
+`restore --at` goes through `updateTicket`, so **the pre-restore state is itself
+snapshotted** and a restore is undoable in turn. `--full` puts back every writable
+field; `created`, `source` and `runId` are set-once and are never forged by a
+restore. `--undelete` writes the snapshot's bytes back verbatim, refuses to
+overwrite a live ticket, and **prints** the edges the delete stripped rather than
+re-linking them — the tickets on the other end may have moved on since.
+
+There is no MCP tool for either verb: restoring is a human, command-line act, so no
+agent can perform one unasked.
+
+A restore refuses — writing nothing — on a malformed id, an id with no history, a
+snapshot that does not parse, a file that is not a `.md` snapshot (so `--at
+deleted.json`, or an orphaned `*.tmp`, cannot be restored as a ticket body), a path
+that does not resolve inside `.history/<id>/`, a `.history/<id>` that is itself a
+symlink out of the board, `--undelete` on a live id, a plain `--at` restore on a
+deleted id, and a restore that would change nothing. **`--undelete` is checked the
+same way**: its snapshot name comes from `readdir` and so cannot traverse, but it is
+still resolved through the same containment check, because the name can be a symlink.
+
+Containment is what identifies a snapshot as this ticket's, since snapshot
+frontmatter carries no id — the directory is the identity.
+
+Two limits worth knowing: the per-id lock is in-process only, so a CLI restore
+racing another process's write can still lose it; and `.history/` lives inside
+`tickets/`, so none of this survives losing that directory. Update-path
+snapshotting also remains best-effort — a failure there is logged but never blocks
+the edit, so a write can still land without a backup.
 
 ## Corrupt ticket files
 
