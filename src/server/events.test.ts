@@ -50,6 +50,17 @@ describe('appendEvent', () => {
     expect(e).toMatchObject({ at: '2026-07-01T00:00:00.000Z', detail: '2 errors' });
   });
 
+  // Written by the hook for a failed chain it cannot attribute; a reader that counted it as
+  // `unrecognized` would turn every such ticket's verify verdict into UNKNOWN (tkt-24925929919c).
+  it('accepts the unattributed state, and the reducer surfaces it over an earlier pass', async () => {
+    await appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'passed' });
+    await appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'unattributed', outcomeFrom: 'event' });
+    const out = await getTicketEvents('tkt-abc');
+    expect(out.unrecognized).toBe(0);
+    expect(out.skipped).toBe(0);
+    expect(out.pipeline.find((p) => p.step === 'test')?.state).toBe('unattributed');
+  });
+
   it('appends (never overwrites) across calls', async () => {
     await appendEvent({ ticketId: 'tkt-abc', step: 'branch', state: 'passed' });
     await appendEvent({ ticketId: 'tkt-abc', step: 'commit', state: 'passed' });

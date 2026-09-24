@@ -40,6 +40,9 @@ import { dirTarget, hasTopLevelBackground, hasTopLevelPipe, hiddenDirMove, resol
 // was passed, so the hook records `review` alongside `commit` (see recordsFor).
 export const HOOK_STEPS = ['branch', 'typecheck', 'lint', 'test', 'commit', 'pr_opened', 'review'];
 
+// Neither `failed` (may accuse a link that never ran) nor silence (leaves a stale `passed`): tkt-24925929919c.
+export const UNATTRIBUTED = 'unattributed';
+
 // Strip leading subshell/group punctuation and simple VAR=val env prefixes,
 // returning a command segment's token list. Shares the STRIP with guard-bash's parsing so
 // `echo "npm run lint"` isn't mistaken for the real command, but not the tokenizer: dirBuiltin is
@@ -332,8 +335,9 @@ export function main() {
     const command = payload?.tool_input?.command;
     const unattributableFailure =
       state === 'failed' && (milestones.length !== 1 || opaqueSegments(command) > 0);
-    const attributable = unattributableFailure ? [] : milestones.filter((m) => m.exitObservable);
-    if (attributable.length > 0) {
+    const outcome = unattributableFailure ? UNATTRIBUTED : state;
+    const recordable = milestones.filter((m) => m.exitObservable);
+    if (recordable.length > 0) {
       const at = new Date().toISOString();
       // Resolved PER milestone, not once for the command: one compound command can legitimately
       // touch two repos, and each half belongs to its own repo's ticket (tkt-8ada0242e94e).
@@ -347,7 +351,7 @@ export function main() {
       // Grouped so recordsFor sees each ticket's own steps in order — it inserts `review` before a
       // passing `commit`, which must land on the ticket that was committed, not the session's.
       const byTicket = new Map();
-      for (const { step, dir } of attributable) {
+      for (const { step, dir } of recordable) {
         const ticketId = ticketFor(dir);
         if (!ticketId) continue; // no repo, or a branch naming no ticket => nothing to attribute to
         const steps = byTicket.get(ticketId) ?? [];
@@ -356,7 +360,7 @@ export function main() {
         byTicket.set(ticketId, steps);
       }
       for (const [ticketId, steps] of byTicket)
-        for (const r of recordsFor(steps, state)) record(ticketId, r.step, r.state, at);
+        for (const r of recordsFor(steps, outcome)) record(ticketId, r.step, r.state, at);
     }
   } catch {
     // best-effort: telemetry must never disrupt the tool

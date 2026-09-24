@@ -122,6 +122,13 @@ describe('verdicts', () => {
     expect(verifyTicket(facts({ steps: { branch: 'passed', test: 'failed' } })).outcome).toBe('violation');
   });
 
+  // The latest run may have passed, failed or never run; a violation would claim more than that.
+  it('is UNKNOWN for an UNATTRIBUTED test milestone, never OK and never a violation', () => {
+    const v = verifyTicket(facts({ steps: { branch: 'passed', test: 'unattributed' } }));
+    expect(v.outcome).toBe('unknown');
+    expect(v.reason).toContain('could not say which link failed');
+  });
+
   it('is OK for a claim of none — the docs-only case the workflow excuses', () => {
     // This single rule is what takes the finding set from ~20 mostly-false to 4 precise ones on the
     // live board: a docs ticket asserts nothing the record can contradict.

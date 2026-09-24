@@ -108,8 +108,9 @@ export type StepId = (typeof STEPS)[number]['id']
 // for. A parity test asserts the hook's inline regex matches this .source.
 export const BRANCH_TICKET_ID_RE = /tkt-[0-9a-f]{12}/;
 
-// reached = status milestone hit (no pass/fail); passed/failed = command milestone resolved via exit code.
-export const STEP_STATES = ['reached', 'passed', 'failed'] as const;
+// reached = status milestone hit (no pass/fail); passed/failed = command milestone resolved via exit code;
+// unattributed = the milestone sat in a failed command that could not say which link failed (tkt-24925929919c).
+export const STEP_STATES = ['reached', 'passed', 'failed', 'unattributed'] as const;
 export type StepState = (typeof STEP_STATES)[number]
 
 // Status transitions that map to a tracked milestone; others emit nothing.

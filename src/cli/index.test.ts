@@ -170,6 +170,16 @@ describe('cmdShow', () => {
     expect(lines.some((l) => l.includes('✓') && l.includes('2026-07-01T00:00:00.000Z'))).toBe(true);
     expect(lines.some((l) => l.startsWith('  ·'))).toBe(true); // steps with no event stay pending
   });
+
+  // Rendered as pending, a recorded failure reads as a step that never ran (tkt-24925929919c).
+  it('renders an unattributed step with its own glyph, not the pending one', async () => {
+    const t = await createTicket({ title: 'Unattributed', type: 'chore', priority: 'low', status: 'todo' });
+    await appendEvent({ ticketId: t.id, step: 'test', state: 'unattributed', at: '2026-07-01T00:00:00.000Z' });
+    const lines = captureLog();
+    await cmdShow(t.id);
+    const row = lines.find((l) => l.includes('2026-07-01T00:00:00.000Z'));
+    expect(row?.startsWith('  ?')).toBe(true);
+  });
 });
 
 describe('cmdList', () => {

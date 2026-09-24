@@ -5,7 +5,7 @@ import { clearStaleSlots, DEFAULT_TTL_MS, formatSlot, listSlots, pidLiveness, Te
 import { listTickets, getTicket, DELETE_RECORD_FILE, type StrippedEdge } from '../server/tickets.js';
 import { listHistory, restoreFromSnapshot, undeleteFromHistory } from '../server/history.js';
 import { getTicketEvents } from '../server/events.js';
-import { isStatusId, STATUS_IDS } from '../shared/constants.js';
+import { isStatusId, STATUS_IDS, type StepState } from '../shared/constants.js';
 import { runChecks, exitCodeFor, formatResults } from '../doctor/checks.js';
 import { gatherFacts } from '../doctor/gather.js';
 import { runAudit, auditExitCode, formatAudit } from '../audit/run.js';
@@ -23,10 +23,12 @@ import { cmdTestContention } from './contention.js';
 // Renders the pipeline from the SAME reducePipeline the web board uses, so the
 // text view can't drift from the real tracker.
 
-const GLYPH: Record<string, string> = {
+// Keyed exhaustively so a new state fails to compile instead of rendering as pending (tkt-24925929919c).
+const GLYPH: Record<StepState | 'pending', string> = {
   passed: '✓',
   reached: '✓',
   failed: '✗',
+  unattributed: '?',
   pending: '·',
 };
 
@@ -50,7 +52,7 @@ export async function cmdShow(id: string): Promise<void> {
   const { pipeline, skipped, unrecognized } = await getTicketEvents(id);
   console.log(`${ticket.id}  ${ticket.status}  ${ticket.title}`);
   for (const step of pipeline) {
-    const glyph = GLYPH[step.state] ?? '·';
+    const glyph = GLYPH[step.state];
     const when = step.at ? `  (${step.at})` : '';
     console.log(`  ${glyph} ${step.label}${when}`);
   }
