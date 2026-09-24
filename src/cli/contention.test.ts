@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   armResult,
@@ -53,6 +54,10 @@ function report(files: { name: string; failed?: (string | string[])[]; fileMessa
     })),
   });
 }
+
+const evidence = (over: { unhandledErrors?: number; coverageAfterFailure?: boolean } = {}): string =>
+  JSON.stringify({ version: 1, unhandledErrors: 0, coverageAfterFailure: false, ...over });
+const CLEAN = evidence();
 
 const green = (index: number, slots: number | null = 2): RunOutcome => ({ kind: 'determined', index, exitCode: 0, green: true, files: [], slots });
 const red = (index: number, slots: number | null = 2): RunOutcome => ({
@@ -176,7 +181,7 @@ describe('parseReport', () => {
   ])('names a file-level %s beside a timed-out test as mixed, so the file is not contention-shaped', (_label, fileMessage) => {
     const text = report([{ name: '/wt/src/a.test.ts', failed: [VITEST4_TIMEOUT], fileMessage }]);
     expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1, mixed: ['<file-level error>'] }] });
-    const runs = [summarizeRun({ index: 0, exitCode: 1, report: text, log: '', roots: ['/wt'] })];
+    const runs = [summarizeRun({ evidence: CLEAN, index: 0, exitCode: 1, report: text, log: '', roots: ['/wt'] })];
     expect(contentionShaped(runs)).toBe(false);
     expect(mixedTests(runs)).toEqual(['src/a.test.ts › <file-level error>']);
   });
@@ -252,16 +257,53 @@ describe('parseReport', () => {
 
 describe('summarizeRun', () => {
   it('is undetermined with no report', () => {
-    expect(summarizeRun({ index: 0, exitCode: 75, report: null, log: '', roots: [] }).kind).toBe('undetermined');
+    expect(summarizeRun({ evidence: CLEAN, index: 0, exitCode: 75, report: null, log: '', roots: [] }).kind).toBe('undetermined');
   });
   it('reads the slot bound from the hold line', () => {
-    const r = summarizeRun({ index: 0, exitCode: 0, report: report([]), log: '[test-run] slot 2/3 · TMPDIR=/t', roots: [] });
+    const r = summarizeRun({ evidence: CLEAN, index: 0, exitCode: 0, report: report([]), log: '[test-run] slot 2/3 · TMPDIR=/t', roots: [] });
     expect(r).toMatchObject({ kind: 'determined', green: true, slots: 3 });
   });
   it('is red when the run exits non-zero with every file passing', () => {
-    const r = summarizeRun({ index: 0, exitCode: 1, report: report([{ name: '/a.test.ts' }]), log: '', roots: [] });
+    const r = summarizeRun({ evidence: CLEAN, index: 0, exitCode: 1, report: report([{ name: '/a.test.ts' }]), log: '', roots: [] });
     expect(r).toMatchObject({ kind: 'determined', green: false, slots: null });
     expect(formatTable([r]).join('\n')).toContain('<run exited 1 with no failing file>');
+  });
+
+  // The JSON report drops unhandled errors, and vitest exits 1 for them exactly as for a timeout (tkt-b1182a02fb14).
+  const timedOut = report([{ name: '/wt/src/a.test.ts', failed: ['Error: STACK_TRACE_ERROR'] }, { name: '/wt/src/b.test.ts' }]);
+  const run = (ev: string | null, text = timedOut, exitCode: number | null = 1): RunOutcome =>
+    summarizeRun({ evidence: ev, index: 0, exitCode, report: text, log: '', roots: ['/wt'] });
+  it('names an unhandled error beside a timed-out test as mixed, so the run is not contention-shaped', () => {
+    const runs = [run(evidence({ unhandledErrors: 2 }))];
+    expect(contentionShaped(runs)).toBe(false);
+    expect(mixedTests(runs)).toEqual(['src/a.test.ts › <unhandled errors in the run: 2>']);
+  });
+  it('names coverage checked after a failure as mixed: its threshold may be what exited non-zero', () => {
+    const runs = [run(evidence({ coverageAfterFailure: true }))];
+    expect(contentionShaped(runs)).toBe(false);
+    expect(mixedTests(runs)).toEqual(['src/a.test.ts › <coverage thresholds checked after the failure>']);
+  });
+  it('keeps a timed-out run contention-shaped when the evidence is clean', () => {
+    expect(contentionShaped([run(CLEAN)])).toBe(true);
+  });
+  it.each([
+    ['no evidence', null],
+    ['evidence that is not JSON', '{'],
+    ['evidence of another version', JSON.stringify({ version: 2, unhandledErrors: 0, coverageAfterFailure: false })],
+    ['a negative count', evidence({ unhandledErrors: -1 })],
+    ['a fractional count', evidence({ unhandledErrors: 0.5 })],
+    ['a missing coverage flag', JSON.stringify({ version: 1, unhandledErrors: 0 })],
+  ])('is undetermined on a non-zero run with a timeout and %s', (_label, ev) => {
+    expect(run(ev)).toMatchObject({ kind: 'undetermined', reason: expect.stringContaining('evidence') });
+    expect(run(ev, timedOut, null).kind).toBe('undetermined');
+    expect(run(ev, timedOut, 0).kind).toBe('undetermined');
+  });
+  it.each([
+    ['a green run', report([{ name: '/wt/src/a.test.ts' }]), 0],
+    ['a run with only an assertion failure', report([{ name: '/wt/src/a.test.ts', failed: ['AssertionError: x'] }]), 1],
+    ['a run exiting non-zero with every file passing', report([{ name: '/wt/src/a.test.ts' }]), 1],
+  ])('needs no evidence for %s, where no test timed out', (_label, text, exitCode) => {
+    expect(run(null, text, exitCode).kind).toBe('determined');
   });
 });
 
@@ -335,7 +377,7 @@ describe('decide — control arm', () => {
   });
   it('refuses a control red only on timeouts beside another error, naming each test once', () => {
     const text = report([{ name: '/wt/src/a.test.ts', failed: [['Error: Test timed out in 20000ms.', 'TypeError: x']] }]);
-    const runs = [0, 1].map((index) => summarizeRun({ index, exitCode: 1, report: text, log: '', roots: ['/wt'] }));
+    const runs = [0, 1].map((index) => summarizeRun({ evidence: CLEAN, index, exitCode: 1, report: text, log: '', roots: ['/wt'] }));
     const d = decide({ ...base, runs });
     expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
     expect(d.lines).toHaveLength(1);
@@ -347,7 +389,7 @@ describe('decide — control arm', () => {
       { name: '/wt/src/a.test.ts', failed: [['Error: Test timed out in 20000ms.', 'TypeError: x']] },
       { name: '/wt/src/b.test.ts', failed: ['AssertionError: expected 1 to be 2'] },
     ]);
-    const d = decide({ ...base, runs: [0, 1].map((index) => summarizeRun({ index, exitCode: 1, report: text, log: '', roots: ['/wt'] })) });
+    const d = decide({ ...base, runs: [0, 1].map((index) => summarizeRun({ evidence: CLEAN, index, exitCode: 1, report: text, log: '', roots: ['/wt'] })) });
     expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
     expect(d.lines[0]).toContain('HEAD is red on its own');
     expect(d.lines[1]).toContain('src/a.test.ts › t0');
@@ -417,10 +459,12 @@ if (process.env.STUB_TRACE) appendFileSync(process.env.STUB_TRACE, process.cwd()
 console.error('[test-run] slot 1/' + (process.env.TEST_SLOTS ?? '1') + ' · TMPDIR=x');
 await new Promise((r) => setTimeout(r, 100));
 if (mode === 'noreport') process.exit(75);
-const bad = mode === 'red';
+const bad = mode === 'red' || mode === 'unhandled';
 const file = (n, failed) => ({ name: path.join(process.cwd(), n), status: failed ? 'failed' : 'passed', message: '',
   assertionResults: [{ status: failed ? 'failed' : 'passed', failureMessages: failed ? ['Error: Test timed out in 20000ms.'] : [] }] });
 writeFileSync(out, JSON.stringify({ success: !bad, testResults: [file('src/a.test.ts', bad), file('src/b.test.ts', false)] }));
+const evidence = process.env.TEST_CONTENTION_EVIDENCE;
+if (evidence) writeFileSync(evidence, JSON.stringify({ version: 1, unhandledErrors: mode === 'unhandled' ? 1 : 0, coverageAfterFailure: false }));
 process.exit(bad ? 1 : 0);
 `;
 
@@ -521,6 +565,15 @@ describe('runContention end to end (stub npm test)', () => {
     expect(cwds.every((l) => l.endsWith(' true'))).toBe(true);
     expect(worktreeCount(repo)).toBe(1);
     expect(parseHistory(readFileSync(path.join(stateDir, 'history.jsonl'), 'utf8')).map((h) => `${h.arm}:${h.result}`)).toEqual(['control:red', 'bounded:green']);
+  });
+
+  it('never records a control red whose runs reported an unhandled error beside the timeouts', async () => {
+    const repo = stubRepo();
+    const stateDir = tempDir('tw-contention-state-');
+    const d = deps(repo, stateDir, { stub: { STUB_CONTROL: 'unhandled' } });
+    expect(await runContention({ runs: 2, control: true }, d)).toBe(CONTENTION_EXIT.NO_VERDICT);
+    expect(d.out.join('\n')).toContain('src/a.test.ts › <unhandled errors in the run: 1>');
+    expect(parseHistory(readFileSync(path.join(stateDir, 'history.jsonl'), 'utf8')).map((h) => h.result)).toEqual(['undetermined']);
   });
 
   it.each([
@@ -634,5 +687,55 @@ describe('the real process list, git and CLI entry', () => {
       process.exitCode = before;
       errSpy.mockRestore();
     }
+  });
+});
+
+// The seam this ticket's evidence crosses: spawn args, per-run env, the reporter vitest loads, summarizeRun (tkt-b1182a02fb14).
+describe('defaultRunTest over a real vitest run', () => {
+  const LATE_REJECTION = [
+    "import { it } from 'vitest';",
+    "it('times out', async () => { setTimeout(() => { void Promise.reject(new TypeError('late boom')); }, 150); await new Promise(() => {}); }, 100);",
+    "it('outlives the rejection', async () => { await new Promise((r) => setTimeout(r, 400)); });",
+  ].join('\n');
+  const TIMEOUT_ONLY = ["import { it } from 'vitest';", "it('times out', async () => { await new Promise(() => {}); }, 100);"].join('\n');
+
+  async function realRun(test: string, config: object = {}): Promise<RunOutcome> {
+    const repo = tempDir('tw-contention-vitest-');
+    writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ name: 'v', private: true, type: 'module', scripts: { test: 'vitest run' } }));
+    writeFileSync(path.join(repo, 'vitest.config.mjs'), `export default ${JSON.stringify({ test: { include: ['a.t.mjs'], ...config } })};`);
+    writeFileSync(path.join(repo, 'a.t.mjs'), test);
+    symlinkSync(fileURLToPath(new URL('../../node_modules', import.meta.url)), path.join(repo, 'node_modules'));
+    const files = { reportFile: path.join(repo, 'r.json'), logFile: path.join(repo, 'r.log'), evidenceFile: path.join(repo, 'e.json') };
+    const exitCode = await defaultRunTest({ cwd: repo, env: scrubbedEnv(), ...files });
+    const read = (f: string): string | null => (existsSync(f) ? readFileSync(f, 'utf8') : null);
+    return summarizeRun({ index: 0, exitCode, report: read(files.reportFile), evidence: read(files.evidenceFile), log: read(files.logFile) ?? '', roots: [repo, realpathSync(repo)] });
+  }
+
+  const REAL_RUN_MS = 60_000;
+  it('sees the unhandled rejection the JSON report drops, so the timeout is not contention', { timeout: REAL_RUN_MS }, async () => {
+    const r = await realRun(LATE_REJECTION);
+    expect(r).toMatchObject({ kind: 'determined', exitCode: 1 });
+    expect(contentionShaped([r])).toBe(false);
+    expect(mixedTests([r])).toEqual(['a.t.mjs › <unhandled errors in the run: 1>']);
+  });
+  it('marks a timeout mixed when coverage thresholds are still checked after a failure', { timeout: REAL_RUN_MS }, async () => {
+    const r = await realRun(TIMEOUT_ONLY, { coverage: { enabled: true, reportOnFailure: true, provider: 'v8', include: ['a.t.mjs'], thresholds: { lines: 1 } } });
+    expect(mixedTests([r])).toEqual(['a.t.mjs › <coverage thresholds checked after the failure>']);
+  });
+  it('still reads a lone timeout as contention (control)', { timeout: REAL_RUN_MS }, async () => {
+    const r = await realRun(TIMEOUT_ONLY);
+    expect(r).toMatchObject({ kind: 'determined', exitCode: 1 });
+    expect(contentionShaped([r])).toBe(true);
+  });
+  it('removes a leftover report and evidence file before the run, so a silent run cannot inherit them', async () => {
+    const repo = tempDir('tw-contention-stale-');
+    writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ name: 'v', private: true, scripts: { test: 'node noop.mjs' } }));
+    writeFileSync(path.join(repo, 'noop.mjs'), '');
+    const files = { reportFile: path.join(repo, 'r.json'), logFile: path.join(repo, 'r.log'), evidenceFile: path.join(repo, 'e.json') };
+    writeFileSync(files.reportFile, report([{ name: path.join(repo, 'a.t.mjs'), failed: ['Error: STACK_TRACE_ERROR'] }]));
+    writeFileSync(files.evidenceFile, CLEAN);
+    expect(await defaultRunTest({ cwd: repo, env: scrubbedEnv(), ...files })).toBe(0);
+    expect(existsSync(files.reportFile)).toBe(false);
+    expect(existsSync(files.evidenceFile)).toBe(false);
   });
 });

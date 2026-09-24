@@ -2,7 +2,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { defaultRepoName } from '../test-run/hold.js';
+import { CONTENTION_EVIDENCE_ENV, type RunEvidence } from './contentionReporter.js';
 import { provisionFailed, provisionWorktree } from '../worktree/provision.js';
 
 // tkt-98cdd3b87020. The bounded arm's verdict needs a same-day red control: a green run on a machine
@@ -155,10 +157,30 @@ export function slotBound(log: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
+export function parseEvidence(text: string | null): RunEvidence | null {
+  if (text === null) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (
+    !isObject(raw) ||
+    !('version' in raw) || raw.version !== 1 ||
+    !('unhandledErrors' in raw) || typeof raw.unhandledErrors !== 'number' || !Number.isInteger(raw.unhandledErrors) || raw.unhandledErrors < 0 ||
+    !('coverageAfterFailure' in raw) || typeof raw.coverageAfterFailure !== 'boolean'
+  ) {
+    return null;
+  }
+  return { version: 1, unhandledErrors: raw.unhandledErrors, coverageAfterFailure: raw.coverageAfterFailure };
+}
+
 export function summarizeRun(input: {
   readonly index: number;
   readonly exitCode: number | null;
   readonly report: string | null;
+  readonly evidence: string | null;
   readonly log: string;
   readonly roots: readonly string[];
 }): RunOutcome {
@@ -169,9 +191,21 @@ export function summarizeRun(input: {
   }
   const parsed = parseReport(input.report, input.roots);
   if (typeof parsed === 'string') return { kind: 'undetermined', index, exitCode, slots, reason: parsed };
+  let files = parsed.files;
+  // Whatever the exit code: a test script can mask vitest's, and the report alone would read as contention.
+  if (files.some((f) => f.timeouts > 0)) {
+    const evidence = parseEvidence(input.evidence);
+    if (evidence === null) {
+      return { kind: 'undetermined', index, exitCode, slots, reason: 'no readable run evidence from the contention reporter (it needs vitest >= 3 for onTestRunEnd)' };
+    }
+    const beside = [
+      ...(evidence.unhandledErrors > 0 ? [`<unhandled errors in the run: ${evidence.unhandledErrors}>`] : []),
+      ...(evidence.coverageAfterFailure ? ['<coverage thresholds checked after the failure>'] : []),
+    ];
+    if (beside.length > 0) files = files.map((f) => (f.timeouts > 0 ? { ...f, mixed: [...f.mixed, ...beside] } : f));
+  }
   // A non-zero exit with every file passing (a coverage threshold, a teardown error) is still red.
-  const files =
-    exitCode !== 0 && parsed.files.length === 0 ? [{ file: `<run exited ${exitCode ?? 'by signal'} with no failing file>`, failed: 1, timeouts: 0, mixed: [] }] : parsed.files;
+  if (exitCode !== 0 && files.length === 0) files = [{ file: `<run exited ${exitCode ?? 'by signal'} with no failing file>`, failed: 1, timeouts: 0, mixed: [] }];
   return { kind: 'determined', index, exitCode, slots, files, green: exitCode === 0 && parsed.success && files.length === 0 };
 }
 
@@ -367,6 +401,14 @@ export interface GitResult {
 
 export type Signal = 'SIGINT' | 'SIGTERM';
 
+export interface RunTestOpts {
+  readonly cwd: string;
+  readonly env: NodeJS.ProcessEnv;
+  readonly reportFile: string;
+  readonly logFile: string;
+  readonly evidenceFile: string;
+}
+
 export interface ContentionDeps {
   readonly cwd: string;
   readonly env: NodeJS.ProcessEnv;
@@ -378,7 +420,7 @@ export interface ContentionDeps {
   readonly git: (args: readonly string[], cwd: string) => GitResult;
   /** `null` when the process list cannot be read — which refuses the run, never passes it. */
   readonly processList: () => string | null;
-  readonly runTest: (opts: { readonly cwd: string; readonly env: NodeJS.ProcessEnv; readonly reportFile: string; readonly logFile: string }) => Promise<number | null>;
+  readonly runTest: (opts: RunTestOpts) => Promise<number | null>;
   /** Registers `fn` for the signals; returns the unregister. */
   readonly onSignal: (fn: (signal: Signal) => void) => () => void;
   readonly exit: (code: number) => void;
@@ -411,10 +453,20 @@ export function defaultOnSignal(fn: (signal: Signal) => void): () => void {
   };
 }
 
-export function defaultRunTest(opts: { readonly cwd: string; readonly env: NodeJS.ProcessEnv; readonly reportFile: string; readonly logFile: string }): Promise<number | null> {
+// `.ts` beside the source under this repo's own vitest, `.js` beside the build everywhere else.
+const EVIDENCE_REPORTER = fileURLToPath(new URL(`./contentionReporter${path.extname(fileURLToPath(import.meta.url))}`, import.meta.url));
+
+export function defaultRunTest(opts: RunTestOpts): Promise<number | null> {
   return new Promise((resolve) => {
+    // A leftover file at either path must never pass as this run's output.
+    rmSync(opts.reportFile, { force: true });
+    rmSync(opts.evidenceFile, { force: true });
     const fd = openSync(opts.logFile, 'a');
-    const child = spawn('npm', ['test', '--', '--reporter=json', `--outputFile=${opts.reportFile}`], { cwd: opts.cwd, env: opts.env, stdio: ['ignore', fd, fd] });
+    const child = spawn('npm', ['test', '--', '--reporter=json', `--outputFile=${opts.reportFile}`, `--reporter=${EVIDENCE_REPORTER}`], {
+      cwd: opts.cwd,
+      env: { ...opts.env, [CONTENTION_EVIDENCE_ENV]: opts.evidenceFile },
+      stdio: ['ignore', fd, fd],
+    });
     const done = (code: number | null): void => {
       closeSync(fd);
       resolve(code);
@@ -533,7 +585,13 @@ export async function runContention(args: ContentionArgs, deps: ContentionDeps):
     try {
       exits = await Promise.all(
         trees.map((dir, i) =>
-          deps.runTest({ cwd: dir, env, reportFile: path.join(artifacts, `run-${i + 1}.json`), logFile: path.join(artifacts, `run-${i + 1}.log`) }),
+          deps.runTest({
+            cwd: dir,
+            env,
+            reportFile: path.join(artifacts, `run-${i + 1}.json`),
+            logFile: path.join(artifacts, `run-${i + 1}.log`),
+            evidenceFile: path.join(artifacts, `run-${i + 1}.evidence.json`),
+          }),
         ),
       );
     } finally {
@@ -558,6 +616,7 @@ export async function runContention(args: ContentionArgs, deps: ContentionDeps):
         index: i,
         exitCode: exits[i] ?? null,
         report: read(path.join(artifacts, `run-${i + 1}.json`)),
+        evidence: read(path.join(artifacts, `run-${i + 1}.evidence.json`)),
         log: read(path.join(artifacts, `run-${i + 1}.log`)) ?? '',
         roots: [dir, real],
       });
