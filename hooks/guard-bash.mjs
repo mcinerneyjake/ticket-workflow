@@ -79,8 +79,7 @@ const argValue = (token) => dequote(token) ?? token;
 // bare `-a` nobody wrote, refusing an ordinary commit on any branch
 // (tkt-8f2e1f9894e2). Quoting stays in the REPO-DIR token: resolveDir owns its removal and accepts
 // it wherever it sits, so `-C "/a/my repo"/sub` names one dir. `sub` and `args` come back DEQUOTED
-// instead (see argValue), with the raw spelling kept alongside as `rawArgs` for the one reader that
-// needs it — the short-flag scan (tkt-6d1ae448e3b3).
+// instead (see argValue).
 export function parseGit(segment) {
   const stripped = segment.trim().replace(/^[({\s]+/, '').replace(/[)}\s]+$/, '');
   const tokens = quotedTokens(stripped);
@@ -112,9 +111,8 @@ export function parseGit(segment) {
   // everywhere else (resolveDir, UNRESOLVABLE_MOVE). Report it and let the caller refuse: such a
   // command is a shell syntax error, so nothing legitimate is wedged (tkt-8f2e1f9894e2).
   if (i >= tokens.length)
-    return endsInsideQuote(stripped) ? { sub: null, args: [], rawArgs: [], repoDir, truncated: true } : null;
-  const rawArgs = tokens.slice(i + 1);
-  return { sub: argValue(tokens[i]), args: rawArgs.map(argValue), rawArgs, repoDir, truncated: false };
+    return endsInsideQuote(stripped) ? { sub: null, args: [], repoDir, truncated: true } : null;
+  return { sub: argValue(tokens[i]), args: tokens.slice(i + 1).map(argValue), repoDir, truncated: false };
 }
 
 
@@ -123,14 +121,36 @@ export function parseGit(segment) {
 // (guard-subagent-gates.mjs imports splitSegments from here).
 export { cdTarget, splitSegments };
 
-// The short-flag LETTERS of a single-dash token, stopping at an attached value. Quote-aware
-// tokenizing keeps `-m"fix and go"` in one token, and scanning all of it read the message text as a
-// flag cluster — refusing an ordinary commit because its words contain an `a`, and an ordinary push
-// because they contain an `f`. Both were the false-block direction the tokenizer change set out to
-// remove, one spelling over (tkt-8f2e1f9894e2). Long `--` flags carry no letter cluster.
-function shortFlagLetters(token) {
-  if (!token.startsWith('-') || token.startsWith('--')) return '';
-  return token.slice(1).split(/['"]/)[0];
+// Options whose VALUE git takes from the rest of the cluster or the next token (`optional`: attached
+// only). A wrong entry here admits; a missing one only over-blocks — so never add a guess.
+const VALUE_OPTIONS = {
+  commit: {
+    short: 'mFCct', optional: 'Su',
+    long: ['--message', '--file', '--reuse-message', '--reedit-message', '--fixup', '--squash',
+      '--author', '--date', '--template', '--cleanup', '--trailer', '--pathspec-from-file'],
+  },
+  push: { short: 'o', optional: '', long: ['--push-option', '--repo', '--receive-pack', '--exec'] },
+  clean: { short: 'e', optional: '', long: ['--exclude'] },
+  branch: { short: 'u', optional: 't', long: ['--set-upstream-to'] },
+  checkout: { short: 'bB', optional: 't', long: ['--orphan'] },
+};
+
+// Short-flag letters git reads as switches, off the DEQUOTED args (tkt-a3bf9e90d073). No stop at
+// `--`: an unlisted long option can take `--` as its value, and git keeps parsing flags after it.
+function shortFlagLetters(sub, args) {
+  const { short = '', optional = '', long = [] } = VALUE_OPTIONS[sub] ?? {};
+  let letters = '';
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (long.includes(a)) { i++; continue; }
+    if (!a.startsWith('-') || a.startsWith('--')) continue;
+    for (let j = 1; j < a.length; j++) {
+      if (optional.includes(a[j])) break;
+      if (short.includes(a[j])) { if (j === a.length - 1) i++; break; }
+      letters += a[j];
+    }
+  }
+  return letters;
 }
 
 // Args that stage the whole working tree rather than named paths.
@@ -141,14 +161,8 @@ function stagesEverything(args) {
 
 // `git commit -a` / `-am` (a single-dash cluster containing 'a') or `--all`
 // stages all tracked files, bypassing the add guard entirely.
-//
-// Two argument lists, and they are not interchangeable: the long flag is a VALUE, so it is matched
-// dequoted (`git commit "--all"`), while the letter cluster is scanned RAW because a quote is what
-// marks where an attached value begins — dequoting `-m"fix and go"` first would read the message
-// text as flags and refuse an ordinary commit, which is tkt-8f2e1f9894e2's false block returning by
-// another route (tkt-6d1ae448e3b3).
-function commitStagesAll(args, rawArgs) {
-  return args.some((a) => a === '--all') || rawArgs.some((a) => shortFlagLetters(a).includes('a'));
+function commitStagesAll(args) {
+  return args.some((a) => a === '--all') || shortFlagLetters('commit', args).includes('a');
 }
 
 // True when a push would land on main: an explicit main refspec/target, or a
@@ -196,18 +210,11 @@ function switchTarget(sub, args, protectedBranches) {
 // safe because this hook rejects the dangerous shapes they would otherwise admit
 // (force-push, force-add over .gitignore, force branch-delete, hard reset,
 // untracked-file deletion, force checkout). Returns a reason or null.
-// Same split as commitStagesAll: exact flags and the `+refspec` force syntax are values, read
-// dequoted, and only the letter cluster reads raw. `rawArgs` defaults to `args` for a caller holding
-// only the dequoted list — that makes the cluster scan read dequoted values, which OVER-blocks
-// (`-o"ci skip fast"` dequotes to `-oci skip fast`, whose `f` reads as --force). Fail-closed, and
-// not "unchanged behaviour": ruleFor always passes both (tkt-6d1ae448e3b3).
-export function destructiveGitReason(sub, args, rawArgs = args) {
+export function destructiveGitReason(sub, args) {
   const has = (...flags) => args.some((a) => flags.includes(a));
-  // A single-character short flag present anywhere in a single-dash cluster,
-  // e.g. 'f' in `-uf` or 'd' in `-df` — so clustered flags can't slip past an
-  // exact-token check. Excludes long (`--`) flags and `-o=val` attached values.
-  const hasShort = (ch) =>
-    rawArgs.some((a) => !a.includes('=') && shortFlagLetters(a).includes(ch));
+  // Clustered flags (`-uf`, `-df`) can't slip past an exact-token check.
+  let letters;
+  const hasShort = (ch) => (letters ??= shortFlagLetters(sub, args)).includes(ch);
   switch (sub) {
     case 'push':
       // Force by flag (-f / -uf / --force / --force-with-lease) OR by the
@@ -306,14 +313,14 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
       const git = parseGit(segment);
       if (git) {
         if (git.truncated) return { blocked: true, reason: TRUNCATED_QUOTE };
-        const { sub, args, rawArgs, repoDir } = git;
+        const { sub, args, repoDir } = git;
         const gitDir = repoDir ? resolveDir(dir, repoDir) : dir; // -C acts on that repo, whatever the cwd
         // Scoped to commit/push and checked before the rules, like the branch===null refusal they
         // share a reason with: an unknown directory must not wedge `git status`, but it must never
         // buy a commit an exemption. An absolute `-C` still names its repo, so it is unaffected.
         if (unknownDir && gitDir === null && (sub === 'commit' || sub === 'push'))
           return { blocked: true, reason: UNRESOLVABLE_MOVE };
-        const verdict = ruleFor(sub, args, rawArgs, branchFor(gitDir), () => repoFor(gitDir));
+        const verdict = ruleFor(sub, args, branchFor(gitDir), () => repoFor(gitDir));
         if (verdict) return { blocked: true, reason: verdict };
         // Only switch/checkout needs the repo shape here; computing it for every segment would put
         // the git subprocesses back on `git status`/`log`/`diff`, which is what the thunk avoids.
@@ -345,14 +352,14 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
 // `branch` is the branch of the repo THIS command acts on, not the hook's.
 // `getRepo()` is a THUNK returning { hasRemote, protectedBranches } — called only by the rules that
 // need it, so `git status`/`log`/`diff` never pay for the git subprocesses it costs.
-function ruleFor(sub, args, rawArgs, branch, getRepo) {
-  const destructive = destructiveGitReason(sub, args, rawArgs);
+function ruleFor(sub, args, branch, getRepo) {
+  const destructive = destructiveGitReason(sub, args);
   if (destructive) return destructive;
 
   if ((sub === 'add' || sub === 'stage') && stagesEverything(args))
     return "git add/stage of the whole tree (-A / --all / . / *) stages everything. Stage only this ticket's files explicitly (git add <path> ...). See CLAUDE.md → Branch, commit & PR workflow.";
 
-  if (sub === 'commit' && commitStagesAll(args, rawArgs))
+  if (sub === 'commit' && commitStagesAll(args))
     return "git commit -a / -am stages every tracked change, bypassing per-ticket staging. Stage this ticket's files explicitly, then commit without -a. See CLAUDE.md.";
 
   // Everything above is repo-shape-independent. The two protected-branch rules below are NOT: the

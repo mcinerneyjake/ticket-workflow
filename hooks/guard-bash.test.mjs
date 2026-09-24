@@ -30,18 +30,18 @@ const twoRepos = byDir({ [KANBAN]: 'main', [OTHER]: 'feat/x' });
 
 describe('parseGit', () => {
   it('extracts the subcommand and args', () => {
-    expect(parseGit('git add -A')).toEqual({ sub: 'add', args: ['-A'], rawArgs: ['-A'], repoDir: null, truncated: false });
+    expect(parseGit('git add -A')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, truncated: false });
     expect(parseGit('git commit -m "x"'))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], rawArgs: ['-m', '"x"'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: null, truncated: false });
   });
 
   it('captures -C as repoDir, skips -c, skips env prefixes', () => {
     expect(parseGit('git -C /repo add foo'))
-      .toEqual({ sub: 'add', args: ['foo'], rawArgs: ['foo'], repoDir: '/repo', truncated: false });
+      .toEqual({ sub: 'add', args: ['foo'], repoDir: '/repo', truncated: false });
     expect(parseGit('git -c user.name=x commit'))
-      .toEqual({ sub: 'commit', args: [], rawArgs: [], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: [], repoDir: null, truncated: false });
     expect(parseGit('FOO=bar git add foo'))
-      .toEqual({ sub: 'add', args: ['foo'], rawArgs: ['foo'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'add', args: ['foo'], repoDir: null, truncated: false });
   });
 
   it('requires the command word to be git (not just a mention)', () => {
@@ -51,29 +51,28 @@ describe('parseGit', () => {
   });
 
   it('sees through subshell/group punctuation', () => {
-    expect(parseGit('(git add -A)')).toEqual({ sub: 'add', args: ['-A'], rawArgs: ['-A'], repoDir: null, truncated: false });
+    expect(parseGit('(git add -A)')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, truncated: false });
   });
 
   // A quoted span is ONE token. repoDir keeps its quoting — resolveDir owns removal there, and
-  // hiddenDirTarget needs the raw text (tkt-8f2e1f9894e2) — while sub/args come back dequoted and
-  // rawArgs preserves the spelling for the short-flag scan (tkt-6d1ae448e3b3).
+  // hiddenDirTarget needs the raw text (tkt-8f2e1f9894e2) — while sub/args come back dequoted (tkt-6d1ae448e3b3).
   it('keeps a quoted span carrying a space in one token', () => {
     expect(parseGit('git -C "/repos/my repo" commit -m x'))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], rawArgs: ['-m', 'x'], repoDir: '"/repos/my repo"', truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: '"/repos/my repo"', truncated: false });
     expect(parseGit("git -C '/repos/my repo' commit -m x"))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], rawArgs: ['-m', 'x'], repoDir: "'/repos/my repo'", truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: "'/repos/my repo'", truncated: false });
     expect(parseGit('git commit -m "fix -a bug"'))
-      .toEqual({ sub: 'commit', args: ['-m', 'fix -a bug'], rawArgs: ['-m', '"fix -a bug"'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'fix -a bug'], repoDir: null, truncated: false });
   });
 
   it('skips an env prefix whose quoted value contains a space', () => {
     expect(parseGit('EDITOR="code -w" git commit -m x'))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], rawArgs: ['-m', 'x'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: null, truncated: false });
   });
 
   it('reports a subcommand swallowed by an unterminated quote, rather than returning null', () => {
     expect(parseGit('git -C "/a/b commit -m x'))
-      .toEqual({ sub: null, args: [], rawArgs: [], repoDir: '"/a/b commit -m x', truncated: true });
+      .toEqual({ sub: null, args: [], repoDir: '"/a/b commit -m x', truncated: true });
     // Still null when there is simply no subcommand — no quote is involved, so nothing was hidden.
     expect(parseGit('git -C /repo')).toBeNull();
   });
@@ -1142,15 +1141,71 @@ describe('decide — a quoted VALUE must be judged dequoted (tkt-6d1ae448e3b3)',
     expect(blocked('git push --force origin feat/x', 'feat/x')).toBe(true); // control
   });
 
-  it('still reads short-flag LETTERS raw, so an attached quoted value is not a flag cluster', () => {
-    // The regression this fix must not cause. Dequoting `-m"fix and go"` to `-mfix and go` puts the
-    // message text back into the cluster scan — an `a` reads as `commit -a`, an `f` as a force-push.
-    // That is exactly the false block tkt-8f2e1f9894e2 closed, so flag letters keep reading the RAW
-    // token while values read the dequoted one.
+  it('ends a short-flag cluster at a value-taking letter, so an attached value is not a cluster', () => {
+    // The regression this must not cause: `-m"fix and go"` dequotes to `-mfix and go`, and scanning
+    // past the `m` reads `commit -a` / a force-push out of the message (tkt-8f2e1f9894e2).
     expect(blocked('git commit -m"fix and go"', 'feat/x')).toBe(false);
     expect(blocked("git commit -m'fix and go'", 'feat/x')).toBe(false);
+    expect(blocked('git commit -mfix', 'feat/x')).toBe(false);
     expect(blocked('git push -o"ci skip fast" origin feat/x', 'feat/x')).toBe(false);
+    expect(blocked('git clean -efoo', 'feat/x')).toBe(false);
     expect(blocked('git commit -am"fix"', 'feat/x')).toBe(true); // control: a real cluster still blocks
+  });
+
+  it('blocks a short-flag cluster however it is quoted (tkt-a3bf9e90d073)', () => {
+    expect(blocked('git push "-f" origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked("git push '-f' origin feat/x", 'feat/x')).toBe(true);
+    expect(blocked('git push -"f" origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('git push -u"f" origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('git push "-4f" origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('git commit "-am" x', 'feat/x')).toBe(true);
+    expect(blocked('git commit "-a"m x', 'feat/x')).toBe(true);
+    expect(blocked('git branch "-D" feat/y', 'feat/x')).toBe(true);
+    expect(blocked('git branch -d"f" feat/y', 'feat/x')).toBe(true);
+    expect(blocked('git clean "-fd"', 'feat/x')).toBe(true);
+    expect(blocked('git clean -d"f"', 'feat/x')).toBe(true);
+    expect(blocked('git add "-f" secret.env', 'feat/x')).toBe(true);
+    expect(blocked('git checkout "-f"', 'feat/x')).toBe(true);
+    // Controls: a quoted non-destructive flag is still an ordinary command.
+    expect(blocked('git push "-u" origin feat/x', 'feat/x')).toBe(false);
+    expect(blocked('git branch "-d" feat/y', 'feat/x')).toBe(false);
+  });
+
+  it('reads a force letter that precedes a value-taking letter in one cluster', () => {
+    expect(blocked('git push -fo=x origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('git push "-fo=x" origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('git clean -fe=pat', 'feat/x')).toBe(true);
+    expect(blocked('git push -o=f origin feat/x', 'feat/x')).toBe(false); // control: `f` is o's value
+  });
+
+  it('skips the separate-token VALUE of an option, so the value is not read as a cluster', () => {
+    expect(blocked('git commit -m "-a"', 'feat/x')).toBe(false);
+    expect(blocked('git commit -m -a', 'feat/x')).toBe(false);
+    expect(blocked('git commit -m "-a bug fix"', 'feat/x')).toBe(false);
+    expect(blocked('git commit --message "-a"', 'feat/x')).toBe(false);
+    expect(blocked('git commit -vm "-a"', 'feat/x')).toBe(false);
+    expect(blocked('git push -o "-f" origin feat/x', 'feat/x')).toBe(false);
+    expect(blocked('git push --push-option -f origin feat/x', 'feat/x')).toBe(false);
+    expect(blocked('git clean -e -f', 'feat/x')).toBe(false);
+    expect(blocked('git branch -u -D feat/y', 'feat/x')).toBe(false);
+    // Controls: an ATTACHED value consumes nothing more, and an optional-value letter never
+    // takes the next token.
+    expect(blocked('git commit -mx -a', 'feat/x')).toBe(true);
+    expect(blocked('git push -ox -f origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('git commit -S -a', 'feat/x')).toBe(true);
+    expect(blocked('git branch -t -D feat/y', 'feat/x')).toBe(true);
+  });
+
+  it('does not stop reading flags at `--`, which an unlisted option may take as its value', () => {
+    // Measured against git 2.54: `branch --sort -- -D x` force-deletes, `add --pathspec-from-file
+    // -- -f` stages an ignored file. Neither option is in VALUE_OPTIONS.
+    expect(blocked('git branch --sort -- -D feat/y', 'feat/x')).toBe(true);
+    expect(blocked('git branch --format -- -D feat/y', 'feat/x')).toBe(true);
+    expect(blocked('git add --pathspec-from-file -- -f', 'feat/x')).toBe(true);
+    expect(blocked('git clean --exclude -- -f', 'feat/x')).toBe(true);
+    // The accepted price: a pathspec literally named like a flag over-blocks.
+    expect(blocked('git add -- -f', 'feat/x')).toBe(true);
+    expect(blocked('git commit -m x -- x', 'feat/x')).toBe(false); // control: `--` alone is harmless
   });
 
   it('does not let a quoted safe-flag push exempt itself from the main rule', () => {
