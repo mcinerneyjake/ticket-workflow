@@ -56,7 +56,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { isMain } from './lib/is-main.mjs';
 import { worktreeKind } from './lib/worktree.mjs';
 import { protectedBranches, tryGit } from './lib/default-branch.mjs';
-import { quotedTokens, resolveDir, SHELL_KEYWORDS, splitSegments, subshellParens } from './lib/shell.mjs';
+import { quotedTokens, resolveDir, SHELL_KEYWORDS, splitSegments, subshellParens, WRAPPERS } from './lib/shell.mjs';
 import { parseGit } from './guard-bash.mjs';
 
 const TAG = '[guard-worktree]';
@@ -338,12 +338,9 @@ function commandPieces(segment) {
   return out.map((s) => s.trim()).filter(Boolean);
 }
 
-// Shell words that precede a command without being one. Skipping them is what lets `then git …`,
-// `do git …` and `xargs git …` reach the rules; leaving them in is the fail-open review found. The
-// reserved words come from lib/shell.mjs so this hook and guard-bash's parseGit cannot drift on
-// THAT set again — they already had, and parseGit was the one admitting `then git commit`
-// (tkt-e70ae972476e). WRAPPERS below is still local, so the two do diverge on `then time git …`.
-const WRAPPERS = new Set(['env', 'sudo', 'nice', 'nohup', 'xargs', 'command', 'builtin', 'exec', 'stdbuf', 'time']);
+// SHELL_KEYWORDS and WRAPPERS come from lib/shell.mjs, shared with guard-bash's parseGit, which had
+// drifted on both (tkt-e70ae972476e, tkt-3d016709216a). The skip LOOP below is still a second copy
+// of parseGit's, so a rule added to one is not in the other.
 
 /**
  * The command a piece actually runs, plus any VAR=value prefixes.

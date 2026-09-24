@@ -1382,3 +1382,85 @@ describe('decide — a shell keyword must not hide a git invocation (tkt-e70ae97
     });
   });
 });
+
+// A command PREFIX — `time`, `nohup`, `sudo`, … — is not a reserved word, so SHELL_KEYWORDS never
+// skipped it and parseGit returned null: `time git commit` on main reached no rule at all, while
+// guard-worktree's own wrapper set caught the same spelling (tkt-3d016709216a). The list is spelled
+// out rather than imported so shrinking the shared set reddens this file.
+describe('decide — a command wrapper must not hide a git invocation (tkt-3d016709216a)', () => {
+  const WRAPPED = ['env', 'sudo', 'nice', 'nohup', 'xargs', 'command', 'builtin', 'exec', 'stdbuf', 'time'];
+
+  it.each(WRAPPED)('blocks a commit on main led by `%s`', (w) => {
+    expect(blocked(`${w} git commit -m x`, 'main')).toBe(true);
+  });
+
+  it.each(WRAPPED)('blocks a push to main led by `%s`', (w) => {
+    expect(blocked(`${w} git push origin main`, 'feat/x')).toBe(true);
+  });
+
+  it('blocks the branch-agnostic destructive rules behind a wrapper on a feature branch', () => {
+    expect(blocked('time git add -A', 'feat/x')).toBe(true);
+    expect(blocked('nohup git push --force origin feat/x', 'feat/x')).toBe(true);
+    expect(blocked('sudo git reset --hard HEAD~1', 'feat/x')).toBe(true);
+  });
+
+  it('skips stacked wrappers, and wrappers interleaved with keywords and env prefixes', () => {
+    expect(blocked('sudo env time git commit -m x', 'main')).toBe(true);
+    expect(blocked('true; then time git commit -m x; fi', 'main')).toBe(true);
+    expect(blocked('env FOO=1 git commit -m x', 'main')).toBe(true);
+    expect(blocked('FOO=1 nohup git commit -m x', 'main')).toBe(true);
+    expect(parseGit('then sudo GIT_AUTHOR_NAME=x time git add -A').sub).toBe('add');
+  });
+
+  it('skips flags that follow a wrapper', () => {
+    expect(blocked('time -p git commit -m x', 'main')).toBe(true);
+    expect(blocked('sudo -- git commit -m x', 'main')).toBe(true);
+    expect(blocked('env -i git commit -m x', 'main')).toBe(true);
+    expect(blocked('nice -n5 git commit -m x', 'main')).toBe(true);
+  });
+
+  it('strips grouping punctuation after a wrapper, spaced and fused', () => {
+    expect(blocked('time (git commit -m x)', 'main')).toBe(true);
+    expect(blocked('true; then ( time git commit -m x ); fi', 'main')).toBe(true);
+  });
+
+  // The negative direction: only the leading run is skipped, so a non-wrapper command word ends it
+  // before its own flags, and neither that nor a wrapper sitting in data promotes a deeper `git`.
+  it('does not promote a git that is not the command word', () => {
+    expect(parseGit('grep -n git file')).toBe(null);
+    expect(parseGit('echo time git commit')).toBe(null);
+    expect(parseGit('time npm test')).toBe(null);
+    expect(parseGit('command -v git')).toBe(null);
+    expect(parseGit('sudo -u root ls git')).toBe(null);
+    expect(blocked('git commit -m "time git push --force"', 'feat/x')).toBe(false);
+  });
+
+  it('CONTROL: wrapper-led commits on a feature branch are still allowed', () => {
+    expect(blocked('time git commit -m x', 'feat/x')).toBe(false);
+    expect(blocked('true; then nohup git commit -m x; fi', 'feat/x')).toBe(false);
+  });
+
+  // KNOWN GAPS, pinned so they are not mistaken for coverage; filed as follow-ups, not fixed here.
+  // A flag whose VALUE is a separate word stops the skip at the value — routine spellings included.
+  it('KNOWN GAP: a value-taking wrapper flag still hides the invocation', () => {
+    expect(parseGit('nice -n 5 git commit -m x')).toBe(null);
+    expect(parseGit('sudo -u root git commit -m x')).toBe(null);
+    expect(parseGit('env -u GIT_DIR git commit -m x')).toBe(null);
+    expect(parseGit('env -C /repo git commit -m x')).toBe(null);
+  });
+
+  it('KNOWN GAP: prefixes outside the set, and spellings of members, are not wrappers', () => {
+    expect(parseGit('timeout 60 git commit -m x')).toBe(null);
+    expect(parseGit('/usr/bin/time git commit -m x')).toBe(null);
+  });
+
+  // Parsed, but judged against the CURRENT directory although git runs in /repo. Was null before.
+  it('KNOWN GAP: a fused directory-changing flag is skipped, not followed', () => {
+    expect(parseGit('env --chdir=/repo git commit -m x')).toMatchObject({ sub: 'commit', repoDir: null });
+  });
+
+  it('KNOWN GAP: a wrapper-led cd is not tracked as a move', () => {
+    const br = (d) => (d === '/primary' ? 'main' : 'feat/x');
+    expect(decide('builtin cd /primary && git commit -m x', br, '/wt').blocked).toBe(false);
+  });
+});

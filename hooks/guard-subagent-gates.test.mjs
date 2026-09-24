@@ -192,3 +192,18 @@ describe('parseGh', () => {
     expect(parseGh('gh --future-flag some/value pr merge 40')).toMatchObject({ group: 'pr', verb: 'merge' });
   });
 });
+
+// parseGit is shared, so a wrapper that hid a git invocation from guard-bash hid it from the subagent
+// gate too: `time git commit` crossed the commit gate from inside a subagent (tkt-3d016709216a).
+describe('a command wrapper does not hide a gated git invocation', () => {
+  it.each(['time git commit -m x', 'nohup git push -u origin fix/x', 'true; then env FOO=1 git commit -m x; fi'])(
+    'blocks `%s` in a subagent',
+    (command) => {
+      expect(decide(payload(command)).blocked).toBe(true);
+    },
+  );
+
+  it('CONTROL: a wrapped non-git command is still allowed', () => {
+    expect(decide(payload('time npm test')).blocked).toBe(false);
+  });
+});
