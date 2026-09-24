@@ -697,6 +697,12 @@ npx ticket-workflow test-contention --runs 4 --control   # TEST_SLOTS=N: the bou
 npx ticket-workflow test-contention --runs 4             # the bound in force
 ```
 
+Each run's slot wait is at least N × 30 min, because queued runs wait out whole suites. This
+command's one exception to "an explicit `TEST_SLOTS_WAIT_MS` wins" above: a caller's value can
+lengthen that wait but never shorten it, and a note says so when it is raised. An invalid value is
+refused before any worktree is made. A `waitMs` passed to `holdTestRun` in the repo's config still
+beats both.
+
 The bounded arm prints a verdict **only** against a control that went red the same local day, for
 the same checkout, commit and N. A green run on a machine that cannot show contention proves nothing.
 A control counts as red only when every failure is a timeout. An assertion failure means `HEAD` is
