@@ -4,8 +4,8 @@ import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { commandToMilestones, extractTicketId, stateFromEvent, recordsFor, HOOK_STEPS } from './track-steps.mjs';
-import { STEP_IDS, BRANCH_TICKET_ID_RE } from '../src/shared/constants.js';
+import { commandToMilestones, extractTicketId, stateFromEvent, recordsFor, HOOK_STEPS, UNATTRIBUTED } from './track-steps.mjs';
+import { STEP_IDS, STEP_STATES, BRANCH_TICKET_ID_RE } from '../src/shared/constants.js';
 
 const HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'track-steps.mjs');
 
@@ -159,6 +159,12 @@ describe('catalog parity with shared/constants.ts', () => {
   it('the hook emits `review` (derived from commit)', () => {
     expect(HOOK_STEPS).toContain('review');
   });
+
+  // A state missing from STEP_STATES is counted `unrecognized` by every reader, which verify reads
+  // as version skew and answers UNKNOWN for the whole ticket.
+  it('the unattributed state is a valid shared StepState', () => {
+    expect(STEP_STATES).toContain(UNATTRIBUTED);
+  });
 });
 
 describe('recordsFor — commit implies review', () => {
@@ -171,6 +177,13 @@ describe('recordsFor — commit implies review', () => {
 
   it('does NOT record review when the commit failed', () => {
     expect(recordsFor(['commit'], 'failed')).toEqual([{ step: 'commit', state: 'failed' }]);
+  });
+
+  it('does NOT record review when the commit sat in an unattributable failure', () => {
+    expect(recordsFor(['test', 'commit'], UNATTRIBUTED)).toEqual([
+      { step: 'test', state: UNATTRIBUTED },
+      { step: 'commit', state: UNATTRIBUTED },
+    ]);
   });
 
   it('leaves non-commit milestones untouched', () => {
@@ -697,10 +710,11 @@ describe('hook boundary — outcome comes from the event, and only when the exit
   });
 
   // The failure count must be over SEGMENTS, not milestones: `npm ci && npm test` carries one
-  // milestone, and blaming it when `npm ci` broke accuses a gate that never ran.
-  it('records nothing when a failing command carries a non-milestone segment that could be the cause', () => {
-    expect(run('npm ci && npm test', 'PostToolUseFailure')).toEqual([]);
-    expect(run('git fetch && npm test', 'PostToolUseFailure')).toEqual([]);
+  // milestone, and blaming it when `npm ci` broke accuses a gate that never ran. Recorded as
+  // unattributed rather than dropped, so the log stops reading greener than reality (tkt-24925929919c).
+  it('records UNATTRIBUTED when a failing command carries a non-milestone segment that could be the cause', () => {
+    expect(run('npm ci && npm test', 'PostToolUseFailure')).toEqual(['test:unattributed']);
+    expect(run('git fetch && npm test', 'PostToolUseFailure')).toEqual(['test:unattributed']);
   });
 
   // An unbroken `&&` chain to the end of the command is the one compound shape whose success DOES
@@ -714,9 +728,28 @@ describe('hook boundary — outcome comes from the event, and only when the exit
   });
 
   // The converse does NOT hold: a failed `&&` chain stopped at SOME link, and nothing in the payload
-  // says which. Attributing the failure to any one milestone would be a guess.
-  it('records nothing when a multi-milestone `&&` chain fails', () => {
-    expect(run('npm run typecheck && npm run lint && npm test', 'PostToolUseFailure')).toEqual([]);
+  // says which. `failed` on any one link would be a guess, and silence would leave a stale `passed`
+  // standing, so every candidate is marked unattributed (tkt-24925929919c).
+  it('records UNATTRIBUTED on every link when a multi-milestone `&&` chain fails', () => {
+    expect(run('npm run typecheck && npm run lint && npm test', 'PostToolUseFailure')).toEqual([
+      'typecheck:unattributed',
+      'lint:unattributed',
+      'test:unattributed',
+    ]);
+  });
+
+  // A masked link's own exit never reached the end, so it is no candidate for the failure either;
+  // only the links the `&&` chain carries to the end are.
+  it('records unattributed only for the links whose exit reaches the end', () => {
+    expect(run('npm test | tail -5 && npm run lint', 'PostToolUseFailure')).toEqual(['lint:unattributed']);
+    expect(run('npm test; echo done', 'PostToolUseFailure')).toEqual([]);
+    expect(run('npm run lint || npm test && npm run typecheck', 'PostToolUseFailure')).toEqual(['typecheck:unattributed']);
+    expect(run('npm run lint && npm test &', 'PostToolUseFailure')).toEqual([]);
+  });
+
+  // `review` is derived from a PASSING commit only; an unattributed one must not imply it.
+  it('writes no review row for a commit inside an unattributable failure', () => {
+    expect(run('npm test && git commit -m x', 'PostToolUseFailure')).toEqual(['test:unattributed', 'commit:unattributed']);
   });
 
   // One milestone, so there is nothing to confuse the failure with. This is the workflow's own

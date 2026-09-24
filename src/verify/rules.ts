@@ -191,6 +191,11 @@ export function verifyTicket(facts: TicketFacts): Verdict {
         'command recorded `passed` and failures recorded nothing — so the record can neither support nor contradict the claim',
     };
   }
+  // Neither a pass nor a failure: the latest run sat in a failed command that could not say which
+  // link failed, so a violation here would assert a fact the record does not hold (tkt-24925929919c).
+  if (facts.steps.test === 'unattributed') {
+    return { id, outcome: 'unknown', reason: 'the latest test run sat in a failed command that could not say which link failed' };
+  }
   if (facts.steps.test === 'passed') {
     return { id, outcome: 'ok', reason: 'claims tests were added, and a passing test milestone was recorded' };
   }

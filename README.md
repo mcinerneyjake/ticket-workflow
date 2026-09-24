@@ -414,14 +414,23 @@ from which event was delivered, so no other configuration expresses this.
 This is **not** the duplicate-writer hazard below: those are two writers racing on one event, whereas
 these are one writer on two disjoint events, and exactly one of them fires per tool call.
 
-**Two shapes still record nothing, by design.** A milestone whose exit is hidden from the tool call —
+**One shape still records nothing, by design.** A milestone whose exit is hidden from the tool call —
 `npm test | tail`, `npm test; echo done`, `npm test || true`, `npm test &` — has no knowable outcome,
 because the delivered event describes the command as a whole, and the shell discarded the
 milestone's own status before the tool call ever ended. (The payload carries no exit status at
 all — that is the original defect.) The
 hook records nothing there rather than guessing `passed`. An unbroken `&&` chain is the exception and
-is recorded in full: if the whole command succeeded, every link in it exited 0. Likewise a *failing*
-command carrying several milestones records nothing, since nothing says which link failed.
+is recorded in full: if the whole command succeeded, every link in it exited 0.
+
+**A failure it cannot pin on one milestone records `unattributed`, never `failed`.** A failing
+`npm run typecheck && npm run lint && npm test` stopped at *some* link, and a failing
+`npm ci && npm test` may never have reached `test` at all — nothing in the payload says which. Each
+link whose exit reached the end of the command gets `state: "unattributed"`: `failed` would accuse a
+gate that may have passed or never run, and silence would leave an earlier `passed` standing as the
+latest word (`tkt-24925929919c`). `verify` reads a latest `unattributed` test as UNKNOWN. A reader
+pinned before that state existed counts those rows as `unrecognized` (see **Corrupt event lines**)
+until its pin is bumped — so bump the readers before the machine's writer — and a consumer keeping
+its **own copy** of the state vocabulary must add the value in the same bump.
 
 **Wiring at user scope does not replace project scope — the two are additive.** Duplicate *guards*
 are harmless (they decide identically), but a duplicate **writer** is not: two `track-steps` hooks
