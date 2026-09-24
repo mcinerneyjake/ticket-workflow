@@ -46,7 +46,7 @@ import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { isMain } from './lib/is-main.mjs';
 import { hasRemote, protectedBranches } from './lib/default-branch.mjs';
-import { cdTarget, dequote, endsInsideQuote, hiddenDirTarget, quotedTokens, resolveDir, SHELL_KEYWORDS, splitSegments, subshellParens } from './lib/shell.mjs';
+import { cdTarget, dequote, endsInsideQuote, hiddenDirTarget, quotedTokens, resolveDir, SHELL_KEYWORDS, splitSegments, subshellParens, WRAPPERS } from './lib/shell.mjs';
 
 // The VALUE of a token: the token with single/double quote characters removed wherever they sit —
 // the reading resolveDir has always applied to a `-C` path. Every rule comparing an arg against a
@@ -88,12 +88,15 @@ export function parseGit(segment) {
   // runs once, so after a keyword is skipped a following `(` was never removed and `then (git commit`
   // hid the invocation from every rule exactly as `then git commit` had (review, tkt-e70ae972476e).
   const bareAt = (n) => tokens[n].replace(/^[({]+/, '');
-  // Env prefixes and reserved words, interleaved in either order: `then VAR=x git …` is as valid a
-  // spelling as `VAR=x git …`. Only this LEADING run is skipped, so a keyword sitting in data
-  // (`echo then git commit`) never promotes a deeper token into the command slot.
+  // Env prefixes, reserved words and wrappers, interleaved in any order: `then VAR=x time git …` is
+  // as valid a spelling as `VAR=x git …`. Only this LEADING run is skipped, so a keyword sitting in
+  // data (`echo then git commit`) never promotes a deeper token into the command slot.
+  let sawWrapper = false;
   while (cmd < tokens.length) {
     const word = bareAt(cmd);
     if (word === '' || SHELL_KEYWORDS.has(word) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) { cmd++; continue; }
+    if (WRAPPERS.has(word)) { sawWrapper = true; cmd++; continue; }
+    if (sawWrapper && word.startsWith('-')) { cmd++; continue; }
     break;
   }
   if (cmd >= tokens.length || bareAt(cmd) !== 'git') return null;

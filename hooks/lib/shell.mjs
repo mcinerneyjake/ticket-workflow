@@ -268,6 +268,11 @@ export const SHELL_KEYWORDS = new Set(
   ['if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'case', 'esac', '!', '{', '}'],
 );
 
+// Command prefixes that run the next word as the command, shared by the same two readers, which skip
+// `-…` tokens after one. Not complete: value-taking flags (`sudo -u root git`), prefixes outside
+// the set (`timeout`) and path spellings still hide the command — pinned in guard-bash.test.mjs.
+export const WRAPPERS = new Set(['env', 'sudo', 'nice', 'nohup', 'xargs', 'command', 'builtin', 'exec', 'stdbuf', 'time']);
+
 // Deliberately NARROWER than SHELL_KEYWORDS, and not derived from it: widening this set changes
 // which hidden `cd`s hiddenDirTarget detects, which is a separate fail-open with its own adversary
 // list. Measured gaps: `if`/`while`/`until`/`!`, and a case arm's `)` (the predecessor test below
