@@ -19,6 +19,7 @@ import { tmpdirCleanup } from './checks/tmpdirCleanup.js';
 import { testRunHold } from './checks/testRunHold.js';
 import { pinParity } from './checks/pinParity.js';
 import { pinFreshness } from './checks/pinFreshness.js';
+import { pinResolved } from './checks/pinResolved.js';
 import { loadRepoConfig, CONFIG_FILE } from './config.js';
 import { tierIncludes } from '../templates.js';
 import { defaultExec, makeResult, readRepoFile, type AuditCheck, type AuditContext, type AuditResult, type Exec } from './types.js';
@@ -36,6 +37,7 @@ export const AUDIT_CHECKS: readonly AuditCheck[] = [
   branchProtection,
   pinParity,
   pinFreshness,
+  pinResolved,
   packageScripts,
   huskyPreCommit,
   eslintRules,
@@ -103,8 +105,8 @@ export function runAudit(repoDirInput: string, exec: Exec = defaultExec): AuditR
 
 /**
  * One check, through the exact config/tier/exemption/crash wrapper `runAudit` applies, for a caller
- * that would otherwise pay for 20 verdicts it discards. Module-internal — deliberately not in
- * `src/index.ts`, since its only caller today is this module's own test helper.
+ * that would otherwise pay for every other check's verdict only to discard it. Module-internal —
+ * deliberately not in `src/index.ts`, since its only caller today is this module's own test helper.
  *
  * Never an AuditReport: a report holding one check reads as complete to `auditExitCode`, which
  * answers 0 when nothing it can see is red.

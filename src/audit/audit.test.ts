@@ -982,6 +982,34 @@ describe('pin checks end-to-end through runAudit', () => {
     expect(report.results.find((r) => r.id === 'pin-freshness')?.status).toBe('blocked');
     expect(auditExitCode(report, new Set(['branch-protection'])), formatAudit(report)).toBe(0);
   });
+
+  // tkt-2db61a124801: same version string at two commits, so pin-parity agrees while the lock drifts.
+  it('pin-resolved FAILS same-version commit drift that pin-parity passes, without moving the exit code', () => {
+    const tagCommit = 'c'.repeat(40);
+    const lockCommit = 'd'.repeat(40);
+    const dir = repoPinnedTo(`v${installedVersion}`);
+    writeFileSync(
+      path.join(dir, 'package-lock.json'),
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: { 'node_modules/ticket-workflow': { version: installedVersion, resolved: `git+ssh://git@github.com/someowner/ticket-workflow.git#${lockCommit}` } },
+      }),
+    );
+    const exec: Exec = (cmd, args, opts) => {
+      if (cmd === 'git' && args[0] === 'ls-remote') {
+        const rows = `${'a'.repeat(40)}\trefs/tags/v${installedVersion}\n${tagCommit}\trefs/tags/v${installedVersion}^{}`;
+        return { kind: 'ran', ok: true, status: 0, stdout: rows, stderr: '' };
+      }
+      return execWithEslint(cmd, args, opts);
+    };
+    const report = runAudit(dir, exec);
+    const byId = new Map(report.results.map((r) => [r.id, r]));
+    expect(byId.get('pin-parity')?.status, byId.get('pin-parity')?.detail).toBe('pass');
+    const resolved = byId.get('pin-resolved');
+    expect(resolved?.status, resolved?.detail).toBe('fail');
+    expect(resolved?.advisory).toBe(true);
+    expect(auditExitCode(report, new Set(['branch-protection'])), formatAudit(report)).toBe(0);
+  });
 });
 
 
@@ -990,7 +1018,7 @@ describe('pin checks end-to-end through runAudit', () => {
  * load-bearing: if the two ever diverge, ~45 tests are asserting about something that is not the
  * audit. The first case is that equivalence, swept over every check rather than sampled at one.
  */
-describe('runOneCheck: the same verdict as runAudit, for one check instead of twenty-one', () => {
+describe('runOneCheck: the same verdict as runAudit, for one check instead of all of them', () => {
   it('agrees with runAudit on every check id, over a repo where the answers are mixed', () => {
     const dir = makeConformingRepo();
     // Mixed on purpose: a pass-heavy repo would agree even if runOneCheck ignored its id and

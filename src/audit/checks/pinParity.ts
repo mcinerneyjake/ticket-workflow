@@ -10,7 +10,7 @@ import { PACKAGE, parseGitPin, parseVersionTag, scanDeclarations } from './pinSp
  * It catches the state a bare `npm install` leaves — the previously resolved sha is kept, so a
  * bumped pin sits above an older tree and the versions disagree. It does NOT catch drift where the
  * pinned tag and the installed tree carry the SAME version string but different shas (a tag that
- * trails `main`); that needs the lockfile's resolved sha, and is tracked separately.
+ * trails `main`); that needs the tag's commit from the remote, so it is `pin-resolved`, advisory.
  *
  * Every undeterminable answer is BLOCKED, never PASS. Not applicable — no dependency map names the
  * package — is a genuine PASS, and is the state this package itself is in via its own `bin` entry.
