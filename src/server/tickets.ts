@@ -46,6 +46,20 @@ export function errnoCode(err: unknown): string | null {
 // existing body (non-destructive) and is never persisted. Mutually exclusive with body.
 export type TicketPatch = Partial<Pick<Ticket, 'title' | 'type' | 'priority' | 'status' | 'order' | 'body' | 'project' | 'blockers' | 'parent' | 'dueDate' | 'assignee'>> & { appendBody?: string }
 
+// Every writable field at once, for `restore --full`. Typed Required<…> so a field added to
+// TicketPatch fails to COMPILE here until restore carries it, rather than being silently dropped
+// (tkt-2147a878f3ba). `created`, `source` and `runId` are absent on purpose: updateTicket treats
+// authorship and creation time as set-once, so a restore must not forge them.
+export type FullTicketPatch = Required<Omit<TicketPatch, 'appendBody'>>
+
+export function fullPatchOf(t: Ticket): FullTicketPatch {
+  return {
+    title: t.title, type: t.type, priority: t.priority, status: t.status, order: t.order,
+    body: t.body, project: t.project, blockers: t.blockers, parent: t.parent,
+    dueDate: t.dueDate, assignee: t.assignee,
+  };
+}
+
 // gray-matter parse output. js-yaml auto-parses unquoted ISO dates → Date objects.
 interface RawFrontmatter {
   title?: string | Date
@@ -158,7 +172,7 @@ function serialize(ticket: Ticket): string {
 // Atomic temp-file + rename: a crash mid-write leaves the target intact.
 // Per-call random suffix (not just pid) so two overlapping writes to the same path
 // can't share a temp path and interleave. Temp cleaned up on rename failure.
-async function atomicWrite(file: string, contents: string): Promise<void> {
+async function atomicWrite(file: string, contents: string | Buffer): Promise<void> {
   const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
   await fs.writeFile(tmp, contents, 'utf8');
   try {
@@ -174,22 +188,51 @@ async function writeTicket(ticket: Ticket) {
   await atomicWrite(ticketPath(ticket.id), serialize(ticket));
 }
 
+// The tombstone deleteTicket writes beside the final-state snapshot. Not itself a snapshot:
+// readers select on `.md`, so this name must never end in it (tkt-2147a878f3ba).
+export const DELETE_RECORD_FILE = 'deleted.json';
+
+// An edge deleteTicket's cleanup strips from ANOTHER ticket, recorded so an undelete can tell a
+// human what to re-link. Deliberately not re-linked automatically: the other ticket may have been
+// edited, or deleted, in between.
+export interface StrippedEdge {
+  id: string
+  blocker: boolean
+  parent: boolean
+}
+
+export interface DeleteRecord {
+  id: string
+  deletedAt: string
+  snapshot: string
+  edges: StrippedEdge[]
+}
+
+export function historyDir(id: string): string {
+  if (!ID_RE.test(id)) throw new HttpError(400, `Invalid ticket id: ${id}`);
+  return path.join(getTicketsDir(), '.history', id);
+}
+
+// Timestamp + random suffix: sequential same-millisecond writes under the per-id lock could
+// otherwise collide on the filename.
+function snapshotName(): string {
+  return `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}.md`;
+}
+
 // Backup-on-write undo (tkt-18d53c0c7cd8): before updateTicket overwrites a body,
 // snapshot the PRIOR full file (frontmatter + body) to a gitignored
 // `<ticketsDir>/.history/<id>/<timestamp>.md`. `tickets/` has no git history and
 // writeTicket atomically renames over the file, so without this an overwrite is
-// unrecoverable. Recovery is manual (read the file) — no restore UI in v1.
+// unrecoverable. listTickets skips `.history` (a directory, not a `.md` file), so
+// snapshots never leak into the board.
 // Non-blocking: a snapshot failure logs loudly but must not wedge a legitimate edit;
-// only the undo for that one overwrite is lost. listTickets skips `.history` (a
-// directory, not a `.md` file), so snapshots never leak into the board.
+// only the undo for that one overwrite is lost. deleteTicket takes the OPPOSITE
+// posture deliberately — see recordDeletion.
 async function snapshotHistory(prior: Ticket): Promise<void> {
   try {
-    const dir = path.join(getTicketsDir(), '.history', prior.id);
+    const dir = historyDir(prior.id);
     await fs.mkdir(dir, { recursive: true });
-    // Timestamp + random suffix: sequential same-millisecond updates under the per-id
-    // lock could otherwise collide on the filename.
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    await atomicWrite(path.join(dir, `${stamp}-${randomUUID().slice(0, 8)}.md`), serialize(prior));
+    await atomicWrite(path.join(dir, snapshotName()), serialize(prior));
   } catch (err) {
     log.error(`[history] failed to snapshot prior body for ${prior.id} before overwrite:`, err);
   }
@@ -346,6 +389,50 @@ export async function listTickets(): Promise<Ticket[]> {
 export async function listProjects(): Promise<string[]> {
   const tickets = await listTickets();
   return [...new Set(tickets.map((t) => t.project).filter((p): p is string => Boolean(p)))].sort();
+}
+
+// Snapshots a live ticket's CURRENT state on demand, fail-CLOSED.
+//
+// updateTicket snapshots only when the body changes (see updateTicketLocked), so a `restore --full`
+// that puts back structured fields with an identical body would otherwise overwrite them with no
+// undo — while the CLI and README both promise the pre-restore state is recoverable. history.ts
+// calls this first so that promise is true for every restore, not just body ones (tkt-2147a878f3ba).
+export async function snapshotTicketState(id: string): Promise<void> {
+  const existing = await getTicket(id);
+  try {
+    const dir = historyDir(id);
+    await fs.mkdir(dir, { recursive: true });
+    await atomicWrite(path.join(dir, snapshotName()), serialize(existing));
+  } catch (err) {
+    log.error(`[history] could not snapshot ${id} before a restore:`, err);
+    throw new HttpError(500, `Refusing to restore ${id}: could not snapshot its current state first (${errnoCode(err) ?? 'unknown error'}). Nothing was written.`);
+  }
+}
+
+// Existence without a read or a parse: history.ts needs to tell a live id from a deleted one, and a
+// ticket with unparseable frontmatter is still live. Keeps ticketPath private.
+export async function ticketExists(id: string): Promise<boolean> {
+  try {
+    await fs.stat(ticketPath(id));
+    return true;
+  } catch (err) {
+    if (isENOENT(err)) return false;
+    throw err;
+  }
+}
+
+// Parses ticket-file bytes that did NOT come from tickets/<id>.md — a `.history` snapshot. The id
+// is the caller's because a snapshot's frontmatter has none: identity comes from the directory it
+// sits in, which is why history.ts enforces containment rather than an id field (tkt-2147a878f3ba).
+export function parseTicketFile(id: string, raw: string, label: string): Ticket {
+  try {
+    const { data, content } = matter(raw, NO_CACHE); // see NO_CACHE: consistent throw on bad YAML
+    return normalize(id, data, content);
+  } catch (err) {
+    // Parser message stays server-side: it embeds the file's own content (tkt-7cab2f9cc082).
+    log.error('[history] unparseable snapshot', label, err);
+    throw new HttpError(400, `Snapshot ${label} has unparseable frontmatter — nothing was written.`);
+  }
 }
 
 export async function getTicket(id: string): Promise<Ticket> {
@@ -688,8 +775,55 @@ export async function summarizeBoard(project: string | null = null): Promise<Das
   return summarize(await listTickets(), project);
 }
 
-export async function deleteTicket(id: string): Promise<void> {
+// Fail-CLOSED, the opposite of snapshotHistory's non-blocking posture, and deliberately so: a
+// refused edit wedges work in progress, but a refused delete costs only a retry, and delete is the
+// one write with nothing behind it — after the unlink there is no copy to recover from
+// (tkt-2147a878f3ba). So if the final state cannot be recorded, the ticket is not deleted.
+//
+// The RAW bytes are snapshotted rather than a parsed-and-reserialized Ticket: it keeps a ticket with
+// unparseable frontmatter deletable — getTicket would throw 500 on one, which would otherwise make a
+// corrupt ticket impossible to remove. Bytes, not a string, so a file holding invalid UTF-8
+// round-trips through delete → undelete unchanged instead of being rewritten with U+FFFD.
+async function recordDeletion(id: string, raw: Buffer, edges: StrippedEdge[]): Promise<void> {
+  const snapshot = snapshotName();
+  try {
+    const dir = historyDir(id);
+    await fs.mkdir(dir, { recursive: true });
+    await atomicWrite(path.join(dir, snapshot), raw);
+    const record: DeleteRecord = { id, deletedAt: new Date().toISOString(), snapshot, edges };
+    await atomicWrite(path.join(dir, DELETE_RECORD_FILE), `${JSON.stringify(record, null, 2)}\n`);
+  } catch (err) {
+    // Logged before the conversion, as every other error site here does: this is a fail-closed path
+    // someone will be actively debugging, and errnoCode alone can be null.
+    log.error(`[delete] could not record final state for ${id}:`, err);
+    throw new HttpError(500, `Refusing to delete ${id}: could not record its final state (${errnoCode(err) ?? 'unknown error'}). The ticket was not modified.`);
+  }
+}
+
+// Read, record and unlink run under the per-id lock. Without it a concurrent updateTicket can land
+// between the read and the unlink: it writes V2 and snapshots only its own prior V1, then this
+// unlinks V2 — which exists in no snapshot, the exact loss the recording exists to prevent. The
+// referential cleanup below stays outside, and only ever locks OTHER ids, so it cannot self-deadlock.
+export function deleteTicket(id: string): Promise<void> {
   const file = ticketPath(id); // validate id before the try (see getTicket)
+  return withTicketLock(id, () => deleteTicketLocked(id, file));
+}
+
+async function deleteTicketLocked(id: string, file: string): Promise<void> {
+  let raw: Buffer;
+  try {
+    raw = await fs.readFile(file);
+  } catch (err) {
+    if (isENOENT(err)) throw new HttpError(404, `Ticket not found: ${id}`);
+    throw err; // EACCES/EMFILE/… are real faults → 500, not a masked 404
+  }
+  // Computed BEFORE the unlink: this is what an undelete needs in order to tell a human which edges
+  // to re-link, and it stays true whether or not the best-effort cleanup below actually succeeds.
+  // Self-edges are excluded — the cleanup cannot strip an edge from a file it just removed.
+  const edges: StrippedEdge[] = (await listTickets())
+    .filter((t) => t.id !== id && (t.blockers.includes(id) || t.parent === id))
+    .map((t) => ({ id: t.id, blocker: t.blockers.includes(id), parent: t.parent === id }));
+  await recordDeletion(id, raw, edges);
   try {
     await fs.unlink(file);
   } catch (err) {
@@ -720,4 +854,35 @@ export async function deleteTicket(id: string): Promise<void> {
   } catch (err) {
     log.error(`[delete] referential cleanup for ${id} failed:`, err);
   }
+}
+
+// Writes a snapshot's raw bytes back at the ticket's own path, for `restore --undelete`. Raw rather
+// than normalize()+serialize(): a round-trip through the parser would silently rewrite fields the
+// snapshot recorded, and the point of an undelete is to get the file that existed back.
+//
+// Under the per-id lock and refusing an existing file, so it can never overwrite a live ticket — a
+// live id is the caller's mistake, and the 409 says which. The edges deleteTicket stripped are NOT
+// re-linked: the other tickets may have been edited or deleted since, so history.ts prints them for
+// a human instead (tkt-2147a878f3ba).
+export function restoreRawTicketFile(id: string, raw: Buffer): Promise<void> {
+  const file = ticketPath(id);
+  return withTicketLock(id, async () => {
+    await ensureDir();
+    // wx: exists-check and create in one syscall, so a concurrent create in ANOTHER process cannot
+    // land between a stat and a write. atomicWrite's rename would clobber it silently.
+    try {
+      await fs.writeFile(file, raw, { flag: 'wx' });
+    } catch (err) {
+      if (errnoCode(err) === 'EEXIST')
+        throw new HttpError(409, `Ticket ${id} already exists — undelete refuses to overwrite a live ticket. Use restore --at <snapshot> to roll its body back instead.`);
+      throw err;
+    }
+    // The tombstone described a ticket that is now live again, so it must not outlive the undelete:
+    // listHistory would report `live` AND `deleted`, and a LATER out-of-band removal would follow its
+    // stale `snapshot` pointer back to the first delete, discarding every edit since. Best-effort —
+    // the ticket is already restored, and failing here would report a success that happened as a
+    // failure.
+    await fs.rm(path.join(historyDir(id), DELETE_RECORD_FILE), { force: true })
+      .catch((err: unknown) => { log.error(`[history] could not clear the tombstone for ${id} after undelete:`, err); });
+  });
 }

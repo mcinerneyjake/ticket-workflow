@@ -2,7 +2,8 @@
 import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { clearStaleSlots, DEFAULT_TTL_MS, formatSlot, listSlots, pidLiveness, TestRunRefusal, testSlotsStateDir } from '../test-run/slots.js';
-import { listTickets, getTicket } from '../server/tickets.js';
+import { listTickets, getTicket, DELETE_RECORD_FILE, type StrippedEdge } from '../server/tickets.js';
+import { listHistory, restoreFromSnapshot, undeleteFromHistory } from '../server/history.js';
 import { getTicketEvents } from '../server/events.js';
 import { isStatusId, STATUS_IDS } from '../shared/constants.js';
 import { runChecks, exitCodeFor, formatResults } from '../doctor/checks.js';
@@ -58,6 +59,98 @@ export async function cmdShow(id: string): Promise<void> {
   // to look: destructuring drops them and typecheck stays clean, which is how this was missed.
   if (skipped > 0) console.log(`  ! ${skipped} unreadable line(s) — steps above may be incomplete`);
   if (unrecognized > 0) console.log(`  ! ${unrecognized} line(s) written by a newer ticket-workflow`);
+}
+
+function edgeLabel(edge: StrippedEdge): string {
+  const roles = [edge.blocker ? 'blocker' : null, edge.parent ? 'parent' : null].filter((r) => r !== null);
+  return `${edge.id} (${roles.join(', ')})`;
+}
+
+export async function cmdHistory(id: string): Promise<void> {
+  const listing = await listHistory(id);
+  const state = listing.live ? 'live' : 'DELETED';
+  console.log(`${listing.id}  ${state}  ${listing.snapshots.length} snapshot(s)`);
+  if (listing.deletion) {
+    console.log(`  deleted ${listing.deletion.deletedAt}`);
+    if (listing.deletion.edges.length > 0)
+      console.log(`  edges stripped from other tickets: ${listing.deletion.edges.map(edgeLabel).join(', ')}`);
+  } else if (!listing.live) {
+    // Absence of a tombstone is information, not a blank: the id was deleted by a build that
+    // predates the record, so the newest snapshot is a pre-delete body, not the final state.
+    console.log(`  no ${DELETE_RECORD_FILE} — deleted before delete-time snapshots shipped, so the newest entry may not be its final state`);
+  }
+  for (const snap of listing.snapshots) {
+    const final = listing.deletion?.snapshot === snap.file ? '  (final state at delete)' : '';
+    console.log(`  ${snap.file}  ${snap.bytes} B  ${snap.modified}${final}`);
+  }
+  if (listing.snapshots.length > 0) {
+    console.log('\nRestore one with:');
+    console.log(listing.live
+      ? `  ticket-workflow restore ${listing.id} --at ${listing.snapshots[0].file} [--full]`
+      : `  ticket-workflow restore ${listing.id} --undelete`);
+  }
+}
+
+export interface RestoreArgs {
+  readonly id: string
+  readonly at: string | null
+  readonly full: boolean
+  readonly undelete: boolean
+}
+
+export function parseRestoreArgs(args: readonly string[]): RestoreArgs {
+  let id: string | null = null;
+  let at: string | null = null;
+  let full = false;
+  let undelete = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--at') {
+      const v = args[++i];
+      if (v === undefined || v.startsWith('--')) throw new Error('--at requires a snapshot filename');
+      at = v;
+    } else if (a === '--full') {
+      full = true;
+    } else if (a === '--undelete') {
+      undelete = true;
+    } else if (a.startsWith('-')) {
+      // Rejected, not ignored: a typo'd option that silently changes nothing is how a restore
+      // quietly does something other than what was asked.
+      throw new Error(`unknown option for restore: ${a} (accepts --at <file>, --full, --undelete)`);
+    } else if (id === null) {
+      id = a;
+    } else {
+      throw new Error(`restore takes at most one ticket id (got "${id}" and "${a}")`);
+    }
+  }
+  if (id === null) throw new Error('usage: ticket-workflow restore <id> (--at <snapshot> [--full] | --undelete)');
+  if (at !== null && undelete) throw new Error('restore takes --at or --undelete, not both');
+  if (at === null && !undelete) throw new Error('restore needs --at <snapshot> or --undelete — run `ticket-workflow history <id>` to list snapshots');
+  // --full describes which FIELDS of a snapshot to write over a live ticket; an undelete writes the
+  // whole file by definition, so accepting it here would advertise a choice that does not exist.
+  if (full && undelete) throw new Error('--full does not apply to --undelete, which restores the whole file');
+  return { id, at, full, undelete };
+}
+
+export async function cmdRestore(args: string[]): Promise<void> {
+  const { id, at, full, undelete } = parseRestoreArgs(args);
+  if (undelete) {
+    const result = await undeleteFromHistory(id);
+    console.log(`Recreated ${id} from ${result.from}`);
+    console.log(`  ${result.ticket.status}  ${result.ticket.title}`);
+    if (result.edges.length > 0) {
+      // Printed, never re-linked: those tickets may have been edited or deleted since.
+      console.log(`  re-link by hand if still wanted: ${result.edges.map(edgeLabel).join(', ')}`);
+    } else if (!result.tombstone) {
+      console.log(`  no ${DELETE_RECORD_FILE} — any blocker/parent edges it once had are unrecorded`);
+    }
+    return;
+  }
+  if (at === null) throw new Error('restore needs --at <snapshot> or --undelete');
+  const result = await restoreFromSnapshot(id, at, { full });
+  console.log(`Restored ${result.scope === 'full' ? 'all fields' : 'the body'} of ${id} from ${result.from}`);
+  console.log(`  ${result.ticket.status}  ${result.ticket.title}`);
+  console.log('  the pre-restore state was itself snapshotted — `ticket-workflow history` lists it');
 }
 
 // The advertised list is GENERATED from the canonical ids, never transcribed (tkt-2b6448a398b9):
@@ -445,11 +538,21 @@ export async function main(): Promise<void> {
       await cmdShow(id);
       break;
     }
+    case 'history': {
+      const id = rest[0];
+      if (id === undefined) throw new Error('usage: ticket-workflow history <id>');
+      await cmdHistory(id);
+      break;
+    }
+    case 'restore':
+      await cmdRestore(rest);
+      break;
     default:
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
           'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json] | ' +
           'vacuous <path> [--check] | test-slots [status|clear-stale] [--json] | test-contention [--runs <N>] [--control] | ' +
+          'history <id> | restore <id> (--at <snapshot> [--full] | --undelete) | ' +
           'worktree <ticket-id> [--branch <name>] [--base <ref>] [--name <dir>] [--repo <path>]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;

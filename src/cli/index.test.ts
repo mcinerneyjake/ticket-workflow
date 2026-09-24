@@ -4,8 +4,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain, parseWorktreeArgs, cmdWorktree} from './index.js';
-import { createTicket, HttpError } from '../server/tickets.js';
+import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain, parseWorktreeArgs, cmdWorktree, parseRestoreArgs, cmdHistory} from './index.js';
+import { createTicket, deleteTicket, updateTicket, HttpError } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import { STATUS_IDS } from '../shared/constants.js';
 import type { DoctorFacts } from '../doctor/checks.js';
@@ -551,5 +551,61 @@ describe('cmdWorktree', () => {
     expect(seen).toEqual([{ repoDir: '/repo', worktreeDir: '/repo/.claude/worktrees/tkt-1-fix' }]);
     expect(process.exitCode).toBe(1);
     process.exitCode = before;
+  });
+});
+
+// tkt-2147a878f3ba — restore/history verbs.
+describe('parseRestoreArgs', () => {
+  it('parses an --at restore, with and without --full', () => {
+    expect(parseRestoreArgs(['tkt-1', '--at', 'snap.md'])).toEqual({ id: 'tkt-1', at: 'snap.md', full: false, undelete: false });
+    expect(parseRestoreArgs(['tkt-1', '--at', 'snap.md', '--full'])).toEqual({ id: 'tkt-1', at: 'snap.md', full: true, undelete: false });
+    expect(parseRestoreArgs(['--undelete', 'tkt-1'])).toEqual({ id: 'tkt-1', at: null, full: false, undelete: true });
+  });
+
+  it.each([
+    ['no id', [], /usage: ticket-workflow restore/],
+    ['neither --at nor --undelete', ['tkt-1'], /needs --at/],
+    ['both --at and --undelete', ['tkt-1', '--at', 's.md', '--undelete'], /not both/],
+    ['--full with --undelete', ['tkt-1', '--undelete', '--full'], /does not apply/],
+    ['--at with no value', ['tkt-1', '--at'], /requires a snapshot filename/],
+    ['--at swallowing the next flag', ['tkt-1', '--at', '--full'], /requires a snapshot filename/],
+    ['an unknown option', ['tkt-1', '--at', 's.md', '--forcefully'], /unknown option for restore/],
+    ['two ids', ['tkt-1', 'tkt-2', '--undelete'], /at most one ticket id/],
+  ])('REFUSES %s', (_label, args, message) => {
+    expect(() => parseRestoreArgs(args)).toThrow(message);
+  });
+});
+
+describe('cmdHistory output', () => {
+  it('names a deleted ticket as DELETED and points at --undelete', async () => {
+    const t = await createTicket({ title: 'Gone', body: 'FINAL' });
+    await deleteTicket(t.id);
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.map(String).join(' ')); });
+    try {
+      await cmdHistory(t.id);
+    } finally {
+      spy.mockRestore();
+    }
+    const out = lines.join('\n');
+    expect(out).toContain('DELETED');
+    expect(out).toContain('(final state at delete)');
+    expect(out).toContain(`restore ${t.id} --undelete`);
+  });
+
+  it('names a live ticket as live and points at --at', async () => {
+    const t = await createTicket({ title: 'Doc', body: 'V1' });
+    await updateTicket(t.id, { body: 'V2' });
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { lines.push(a.map(String).join(' ')); });
+    try {
+      await cmdHistory(t.id);
+    } finally {
+      spy.mockRestore();
+    }
+    const out = lines.join('\n');
+    expect(out).toContain('live');
+    expect(out).toContain('--at');
+    expect(out).not.toContain('DELETED');
   });
 });
