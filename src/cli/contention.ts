@@ -126,10 +126,14 @@ export function parseReport(text: string, root: readonly string[]): { readonly s
       // A timeout's own cleanup error and a real bug beside it read identically, so fail closed (tkt-ea601ec924ed).
       if (timedOut < messages.length) mixed.push('fullName' in a && typeof a.fullName === 'string' ? a.fullName : '<unnamed test>');
     }
+    const fileError = 'message' in tr && typeof tr.message === 'string' && tr.message !== '' ? tr.message : null;
     // A file can fail with no failing test: an import error, or a hook that timed out.
     if (failed === 0) {
       failed = 1;
-      if ('message' in tr && typeof tr.message === 'string' && isTimeoutMessage(tr.message)) timeouts = 1;
+      if (fileError !== null && isTimeoutMessage(fileError)) timeouts = 1;
+    } else if (fileError !== null && timeouts > 0) {
+      // The report keeps only errors[0].message, so a file error beside a timeout is as undecidable as a test's (tkt-a9c71c324ac7).
+      mixed.push('<file-level error>');
     }
     files.push({ file: relativeTo(tr.name, root), failed, timeouts, mixed });
   }
