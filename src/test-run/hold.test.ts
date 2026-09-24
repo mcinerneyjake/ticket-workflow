@@ -426,8 +426,8 @@ describe('re-acquiring the slot in one process', () => {
     vi.stubEnv('VITEST_WORKER_ID', undefined);
     vi.stubEnv('CI', undefined);
     vi.stubEnv('TMPDIR', outer);
+    const h = harness({ tmpRoot: undefined, env: process.env });
     try {
-      const h = harness({ tmpRoot: undefined, env: process.env });
       const first = await holdTestRun(h.opts);
       expect(first.kind).toBe('held');
       const firstDir = first.kind === 'held' ? first.tmpDir : '';
@@ -440,6 +440,9 @@ describe('re-acquiring the slot in one process', () => {
       expect(path.dirname(secondDir)).toBe(path.dirname(firstDir));
       await releaseTestRun(h.registry);
     } finally {
+      // A failed expect above would otherwise leave process.env's global TMPDIR stack live for later cases.
+      await releaseTestRun(h.registry).catch(() => undefined);
+      globalThis.__ticketWorkflowTmpDirStacks?.delete(process.env);
       vi.unstubAllEnvs();
     }
   });
@@ -484,10 +487,8 @@ describe('a hostile registerExit cannot cost the release', () => {
 // globalSetup load through different module registries, so "one hold per process" was an assumption
 // the reclaim branch relied on and nothing enforced.
 //
-// SLOT layer only. Two live holds still corrupt each other's per-run TMPDIR — the second nests inside
-// the first and the first's release deletes it (tkt-6d494a02f2f3). `harness` gives each hold its own
-// `env` and an explicit `tmpRoot`, so nothing here would notice; do not read these as blessing the
-// configuration end to end.
+// SLOT layer only: `harness` gives each hold its own `env` and `tmpRoot`. The TMPDIR layer is covered
+// by 'two live holds sharing one TMPDIR' below.
 describe('two live holds in one process', () => {
   it('gives the second hold its own slot instead of cannibalising the first', async () => {
     const first = harness({ slots: 2 });
@@ -563,5 +564,137 @@ describe('two live holds in one process', () => {
     expect((await holdTestRun(next.opts)).kind).toBe('held');
     expect(next.log.some((l) => l.includes('own orphaned slot'))).toBe(true);
     await releaseTestRun(next.registry);
+  });
+});
+
+// The TMPDIR layer under two live holds (tkt-6d494a02f2f3). Only process.env reaches os.tmpdir(), so
+// these share it with the default tmpRoot: an injected env or explicit tmpRoot would hide the nesting.
+describe('two live holds sharing one TMPDIR', () => {
+  // A case failing between its releases, or a broken stack, would leave process.env's global stack
+  // populated and every later case would join it: a cascade that reads as independent failures.
+  const open: TestRegistry[] = [];
+
+  async function twoHolds(outer: string): Promise<{ first: Harness; second: Harness; firstDir: string; secondDir: string }> {
+    vi.stubEnv('VITEST_WORKER_ID', undefined);
+    vi.stubEnv('CI', undefined);
+    vi.stubEnv('TMPDIR', outer);
+    const first = harness({ tmpRoot: undefined, env: process.env, slots: 2 });
+    const second = harness({ tmpRoot: undefined, env: process.env, slots: 2, stateDir: first.stateDir });
+    open.push(first.registry, second.registry);
+    const a = await holdTestRun(first.opts);
+    const b = await holdTestRun(second.opts);
+    return { first, second, firstDir: a.kind === 'held' ? a.tmpDir : '', secondDir: b.kind === 'held' ? b.tmpDir : '' };
+  }
+
+  afterEach(async () => {
+    for (const reg of open.splice(0)) await releaseTestRun(reg).catch(() => undefined);
+    globalThis.__ticketWorkflowTmpDirStacks?.delete(process.env);
+    vi.unstubAllEnvs();
+  });
+
+  it('roots the second run dir beside the live first one, never inside it', async () => {
+    const outer = temp('tw-hold-outer-');
+    const { first, second, firstDir, secondDir } = await twoHolds(outer);
+    expect(path.dirname(firstDir)).toBe(path.join(outer, 'demo-test'));
+    expect(path.dirname(secondDir)).toBe(path.join(outer, 'demo-test'));
+    await releaseTestRun(second.registry);
+    await releaseTestRun(first.registry);
+  });
+
+  it('first-in first-out: releasing the first keeps the second’s dir and TMPDIR, then restores the original', async () => {
+    const outer = temp('tw-hold-outer-');
+    const { first, second, secondDir } = await twoHolds(outer);
+
+    await releaseTestRun(first.registry);
+    expect(existsSync(secondDir)).toBe(true);
+    expect(process.env.TMPDIR).toBe(secondDir);
+
+    await releaseTestRun(second.registry);
+    expect(process.env.TMPDIR).toBe(outer);
+  });
+
+  it('last-in first-out: releasing the second hands TMPDIR back to the live first, then the original', async () => {
+    const outer = temp('tw-hold-outer-');
+    const { first, second, firstDir } = await twoHolds(outer);
+
+    await releaseTestRun(second.registry);
+    expect(existsSync(firstDir)).toBe(true);
+    expect(process.env.TMPDIR).toBe(firstDir);
+
+    await releaseTestRun(first.registry);
+    expect(process.env.TMPDIR).toBe(outer);
+  });
+
+  it.each([
+    ['first-in first-out', false],
+    ['last-in first-out', true],
+  ])('leaves no TMPDIR behind when there was none before either hold (%s)', async (_order, reverse) => {
+    const env: NodeJS.ProcessEnv = {};
+    const first = harness({ slots: 2 }, env);
+    const second = harness({ slots: 2, stateDir: first.stateDir, tmpRoot: first.tmpRoot }, env);
+    await holdTestRun(first.opts);
+    await holdTestRun(second.opts);
+    for (const h of reverse ? [second, first] : [first, second]) await releaseTestRun(h.registry);
+    expect('TMPDIR' in env).toBe(false);
+  });
+
+  it('releasing a middle hold leaves TMPDIR on the newest live one', async () => {
+    const env: NodeJS.ProcessEnv = { TMPDIR: '/outer/tmp' };
+    const first = harness({ slots: 3 }, env);
+    const shared = { slots: 3, stateDir: first.stateDir, tmpRoot: first.tmpRoot };
+    const second = harness(shared, env);
+    const third = harness(shared, env);
+    const dirs: string[] = [];
+    for (const h of [first, second, third]) {
+      const o = await holdTestRun(h.opts);
+      dirs.push(o.kind === 'held' ? o.tmpDir : '');
+    }
+
+    await releaseTestRun(second.registry);
+    expect(env.TMPDIR).toBe(dirs[2]);
+    await releaseTestRun(third.registry);
+    expect(env.TMPDIR).toBe(dirs[0]);
+    await releaseTestRun(first.registry);
+    expect(env.TMPDIR).toBe('/outer/tmp');
+  });
+
+  it('roots a hold on an injected env beside a live process.env hold, not inside it', async () => {
+    const outer = temp('tw-hold-outer-');
+    vi.stubEnv('VITEST_WORKER_ID', undefined);
+    vi.stubEnv('CI', undefined);
+    vi.stubEnv('TMPDIR', outer);
+    const first = harness({ tmpRoot: undefined, env: process.env, slots: 2 });
+    const second = harness({ tmpRoot: undefined, slots: 2, stateDir: first.stateDir }, {});
+    open.push(first.registry, second.registry);
+    await holdTestRun(first.opts);
+    const b = await holdTestRun(second.opts);
+    expect(path.dirname(b.kind === 'held' ? b.tmpDir : '')).toBe(path.join(outer, 'demo-test'));
+  });
+
+  it('never sweeps a live sibling hold’s run dir, however old it is', async () => {
+    const env: NodeJS.ProcessEnv = {};
+    const first = harness({ slots: 2 }, env);
+    open.push(first.registry);
+    const a = await holdTestRun(first.opts);
+    const firstDir = a.kind === 'held' ? a.tmpDir : '';
+
+    const later = Date.now() + 7 * 60 * 60_000; // past the default 6 h tmpTtlMs
+    const second = harness({ slots: 2, stateDir: first.stateDir, tmpRoot: first.tmpRoot, now: () => later }, env);
+    open.push(second.registry);
+    await holdTestRun(second.opts);
+
+    expect(existsSync(firstDir)).toBe(true);
+  });
+
+  it('a throwing registerExit leaves TMPDIR as it found it, and a later hold still restores the original', async () => {
+    const env: NodeJS.ProcessEnv = { TMPDIR: '/outer/tmp' };
+    const broken = harness({ registerExit: () => { throw new Error('registerExit blew up'); } }, env);
+    await expect(holdTestRun(broken.opts)).rejects.toThrow('registerExit blew up');
+    expect(env.TMPDIR).toBe('/outer/tmp');
+
+    const next = harness({ stateDir: broken.stateDir, tmpRoot: broken.tmpRoot }, env);
+    await holdTestRun(next.opts);
+    await releaseTestRun(next.registry);
+    expect(env.TMPDIR).toBe('/outer/tmp');
   });
 });
