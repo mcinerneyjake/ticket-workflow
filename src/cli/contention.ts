@@ -276,10 +276,13 @@ export function armResult(runs: readonly RunOutcome[]): ArmResult {
   return runs.every((r) => r.kind === 'determined' && r.green) ? 'green' : 'red';
 }
 
+const onlyTimeouts = (f: FileFailure): boolean => f.failed > 0 && f.timeouts === f.failed && f.mixed.length === 0;
+const failedFiles = (runs: readonly RunOutcome[]): FileFailure[] => runs.flatMap((r) => (r.kind === 'determined' ? r.files : []));
+
 /** Every failure a timeout — the contention signature. An assertion failure means HEAD is red on its own. */
 export function contentionShaped(runs: readonly RunOutcome[]): boolean {
-  const files = runs.flatMap((r) => (r.kind === 'determined' ? r.files : []));
-  return files.length > 0 && files.every((f) => f.failed > 0 && f.timeouts === f.failed && f.mixed.length === 0);
+  const files = failedFiles(runs);
+  return files.length > 0 && files.every(onlyTimeouts);
 }
 
 /** Each mixed test once across runs; `(×k)` when k distinct tests in one run share that name. */
@@ -345,10 +348,22 @@ export function parseHistory(text: string): HistoryEntry[] {
   return out;
 }
 
-/** `recorded` is what history keeps: only a control this function accepted is ever stored `red`. */
+/** `recorded` is what history keeps: a control is stored `red` only when this function accepted it. */
 export type Decision = { readonly exit: number; readonly lines: readonly string[]; readonly recorded: ArmResult };
 
 const noVerdict = (line: string): Decision => ({ exit: CONTENTION_EXIT.NO_VERDICT, lines: [line], recorded: 'undetermined' });
+function notContention(arm: Arm, runs: readonly RunOutcome[]): string[] {
+  const mixed = mixedTests(runs);
+  const headRed = failedFiles(runs).some((f) => f.timeouts < f.failed);
+  const lines: string[] = [];
+  if (headRed || mixed.length === 0) lines.push(`NO VERDICT: the ${arm === 'control' ? 'control' : 'bounded arm'} failed on something other than timeouts, so HEAD is red on its own — fix that first.`);
+  if (mixed.length > 0) {
+    lines.push(
+      `NO VERDICT: these tests timed out beside another error or an unreadable report entry — a cleanup that assumes setup finished, or a real bug; the report cannot tell which:\n  ${mixed.join('\n  ')}`,
+    );
+  }
+  return lines;
+}
 
 export function decide(input: {
   readonly arm: Arm;
@@ -378,18 +393,7 @@ export function decide(input: {
         lines: [`CONTROL GREEN: ${n} unbounded runs did not collide, so this machine cannot show contention at N=${n} right now. Raise --runs, or retry under load.`],
       };
     }
-    if (!contentionShaped(runs)) {
-      const mixed = mixedTests(runs);
-      const headRed = runs.some((r) => r.kind === 'determined' && r.files.some((f) => f.timeouts < f.failed));
-      const lines: string[] = [];
-      if (headRed || mixed.length === 0) lines.push('NO VERDICT: the control failed on something other than timeouts, so HEAD is red on its own — fix that first.');
-      if (mixed.length > 0) {
-        lines.push(
-          `NO VERDICT: these tests timed out beside another error or an unreadable report entry — a cleanup that assumes setup finished, or a real bug; the report cannot tell which:\n  ${mixed.join('\n  ')}`,
-        );
-      }
-      return { exit: CONTENTION_EXIT.NO_VERDICT, lines, recorded: 'undetermined' };
-    }
+    if (!contentionShaped(runs)) return { exit: CONTENTION_EXIT.NO_VERDICT, lines: notContention('control', runs), recorded: 'undetermined' };
     return { exit: CONTENTION_EXIT.PASS, recorded: 'red', lines: [`CONTROL RED: contention reproduced at N=${n}. Now run the bounded arm: test-contention --runs ${n}`] };
   }
 
@@ -398,6 +402,8 @@ export function decide(input: {
     return noVerdict('NO VERDICT: not every run held a test-run slot, so the bound was not in force. Is holdTestRun wired in this repo’s vitest config?');
   }
   if (k >= n) return noVerdict(`NO VERDICT: K=${k} slots admit all ${n} runs at once, so nothing was bounded.`);
+  // One clean timeout shows the bound failed; a red resting only on mixed tests shows nothing (tkt-9d2305ebf504).
+  const withheld = result === 'red' && mixedTests(runs).length > 0 && !failedFiles(runs).some(onlyTimeouts) ? notContention('bounded', runs) : [];
   // Same checkout and same commit: a control at another HEAD measured different code.
   const control = input.history.find(
     (h) => h.arm === 'control' && h.root === input.root && h.head === input.head && h.runs === n && h.day === input.today && h.result === 'red',
@@ -405,10 +411,14 @@ export function decide(input: {
   if (control === undefined) {
     return {
       exit: CONTENTION_EXIT.NO_VERDICT,
-      recorded: result,
-      lines: [`NO VERDICT: no control arm at N=${n} for this checkout at ${input.head.slice(0, 7)} went red today (${input.today}). Run test-contention --runs ${n} --control first.`],
+      recorded: withheld.length > 0 ? 'undetermined' : result,
+      lines: [
+        `NO VERDICT: no control arm at N=${n} for this checkout at ${input.head.slice(0, 7)} went red today (${input.today}). Run test-contention --runs ${n} --control first.`,
+        ...withheld,
+      ],
     };
   }
+  if (withheld.length > 0) return { exit: CONTENTION_EXIT.NO_VERDICT, lines: withheld, recorded: 'undetermined' };
   const against = `against control red at ${control.at}`;
   return result === 'green'
     ? { exit: CONTENTION_EXIT.PASS, recorded: result, lines: [`PASS: ${n} runs green at K=${k}, ${against}.`] }
