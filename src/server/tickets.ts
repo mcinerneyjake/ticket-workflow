@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import matter from 'gray-matter';
-import { STATUS_IDS, TYPES, PRIORITIES, BOARD_STATUSES, CREATE_STATUS_IDS, STATUS_STEP, isSource, type Ticket, type StatusId, type Priority, type DashboardSummary, type Provenance } from '../shared/constants.js';
+import { STATUS_IDS, TYPES, PRIORITIES, BOARD_STATUSES, CREATE_STATUS_IDS, STATUS_STEP, isSource, isStatusId, type Ticket, type StatusId, type Priority, type DashboardSummary, type Provenance } from '../shared/constants.js';
 import { ticketsDir } from '../paths.js';
 import { appendEvent } from './events.js';
 import { log } from '../logger.js';
@@ -122,15 +122,20 @@ function asString(v: string | Date | null | undefined): string {
   return '';
 }
 
-// Normalize a parsed file to a stable ticket; invalid enums fall back to defaults
-// so a hand-edited file can't crash the board.
-function normalize(id: string, data: RawFrontmatter, body: string): Ticket {
+// A parsed file whose status is null because it named no STATUS_IDS member. Status is never
+// defaulted like type/priority: it decides the column (tkt-ee3f3315cdd8).
+export const INVALID_STATUS_REASON = 'invalid status';
+
+export type ParsedTicket = Omit<Ticket, 'status'> & { status: StatusId | null }
+
+// Invalid type/priority fall back to defaults so a hand-edited file can't crash the board.
+function normalize(id: string, data: RawFrontmatter, body: string): ParsedTicket {
   return {
     id,
     title: asString(data.title),
     type: validEnum(TYPES, data.type, 'task'),
     priority: validEnum(PRIORITIES, data.priority, 'medium'),
-    status: validEnum(STATUS_IDS, data.status, 'backlog'),
+    status: typeof data.status === 'string' && isStatusId(data.status) ? data.status : null,
     order: typeof data.order === 'number' ? data.order : 0,
     created: asString(data.created),
     updated: asString(data.updated),
@@ -228,13 +233,13 @@ function snapshotName(): string {
 // Non-blocking: a snapshot failure logs loudly but must not wedge a legitimate edit;
 // only the undo for that one overwrite is lost. deleteTicket takes the OPPOSITE
 // posture deliberately — see recordDeletion.
-async function snapshotHistory(prior: Ticket): Promise<void> {
+async function snapshotHistory(id: string, contents: string | Buffer): Promise<void> {
   try {
-    const dir = historyDir(prior.id);
+    const dir = historyDir(id);
     await fs.mkdir(dir, { recursive: true });
-    await atomicWrite(path.join(dir, snapshotName()), serialize(prior));
+    await atomicWrite(path.join(dir, snapshotName()), contents);
   } catch (err) {
-    log.error(`[history] failed to snapshot prior body for ${prior.id} before overwrite:`, err);
+    log.error(`[history] failed to snapshot prior body for ${id} before overwrite:`, err);
   }
 }
 
@@ -351,9 +356,22 @@ export interface BoardListing {
 // --- Public API ------------------------------------------------------------
 
 export async function listBoard(): Promise<BoardListing> {
+  const { tickets, unreadable } = await readBoard();
+  return { tickets, unreadable };
+}
+
+// Every file that parses, invalid status included. Integrity checks (cycle guard, delete edges,
+// next order) read links, not columns, so an unreadable-status ticket must stay visible to them.
+async function listLinks(): Promise<ParsedTicket[]> {
+  const { tickets, invalidStatus } = await readBoard();
+  return [...tickets, ...invalidStatus];
+}
+
+async function readBoard(): Promise<BoardListing & { invalidStatus: ParsedTicket[] }> {
   await ensureDir();
   const files = await fs.readdir(getTicketsDir());
   const tickets: Ticket[] = [];
+  const invalidStatus: ParsedTicket[] = [];
   const unreadable: UnreadableTicketFile[] = [];
   for (const file of files) {
     if (!file.endsWith('.md')) continue;
@@ -370,7 +388,14 @@ export async function listBoard(): Promise<BoardListing> {
     }
     try {
       const { data, content } = matter(raw, NO_CACHE); // NO_CACHE → consistent throw on bad YAML
-      tickets.push(normalize(file.slice(0, -3), data, content));
+      const parsed = normalize(file.slice(0, -3), data, content);
+      if (parsed.status === null) {
+        log.warn(`[tickets] skipping ticket file ${file}: invalid status ${String(data.status)}`);
+        invalidStatus.push(parsed);
+        unreadable.push({ file, reason: INVALID_STATUS_REASON });
+      } else {
+        tickets.push({ ...parsed, status: parsed.status });
+      }
     } catch (err) {
       // Unparseable frontmatter must not take the whole board down — skip so the rest stays up.
       log.warn(`[tickets] skipping unparseable ticket file ${file}:`, err instanceof Error ? err.message : err);
@@ -379,7 +404,7 @@ export async function listBoard(): Promise<BoardListing> {
       unreadable.push({ file, reason: 'unparseable frontmatter' });
     }
   }
-  return { tickets: tickets.sort((a, b) => a.order - b.order), unreadable };
+  return { tickets: tickets.sort((a, b) => a.order - b.order), unreadable, invalidStatus };
 }
 
 export async function listTickets(): Promise<Ticket[]> {
@@ -425,6 +450,14 @@ export async function ticketExists(id: string): Promise<boolean> {
 // is the caller's because a snapshot's frontmatter has none: identity comes from the directory it
 // sits in, which is why history.ts enforces containment rather than an id field (tkt-2147a878f3ba).
 export function parseTicketFile(id: string, raw: string, label: string): Ticket {
+  const parsed = parseSnapshot(id, raw, label);
+  if (parsed.status === null)
+    throw new HttpError(400, `Snapshot ${label} has an invalid status — nothing was written.`);
+  return { ...parsed, status: parsed.status };
+}
+
+// For a body-only restore and undelete, neither of which writes a status: an invalid one is allowed.
+export function parseSnapshot(id: string, raw: string, label: string): ParsedTicket {
   try {
     const { data, content } = matter(raw, NO_CACHE); // see NO_CACHE: consistent throw on bad YAML
     return normalize(id, data, content);
@@ -436,23 +469,39 @@ export function parseTicketFile(id: string, raw: string, label: string): Ticket 
 }
 
 export async function getTicket(id: string): Promise<Ticket> {
+  return (await readTicket(id)).ticket;
+}
+
+// Returns the file's bytes too: a repair snapshots them, since the parsed ticket no longer holds the
+// invalid value and a string round-trip would rewrite invalid UTF-8 (same reason as recordDeletion).
+async function readTicket(id: string, repairStatus?: StatusId): Promise<{ ticket: Ticket; statusRepaired: boolean; raw: Buffer }> {
   const file = ticketPath(id); // validate id before the try → bad id is 400, not a masked 404
-  let raw: string;
+  let raw: Buffer;
   try {
-    raw = await fs.readFile(file, 'utf8');
+    raw = await fs.readFile(file);
   } catch (err) {
     if (isENOENT(err)) throw new HttpError(404, `Ticket not found: ${id}`);
     throw err; // EACCES/EMFILE/… are real faults → 500, not a masked 404
   }
+  let data: RawFrontmatter;
+  let parsed: ParsedTicket;
   try {
-    const { data, content } = matter(raw, NO_CACHE); // see NO_CACHE: consistent throw on bad YAML
-    return normalize(id, data, content);
+    const matched = matter(raw.toString('utf8'), NO_CACHE); // see NO_CACHE: consistent throw on bad YAML
+    data = matched.data;
+    parsed = normalize(id, data, matched.content);
   } catch (err) {
     // The YAMLException embeds a snippet of the file's own content and its line/column; it stays
     // server-side because consumers surface HttpError messages to clients (tkt-7cab2f9cc082).
     log.error('[tickets] unparseable frontmatter', file, err);
     throw new HttpError(500, `Ticket ${id} has unparseable frontmatter`);
   }
+  if (parsed.status !== null) return { ticket: { ...parsed, status: parsed.status }, statusRepaired: false, raw };
+  log.error(`[tickets] ${file}: invalid status ${String(data.status)}`);
+  if (repairStatus === undefined)
+    // The bad value may be a mangled `in-progress`, so the message sends a human to check for a holder
+    // before repairing — an update that sets status skips start_ticket's held check.
+    throw new HttpError(500, `Ticket ${id} has an invalid status. Check that no session is working it, then repair it with an update that sets \`status\`.`);
+  return { ticket: { ...parsed, status: repairStatus }, statusRepaired: true, raw };
 }
 
 // provenance is a TRUSTED stamp — supplied only by the agent write path, never
@@ -472,36 +521,34 @@ export async function createTicket(input: Partial<Ticket>, provenance?: Provenan
     throw new HttpError(400, 'Title is required');
 
   const now = new Date().toISOString();
-  const all = await listTickets();
+  const all = await listLinks();
   const maxOrder = all.reduce((m, t) => Math.max(m, t.order), 0);
 
-  const ticket = normalize(
-    newId(),
-    {
-      title: input.title.trim(),
-      type: input.type ?? 'task',
-      priority: input.priority ?? 'medium',
-      status: input.status ?? 'backlog',
-      order: maxOrder + 1,
-      created: now,
-      updated: now,
-      blockers: input.blockers ?? [],
-      project: input.project ?? null,
-      parent: input.parent ?? null,
-      dueDate: input.dueDate ?? null,
-      assignee: input.assignee ?? null,
-      source: provenance?.source,
-      runId: provenance?.runId,
-    },
-    input.body ?? '',
-  );
+  const ticket: Ticket = {
+    id: newId(),
+    title: input.title.trim(),
+    type: input.type ?? 'task',
+    priority: input.priority ?? 'medium',
+    status: input.status ?? 'backlog',
+    order: maxOrder + 1,
+    created: now,
+    updated: now,
+    body: (input.body ?? '').trim(),
+    project: input.project || null,
+    blockers: input.blockers ?? [],
+    parent: input.parent || null,
+    dueDate: input.dueDate || null,
+    assignee: input.assignee || null,
+    source: provenance?.source ?? null,
+    runId: provenance?.runId || null,
+  };
   await writeTicket(ticket);
   return ticket;
 }
 
 // Cycle guard: the new parent may not be `id` nor any descendant of it. Computed
 // server-side so HTTP/MCP callers can't persist a cycle the UI already prevents.
-function collectDescendants(id: string, all: Ticket[]): Set<string> {
+function collectDescendants(id: string, all: ParsedTicket[]): Set<string> {
   const descendants = new Set<string>();
   const queue: string[] = [id];
   while (queue.length > 0) {
@@ -645,11 +692,11 @@ async function updateTicketLocked(id: string, patch: TicketPatch, provenance?: P
   validateWritableTypes(patch);
   validateEnums(patch);
   assertDueDate(patch.dueDate);
-  const existing = await getTicket(id);
+  const { ticket: existing, statusRepaired, raw } = await readTicket(id, patch.status ?? undefined);
   const nextBody = mergeBody(existing.body, patch);
   if (typeof patch.parent === 'string') {
     if (patch.parent === id) throw new HttpError(400, 'A ticket cannot be its own parent');
-    if (collectDescendants(id, await listTickets()).has(patch.parent))
+    if (collectDescendants(id, await listLinks()).has(patch.parent))
       throw new HttpError(400, 'parent would create a cycle');
   }
   // Explicit field-by-field merge: MCP callers bypass TicketPatch typing, so
@@ -683,12 +730,14 @@ async function updateTicketLocked(id: string, patch: TicketPatch, provenance?: P
   // documented whitespace-only appendBody no-op (code review, 2026-07-23).
   // Compared through serialize() so the check covers exactly what gets persisted
   // and picks up any field added later, rather than a second hand-kept field list.
-  if (serialize({ ...merged, updated: existing.updated }) === serialize(existing)) return existing;
+  if (!statusRepaired && serialize({ ...merged, updated: existing.updated }) === serialize(existing)) return existing; // a repair only looks like a no-op
   // Snapshot the prior body before the overwrite loses it (tkt-18d53c0c7cd8). Body-
   // changing writes only — a structured-only edit keeps the same body, nothing to undo.
-  if (merged.body !== existing.body) await snapshotHistory(existing);
+  if (statusRepaired) await snapshotHistory(existing.id, raw);
+  else if (merged.body !== existing.body) await snapshotHistory(existing.id, serialize(existing));
   await writeTicket(merged);
   // Emit only on a real status change — body/priority/reorder patches must not record a milestone.
+  // A repair emits nothing: the file's prior column is unknown, so no transition can be claimed.
   if (merged.status !== existing.status) await emitStatusStep(id, merged.status);
   return merged;
 }
@@ -820,7 +869,7 @@ async function deleteTicketLocked(id: string, file: string): Promise<void> {
   // Computed BEFORE the unlink: this is what an undelete needs in order to tell a human which edges
   // to re-link, and it stays true whether or not the best-effort cleanup below actually succeeds.
   // Self-edges are excluded — the cleanup cannot strip an edge from a file it just removed.
-  const edges: StrippedEdge[] = (await listTickets())
+  const edges: StrippedEdge[] = (await listLinks())
     .filter((t) => t.id !== id && (t.blockers.includes(id) || t.parent === id))
     .map((t) => ({ id: t.id, blocker: t.blockers.includes(id), parent: t.parent === id }));
   await recordDeletion(id, raw, edges);

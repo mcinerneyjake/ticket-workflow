@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { createTicket, deleteTicket, getTicket, updateTicket, restoreRawTicketFile, DELETE_RECORD_FILE, HttpError } from './tickets.js';
+import { createTicket, deleteTicket, getTicket, listBoard, updateTicket, restoreRawTicketFile, DELETE_RECORD_FILE, HttpError } from './tickets.js';
 import { listHistory, restoreFromSnapshot, undeleteFromHistory } from './history.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 import { setLogger } from '../logger.js';
@@ -343,6 +343,41 @@ describe('restore --undelete', () => {
     expect(await ticketFileExists(t.id)).toBe(false);
   });
 
+  // tkt-ee3f3315cdd8 — undelete returns the file as it was, so an invalid status comes back unreadable
+  // (not refused, not coerced to backlog); an update that sets status then repairs it.
+  it('revives a snapshot whose status is invalid, byte for byte, as unreadable', async () => {
+    silenceLog();
+    const t = await createTicket({ title: 'Gone', body: 'FINAL' });
+    await deleteTicket(t.id);
+    const [snap] = (await listHistory(t.id)).snapshots;
+    const snapPath = path.join(histDir(t.id), snap.file);
+    const raw = await fs.readFile(snapPath, 'utf8');
+    expect(raw).toMatch(/^status: backlog$/m); // control: the substitution below really applies
+    const corrupt = raw.replace(/^status: backlog$/m, 'status: in progres');
+    await fs.writeFile(snapPath, corrupt, 'utf8');
+
+    const result = await undeleteFromHistory(t.id);
+
+    expect(result.ticket.status).toBeNull();
+    expect(result.ticket.title).toBe('Gone');
+    expect(await fs.readFile(path.join(dirs.tickets, `${t.id}.md`), 'utf8')).toBe(corrupt);
+    expect((await listBoard()).unreadable).toEqual([{ file: `${t.id}.md`, reason: 'invalid status' }]);
+  });
+
+  it('REFUSES to restore --full FROM a snapshot whose status is invalid', async () => {
+    silenceLog();
+    const t = await createTicket({ title: 'Doc', body: 'A' });
+    await updateTicket(t.id, { body: 'B' });
+    const [snap] = (await listHistory(t.id)).snapshots;
+    const snapPath = path.join(histDir(t.id), snap.file);
+    await fs.writeFile(snapPath, (await fs.readFile(snapPath, 'utf8')).replace(/^status: backlog$/m, 'status: 42'), 'utf8');
+
+    const err = await httpError(restoreFromSnapshot(t.id, snap.file, { full: true }));
+    expect(err.status).toBe(400);
+    expect(err.message).toContain('invalid status');
+    expect((await getTicket(t.id)).body).toBe('B');
+  });
+
   it('round-trips create -> edit -> delete -> undelete with the final body intact', async () => {
     const created = await createTicket({ title: 'Round trip', body: 'V1' });
     await updateTicket(created.id, { body: 'V2' });
@@ -477,5 +512,70 @@ describe('code-review regressions', () => {
     await deleteTicket(id);
     await undeleteFromHistory(id);
     expect(await fs.readFile(path.join(dirs.tickets, `${id}.md`))).toEqual(raw);
+  });
+});
+
+// tkt-ee3f3315cdd8 — a live file whose status is invalid, against the restore and delete paths.
+describe('a live ticket whose status is invalid', () => {
+  async function corruptStatus(id: string, value: string): Promise<string> {
+    const file = path.join(dirs.tickets, `${id}.md`);
+    const raw = await fs.readFile(file, 'utf8');
+    expect(raw).toMatch(/^status: backlog$/m); // control: the substitution below really applies
+    const corrupt = raw.replace(/^status: backlog$/m, `status: ${value}`);
+    await fs.writeFile(file, corrupt, 'utf8');
+    return corrupt;
+  }
+
+  it('restore --full refuses it and changes nothing; the repair is an update that sets status', async () => {
+    silenceLog();
+    const t = await createTicket({ title: 'Doc', body: 'A' });
+    await updateTicket(t.id, { body: 'B' });
+    const [snap] = (await listHistory(t.id)).snapshots;
+    const corrupt = await corruptStatus(t.id, 'in progres');
+    const before = (await historyFiles(t.id)).length;
+
+    const err = await httpError(restoreFromSnapshot(t.id, snap.file, { full: true }));
+
+    expect(err.status).toBe(500);
+    expect(err.message).toContain('update that sets `status`');
+    expect(await fs.readFile(path.join(dirs.tickets, `${t.id}.md`), 'utf8')).toBe(corrupt);
+    expect(await historyFiles(t.id)).toHaveLength(before);
+  });
+
+  it('a body-only restore FROM the snapshot a repair left works, though its status is invalid', async () => {
+    silenceLog();
+    const t = await createTicket({ title: 'Doc', body: 'OLD' });
+    await corruptStatus(t.id, 'in progres');
+    await updateTicket(t.id, { status: 'todo', body: 'NEW' });
+    const [snap] = (await listHistory(t.id)).snapshots;
+
+    const result = await restoreFromSnapshot(t.id, snap.file);
+
+    expect(result.ticket.body).toBe('OLD');
+    expect(result.ticket.status).toBe('todo');
+  });
+
+  it('a body-only restore refuses, because it would leave the status invalid', async () => {
+    silenceLog();
+    const t = await createTicket({ title: 'Doc', body: 'A' });
+    await updateTicket(t.id, { body: 'B' });
+    const [snap] = (await listHistory(t.id)).snapshots;
+    const corrupt = await corruptStatus(t.id, 'in progres');
+
+    const err = await httpError(restoreFromSnapshot(t.id, snap.file));
+
+    expect(err.status).toBe(500);
+    expect(await fs.readFile(path.join(dirs.tickets, `${t.id}.md`), 'utf8')).toBe(corrupt);
+  });
+
+  it('deleting a ticket it links to still records the edge for an undelete to report', async () => {
+    silenceLog();
+    const target = await createTicket({ title: 'Target' });
+    const linked = await createTicket({ title: 'Linked', parent: target.id });
+    await corruptStatus(linked.id, 'in progres');
+
+    await deleteTicket(target.id);
+
+    expect((await listHistory(target.id)).deletion?.edges).toEqual([{ id: linked.id, blocker: false, parent: true }]);
   });
 });

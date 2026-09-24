@@ -1,6 +1,6 @@
 import { type Tool } from '@modelcontextprotocol/sdk/types.js';
 import {
-  listBoard, getTicket, createTicket, updateTicket, startTicket, deleteTicket, HttpError, errnoCode,
+  INVALID_STATUS_REASON, listBoard, getTicket, createTicket, updateTicket, startTicket, deleteTicket, HttpError, errnoCode,
   type UnreadableTicketFile,
 } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
@@ -295,7 +295,12 @@ export async function handleToolCall(
           notes.push(`${omitted} more ticket(s) omitted by limit=${filters.limit}; narrow with status/project/query or raise limit.`);
         }
         if (unreadable.length > 0) {
-          notes.push(`${unreadable.length} ticket file(s) could NOT be read and are missing from every count above: ${unreadable.map((u) => u.file).join(', ')}. Fix the frontmatter — an unquoted title containing a colon is the usual cause.`);
+          const invalidStatus = unreadable.filter((u) => u.reason === INVALID_STATUS_REASON).length;
+          notes.push(`${unreadable.length} ticket file(s) could NOT be read and are missing from every count above: ${unreadable.map((u) => u.file).join(', ')}.`);
+          if (invalidStatus < unreadable.length)
+            notes.push('Fix the frontmatter — an unquoted title containing a colon is the usual cause.');
+          if (invalidStatus > 0)
+            notes.push("For reason 'invalid status': check no session is working it, then repair it with update_ticket setting status.");
         }
         if (unassignedAll.length > 0) {
           const more = unassignedAll.length - unassigned.length;

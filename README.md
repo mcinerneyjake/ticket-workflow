@@ -176,6 +176,18 @@ the `status`/`project`/`query` filters — a file that won't parse has no fields
 filter on, so no filter may hide it. The usual cause is a hand-edited unquoted
 `title:` containing a colon.
 
+A file whose `status` is not exactly one of the status ids — missing, misspelled,
+wrong case, a list — is reported the same way, with `reason: 'invalid status'`,
+rather than being read as `backlog`. Status decides the column, so guessing one
+would move the ticket in silence. `getTicket` and `start_ticket` refuse it, since
+the value may be a mangled `in-progress` that another session holds. Once you have
+checked that nobody does, an update that sets `status` repairs it. That is the only
+repair: it snapshots the original file byte for byte first and records no status
+milestone. `restore --full` refuses such a ticket rather than repairing it, while a
+body-only `restore --at` accepts the snapshot a repair left behind, and
+`restore --undelete` brings a deleted one back exactly as it was, still unreadable.
+An invalid `type` or `priority` still falls back to `task`/`medium`.
+
 ## Corrupt event lines
 
 The same rule applies to the JSONL telemetry, for the same reason: a line that

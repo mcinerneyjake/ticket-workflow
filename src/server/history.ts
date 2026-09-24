@@ -2,8 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
   DELETE_RECORD_FILE, HttpError, fullPatchOf, getTicket, getTicketsDir, historyDir, isENOENT,
-  parseTicketFile, restoreRawTicketFile, snapshotTicketState, ticketExists, updateTicket,
-  type DeleteRecord, type StrippedEdge,
+  parseSnapshot, parseTicketFile, restoreRawTicketFile, snapshotTicketState,
+  ticketExists, updateTicket, type DeleteRecord, type ParsedTicket, type StrippedEdge,
 } from './tickets.js';
 import { log } from '../logger.js';
 import type { Ticket } from '../shared/constants.js';
@@ -140,7 +140,9 @@ export interface RestoreResult {
 export async function restoreFromSnapshot(id: string, file: string, options: { full?: boolean } = {}): Promise<RestoreResult> {
   const full = options.full === true;
   const snapshotPath = await resolveSnapshotPath(id, file);
-  const snapshot = parseTicketFile(id, await fs.readFile(snapshotPath, 'utf8'), file);
+  const raw = await fs.readFile(snapshotPath, 'utf8');
+  // A body-only restore writes no status, so it accepts the invalid-status snapshot a repair leaves.
+  const patch = full ? fullPatchOf(parseTicketFile(id, raw, file)) : { body: parseSnapshot(id, raw, file).body };
   let current: Ticket;
   try {
     current = await getTicket(id);
@@ -150,10 +152,9 @@ export async function restoreFromSnapshot(id: string, file: string, options: { f
       throw new HttpError(404, `Ticket ${id} does not exist — use \`restore ${id} --undelete\` to recreate it from its last snapshot.`);
     throw err;
   }
-  const patch = full ? fullPatchOf(snapshot) : { body: snapshot.body };
   const unchanged = full
     ? JSON.stringify(fullPatchOf(current)) === JSON.stringify(patch)
-    : current.body === snapshot.body;
+    : current.body === patch.body;
   // Refused BEFORE the write rather than relying on updateTicket's own no-op guard: the caller asked
   // for a restore, and reporting success for a write that never happened is the fail-open shape.
   if (unchanged)
@@ -167,7 +168,8 @@ export async function restoreFromSnapshot(id: string, file: string, options: { f
 }
 
 export interface UndeleteResult {
-  ticket: Ticket
+  // status is null when the revived file's is invalid; the ticket is back, but listed as unreadable.
+  ticket: ParsedTicket
   from: string
   edges: StrippedEdge[]
   tombstone: boolean
@@ -190,12 +192,12 @@ export async function undeleteFromHistory(id: string): Promise<UndeleteResult> {
   // whatever it points at as the ticket is the same hole `--at` already refuses.
   const snapshotPath = await resolveSnapshotPath(id, file);
   const raw = await fs.readFile(snapshotPath);
-  // Validate before writing: a corrupt snapshot must not be revived. Parsed from the bytes, while
-  // what gets written is the bytes themselves.
-  parseTicketFile(id, raw.toString('utf8'), file);
+  // Validate before writing: an unparseable snapshot must not be revived (an invalid status is, as-is).
+  // Parsed from the bytes, while what gets written is the bytes themselves.
+  const ticket = parseSnapshot(id, raw.toString('utf8'), file);
   await restoreRawTicketFile(id, raw);
   return {
-    ticket: await getTicket(id),
+    ticket,
     from: file,
     edges: listing.deletion?.edges ?? [],
     tombstone: listing.deletion !== null,
