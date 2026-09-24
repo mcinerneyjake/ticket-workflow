@@ -134,6 +134,15 @@ describe('audit: each check goes red on exactly its own broken guardrail', () =>
         writeFileSync(p, readBack(p).replace(/^\.claude\/worktrees$/m, '.claude/worktrees/'));
       },
     },
+    // tkt-6b1ad6b887fe: the same slash on node_modules misses the node_modules a worktree links in.
+    {
+      id: 'gitignore',
+      expect: 'fail',
+      mutate: (d) => {
+        const p = path.join(d, '.gitignore');
+        writeFileSync(p, readBack(p).replace(/^node_modules$/m, 'node_modules/'));
+      },
+    },
     {
       id: 'ci-gate-job',
       expect: 'fail',

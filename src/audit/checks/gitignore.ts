@@ -3,15 +3,26 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { makeResult, type AuditCheck, type AuditContext, type AuditResult } from '../types.js';
 
-/** Where `ticket-workflow worktree` puts a session's isolated checkout. */
-const WORKTREE_DIR = '.claude/worktrees';
-const PROBE_NESTED = `${WORKTREE_DIR}/session/file.txt`;
+interface Target {
+  readonly path: string;
+  /** A file inside it, probed once the target is a real directory. */
+  readonly nested: string;
+}
+
+/**
+ * Each must be ignored as a directory AND as a symlink. A session's worktree may be a symlink, and a
+ * worktree's node_modules is a symlink to the primary's rather than a fresh install
+ * (tkt-6b1ad6b887fe) — a `dir/` rule misses either link and leaves it for `git add -A` to commit.
+ */
+const WORKTREES: Target = { path: '.claude/worktrees', nested: '.claude/worktrees/session/file.txt' };
+/** Required only beside a root package.json — the same signal config.ts infers the node tier from. */
+const NODE_MODULES: Target = { path: 'node_modules', nested: 'node_modules/pkg/index.js' };
 /** The guardrail files a conforming repo must be able to COMMIT — see the bare-`.claude/` warning. */
 const PROBE_SETTINGS = '.claude/settings.json';
 
 /**
  * Git consults one ignore file per PARENT directory of a path, so exactly these two can decide
- * `.claude/worktrees`. Copying them — and nothing else — into a scratch repository is what makes
+ * every target. Copying them — and nothing else — into a scratch repository is what makes
  * the verdict a property of the REPOSITORY rather than of the machine running the audit.
  */
 const RULE_FILES = ['.gitignore', '.claude/.gitignore'] as const;
@@ -121,10 +132,10 @@ function buildScratch(ctx: AuditContext): Scratch | { readonly failed: string } 
   return { dir, cleanup };
 }
 
-/** Materialises `.claude/worktrees` as a symlink, then as a real directory — a `dir/` pattern
- *  matches only the second, and git reads the shape off the filesystem rather than the path string. */
-function shapeWorktree(dir: string, as: 'symlink' | 'directory'): string | null {
-  const at = path.join(dir, WORKTREE_DIR);
+/** Materialises a target as a symlink, then as a real directory — a `dir/` pattern matches only
+ *  the second, and git reads the shape off the filesystem rather than the path string. */
+function shape(dir: string, target: Target, as: 'symlink' | 'directory'): string | null {
+  const at = path.join(dir, target.path);
   try {
     // The previous shape leaves a DANGLING symlink, which `rmSync(force)` stats through and treats
     // as already gone — so the swap silently kept the symlink and mkdir then failed with ENOENT.
@@ -136,15 +147,31 @@ function shapeWorktree(dir: string, as: 'symlink' | 'directory'): string | null 
     rmSync(at, { recursive: true, force: true });
     if (as === 'symlink') {
       // Deliberately dangling: git lstats it, so the target need not exist.
-      symlinkSync(path.join(dir, 'no-such-worktree-target'), at);
+      symlinkSync(path.join(dir, 'no-such-link-target'), at);
       return null;
     }
-    mkdirSync(path.join(at, 'session'), { recursive: true });
-    writeFileSync(path.join(dir, PROBE_NESTED), '');
+    const nested = path.join(dir, target.nested);
+    mkdirSync(path.dirname(nested), { recursive: true });
+    writeFileSync(nested, '');
     return null;
   } catch (err) {
-    return `the ${as} probe could not be materialised: ${message(err)}`;
+    return `the ${as} probe of ${target.path} could not be materialised: ${message(err)}`;
   }
+}
+
+/** Null when the target is ignored in both shapes; otherwise what is wrong and how to fix it. */
+function defect(target: Target, symlink: Verdict, directory: Verdict, nested: Verdict): string | null {
+  if (symlink.kind === 'ignored' && nested.kind === 'ignored') return null;
+  // The directory's own verdict only names a negation: a file under a re-included directory reports
+  // no rule at all, so `!dir/` would otherwise go unnamed.
+  const negated = [symlink, directory, nested].map((v) => (v.kind === 'not-ignored' ? v.negatedBy : null)).find((n) => n !== null) ?? null;
+  if (negated !== null) return `${target.path} is re-included by \`${negated}\`, so it is not ignored after all — drop that negation`;
+  if (nested.kind === 'ignored') {
+    // Also reached by `dir/*` and `dir/**`, which match only the contents — so the fix names the
+    // rule to write, not just the slash to drop.
+    return `the rule ignoring ${target.path} matches it only as a DIRECTORY (a trailing slash, or a /* or /** glob), so a SYMLINKED ${target.path} is left untracked-but-visible — write it bare: ${target.path}`;
+  }
+  return `.gitignore does not ignore ${target.path} — add \`${target.path}\` (no trailing slash, so it covers a symlink too)`;
 }
 
 export const gitignore: AuditCheck = {
@@ -156,46 +183,47 @@ export const gitignore: AuditCheck = {
     if (file.kind === 'error') return makeResult(this, 'blocked', `.gitignore could not be read: ${file.message}`);
     if (file.contents.trim() === '') return makeResult(this, 'fail', '.gitignore is empty');
 
+    const pkg = ctx.read('package.json');
+    if (pkg.kind === 'error') return makeResult(this, 'blocked', `package.json could not be read, so whether node_modules must be ignored is unknown: ${pkg.message}`);
+    const TARGETS = pkg.kind === 'ok' ? [WORKTREES, NODE_MODULES] : [WORKTREES];
+
     const scratch = buildScratch(ctx);
     if ('failed' in scratch) return makeResult(this, 'blocked', scratch.failed);
     try {
-      const asSymlink = shapeWorktree(scratch.dir, 'symlink');
-      if (asSymlink !== null) return makeResult(this, 'blocked', asSymlink);
-      const asLink = probe(ctx, scratch.dir, [WORKTREE_DIR]);
+      for (const t of TARGETS) {
+        const failed = shape(scratch.dir, t, 'symlink');
+        if (failed !== null) return makeResult(this, 'blocked', failed);
+      }
+      const asLink = probe(ctx, scratch.dir, TARGETS.map((t) => t.path));
       if ('undetermined' in asLink) return makeResult(this, 'blocked', asLink.undetermined);
 
       // A second shape, because a `dir/` pattern matches only this one — and git reads the shape off
       // the filesystem, never off the path string.
-      const asDirectory = shapeWorktree(scratch.dir, 'directory');
-      if (asDirectory !== null) return makeResult(this, 'blocked', asDirectory);
-      const asDir = probe(ctx, scratch.dir, [PROBE_NESTED, PROBE_SETTINGS]);
+      for (const t of TARGETS) {
+        const failed = shape(scratch.dir, t, 'directory');
+        if (failed !== null) return makeResult(this, 'blocked', failed);
+      }
+      const asDir = probe(ctx, scratch.dir, [...TARGETS.flatMap((t) => [t.path, t.nested]), PROBE_SETTINGS]);
       if ('undetermined' in asDir) return makeResult(this, 'blocked', asDir.undetermined);
 
-      const symlink = asLink.get(WORKTREE_DIR) ?? { kind: 'undetermined', why: `no verdict for ${WORKTREE_DIR}` };
-      const nested = asDir.get(PROBE_NESTED) ?? { kind: 'undetermined', why: `no verdict for ${PROBE_NESTED}` };
-      const settings = asDir.get(PROBE_SETTINGS) ?? { kind: 'undetermined', why: `no verdict for ${PROBE_SETTINGS}` };
-      for (const v of [symlink, nested, settings]) {
-        if (v.kind === 'undetermined') return makeResult(this, 'blocked', v.why);
-      }
-      // Concurrent sessions need one worktree each, and a worktree that is not ignored shows up as a
-      // mountain of untracked files in the main checkout — which is exactly when someone reaches for
-      // `git add -A` and commits another session's in-flight work.
-      if (symlink.kind !== 'ignored' || nested.kind !== 'ignored') {
-        const negated = (symlink.kind === 'not-ignored' ? symlink.negatedBy : null) ?? (nested.kind === 'not-ignored' ? nested.negatedBy : null);
-        if (negated !== null) {
-          return makeResult(this, 'fail', `${WORKTREE_DIR} is re-included by \`${negated}\`, so it is not ignored after all — drop that negation`);
+      const verdictOf = (m: Map<string, Verdict>, p: string): Verdict => m.get(p) ?? { kind: 'undetermined', why: `no verdict for ${p}` };
+      const settings = verdictOf(asDir, PROBE_SETTINGS);
+      const defects: string[] = [];
+      for (const t of TARGETS) {
+        const symlink = verdictOf(asLink, t.path);
+        const directory = verdictOf(asDir, t.path);
+        const nested = verdictOf(asDir, t.nested);
+        for (const v of [symlink, directory, nested]) {
+          if (v.kind === 'undetermined') return makeResult(this, 'blocked', v.why);
         }
-        if (nested.kind === 'ignored') {
-          return makeResult(
-            this,
-            'fail',
-            `the rule ignoring ${WORKTREE_DIR} matches DIRECTORIES only, so a SYMLINKED worktree is left untracked-but-visible — drop the trailing slash: ${WORKTREE_DIR}`,
-          );
-        }
-        return makeResult(this, 'fail', `.gitignore does not ignore ${WORKTREE_DIR} — add \`${WORKTREE_DIR}\` (no trailing slash, so it covers a symlinked worktree too)`);
+        const d = defect(t, symlink, directory, nested);
+        if (d !== null) defects.push(d);
       }
+      if (settings.kind === 'undetermined') return makeResult(this, 'blocked', settings.why);
+      // Every defect, not the first: reporting one at a time sends someone round the re-audit loop twice.
+      if (defects.length > 0) return makeResult(this, 'fail', defects.join('; '));
 
-      const conforms = `.gitignore present, non-empty, and ignores ${WORKTREE_DIR} as a directory AND as a symlink`;
+      const conforms = `.gitignore present, non-empty, and ignores ${TARGETS.map((t) => t.path).join(' and ')} as a directory AND as a symlink`;
       if (settings.kind === 'ignored') {
         // A blanket `.claude/` reaches the worktree effect by ignoring far more than was asked, and
         // the settings and hooks the standard requires can then never be committed. Reported rather
