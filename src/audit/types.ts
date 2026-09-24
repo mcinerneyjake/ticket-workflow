@@ -30,6 +30,9 @@ export interface AuditResult {
    * test-run-hold is advisory on its own argument: consumers cannot pass it until they bump to the
    * release shipping `holdTestRun` (tkt-103ad27180c3). Promotion is tkt-d345e96e6d5e.
    *
+   * pin-resolved IS a conformance fact, but the tag's commit is knowable only from the remote, so
+   * gating would fail a required check on an unreachable network (tkt-2db61a124801).
+   *
    * Everything else that cannot be determined still fails the gate — "can't check" is not
    * conformance.
    */
