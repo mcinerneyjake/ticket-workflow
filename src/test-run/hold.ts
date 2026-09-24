@@ -68,9 +68,17 @@ interface Held {
   readonly log: (line: string) => void;
   readonly setExitCode: (code: number) => void;
   readonly env: NodeJS.ProcessEnv;
-  readonly prevTmpDir: string | undefined;
+  readonly tmpStack: TmpDirStack;
   unregisterExit: (() => void) | undefined;
   released: boolean;
+}
+
+/** The live holds writing one env's TMPDIR, oldest first, and what that env had before any of them. */
+interface TmpDirStack {
+  readonly prevTmpDir: string | undefined;
+  /** os.tmpdir() before any live hold; only process.env's stack is ever read for it. */
+  readonly tmpRoot: string;
+  readonly live: Held[];
 }
 
 export interface RunState {
@@ -83,6 +91,7 @@ declare global {
   // shared between them (measured in copart-filter's testDbLock, the shape this mirrors).
   var __ticketWorkflowTestRun: Promise<RunState> | undefined;
   var __ticketWorkflowHeldTokens: Set<string> | undefined;
+  var __ticketWorkflowTmpDirStacks: WeakMap<NodeJS.ProcessEnv, TmpDirStack> | undefined;
 }
 
 export const globalRegistry: Registry = {
@@ -100,6 +109,44 @@ export const globalRegistry: Registry = {
 function heldTokens(): Set<string> {
   globalThis.__ticketWorkflowHeldTokens ??= new Set();
   return globalThis.__ticketWorkflowHeldTokens;
+}
+
+// A single saved TMPDIR per hold assumed LIFO release: out of order, the first release restored a
+// value the second was still using and deleted the second's dir nested inside its own (tkt-6d494a02f2f3).
+function tmpDirStacks(): WeakMap<NodeJS.ProcessEnv, TmpDirStack> {
+  globalThis.__ticketWorkflowTmpDirStacks ??= new WeakMap();
+  return globalThis.__ticketWorkflowTmpDirStacks;
+}
+
+/** os.tmpdir() as it read before any live hold rewrote TMPDIR; it re-reads process.env on every call. */
+function defaultTmpRoot(): string {
+  return tmpDirStacks().get(process.env)?.tmpRoot ?? tmpdir();
+}
+
+function liveTmpDirs(env: NodeJS.ProcessEnv): Set<string> {
+  const stacks = tmpDirStacks();
+  const live = [...(stacks.get(env)?.live ?? []), ...(stacks.get(process.env)?.live ?? [])];
+  return new Set(live.map((h) => h.tmpDir));
+}
+
+function pushTmpDir(held: Held): void {
+  held.tmpStack.live.push(held);
+  tmpDirStacks().set(held.env, held.tmpStack);
+  held.env.TMPDIR = held.tmpDir;
+}
+
+function popTmpDir(held: Held): void {
+  const { live, prevTmpDir } = held.tmpStack;
+  const at = live.indexOf(held);
+  if (at === -1) return;
+  live.splice(at, 1);
+  const top = live.at(-1);
+  if (top !== undefined) held.env.TMPDIR = top.tmpDir;
+  else {
+    tmpDirStacks().delete(held.env);
+    if (prevTmpDir === undefined) delete held.env.TMPDIR;
+    else held.env.TMPDIR = prevTmpDir;
+  }
 }
 
 export function defaultSetExitCode(code: number): void {
@@ -143,10 +190,8 @@ function releaseHeld(held: Held): void {
   held.released = true;
   clearInterval(held.timer);
   // FIRST, because `released` is already true: nothing above this line may throw, or the restore is
-  // lost for good. os.tmpdir() RE-READS TMPDIR on every call, so a value left pointing at this run's
-  // (now deleted) dir roots the next hold inside it (tkt-43881f6840ad; nesting = tkt-c0c46f02a1f9).
-  if (held.prevTmpDir === undefined) delete held.env.TMPDIR;
-  else held.env.TMPDIR = held.prevTmpDir;
+  // lost for good, leaving TMPDIR on this run's soon-deleted dir (tkt-43881f6840ad, tkt-6d494a02f2f3).
+  popTmpDir(held);
   // Also before anything that can throw: a slot file left behind by the release below must look like
   // an orphan to the next claim, or tkt-0ce4d4313ce7's self-reclaim never fires for it.
   heldTokens().delete(held.token);
@@ -195,6 +240,7 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
   const pid = process.pid;
   const token = randomUUID();
   let runDir: string | null = null;
+  let pushed: Held | null = null;
 
   try {
     const slots = opts.slots ?? envInt(env, 'TEST_SLOTS', 2, 1);
@@ -202,11 +248,10 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
     const ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
     const heartbeatMs = opts.heartbeatMs ?? 30_000;
     const tmpTtlMs = opts.tmpTtlMs ?? 6 * 60 * 60_000;
-    // Read BEFORE TMPDIR is rewritten below, or a second config load would nest a run dir in the first.
-    const tmpRoot = opts.tmpRoot ?? tmpdir();
+    const tmpRoot = opts.tmpRoot ?? defaultTmpRoot();
 
     // TMPDIR first: a run refused on tmpdir grounds must not be holding a slot.
-    const prepared = prepareRunTmpDir({ tmpRoot, repo, pid, probe, now: now(), tmpTtlMs, log });
+    const prepared = prepareRunTmpDir({ tmpRoot, repo, pid, probe, now: now(), tmpTtlMs, log, keep: liveTmpDirs(env) });
     runDir = prepared.runDir;
     const record: SlotRecord = { version: 1, pid, repo, cwd, startedAt: new Date(now()).toISOString(), tmpDir: runDir, token };
     const holders = (): string => listSlots(stateDir, { probe, now: now(), ttlMs }).map(formatSlot).join('\n  ');
@@ -235,8 +280,7 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
     // No `await` between claimSlot linking the slot and this line, so a concurrent acquire in this
     // process can never observe the slot before its token counts as live and reclaim it as an orphan.
     heldTokens().add(token);
-    const prevTmpDir = env.TMPDIR;
-    env.TMPDIR = runDir;
+    const tmpStack = tmpDirStacks().get(env) ?? { prevTmpDir: env.TMPDIR, tmpRoot: defaultTmpRoot(), live: [] };
     const timer = setInterval(() => {
       try {
         heartbeat(claim.file, now());
@@ -245,7 +289,9 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
       }
     }, heartbeatMs);
     timer.unref();
-    const held: Held = { slot: claim.slot, file: claim.file, pid, token, tmpDir: runDir, stateDir, timer, log, setExitCode, env, prevTmpDir, unregisterExit: undefined, released: false };
+    const held: Held = { slot: claim.slot, file: claim.file, pid, token, tmpDir: runDir, stateDir, timer, log, setExitCode, env, tmpStack, unregisterExit: undefined, released: false };
+    pushTmpDir(held);
+    pushed = held;
     const remove = registerExit(() => releaseHeld(held));
     // `registerExit` used to be declared `=> void`, so a consumer written against that may return
     // something else entirely (`process.on` returns `process`). Under a re-acquiring watcher that
@@ -261,6 +307,8 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
     // token goes with it, so a slot file linked before the throw is reclaimable rather than wedged
     // behind a token no Held will ever release.
     heldTokens().delete(token);
+    // A dead entry would never let its stack empty, so TMPDIR could never return to the original.
+    if (pushed !== null) popTmpDir(pushed);
     if (runDir !== null) removeRunTmpDir(runDir);
     if (err instanceof TestRunRefusal) setExitCode(err.code);
     throw err;
