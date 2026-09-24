@@ -4,6 +4,7 @@ import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defaultRepoName } from '../test-run/hold.js';
+import { envInt, TestRunRefusal } from '../test-run/slots.js';
 import { CONTENTION_EVIDENCE_ENV, type RunEvidence } from './contentionReporter.js';
 import { provisionFailed, provisionWorktree } from '../worktree/provision.js';
 
@@ -507,6 +508,17 @@ function provision(root: string, dir: string, modules: string): void {
 }
 
 export async function runContention(args: ContentionArgs, deps: ContentionDeps): Promise<number> {
+  // Queued runs wait up to ceil(N/K) suite durations, so a caller's TEST_SLOTS_WAIT_MS may lengthen that, never
+  // shorten it (tkt-cf5e371cb395). Refused up front with this build's envInt, rather than N times inside the runs.
+  let callerWaitMs: number;
+  try {
+    callerWaitMs = envInt(deps.env, 'TEST_SLOTS_WAIT_MS', 0, 0);
+  } catch (e) {
+    if (!(e instanceof TestRunRefusal)) throw e;
+    deps.err(`refused: ${e.message}`);
+    return CONTENTION_EXIT.NO_VERDICT;
+  }
+  const waitMs = Math.max(callerWaitMs, args.runs * 30 * 60_000);
   const top = deps.git(['rev-parse', '--show-toplevel'], deps.cwd);
   if (!top.ok) {
     deps.err(`refused: ${deps.cwd} is not inside a git work tree`);
@@ -576,8 +588,10 @@ export async function runContention(args: ContentionArgs, deps: ContentionDeps):
       trees.push(dir);
       provision(root, dir, modules);
     }
-    // Queued runs wait up to ceil(N/K) suite durations; the helper's 10-minute default would refuse them.
-    const env: NodeJS.ProcessEnv = { ...deps.env, TEST_SLOTS_WAIT_MS: deps.env.TEST_SLOTS_WAIT_MS ?? String(args.runs * 30 * 60_000) };
+    if (deps.env.TEST_SLOTS_WAIT_MS !== undefined && waitMs > callerWaitMs) {
+      deps.log(`note: TEST_SLOTS_WAIT_MS=${callerWaitMs} raised to ${waitMs} (runs × 30 min), so queued runs are not refused`);
+    }
+    const env: NodeJS.ProcessEnv = { ...deps.env, TEST_SLOTS_WAIT_MS: String(waitMs) };
     if (args.control) env.TEST_SLOTS = String(args.runs);
     deps.log(`${arm} arm: ${args.runs} concurrent npm test runs of ${head.slice(0, 7)} (logs: ${artifacts})`);
     const timer = setInterval(watch, deps.pollMs);

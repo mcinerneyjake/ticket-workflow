@@ -576,10 +576,16 @@ describe('runContention end to end (stub npm test)', () => {
     expect(parseHistory(readFileSync(path.join(stateDir, 'history.jsonl'), 'utf8')).map((h) => h.result)).toEqual(['undetermined']);
   });
 
+  const floor = (runs: number): number => runs * 30 * 60_000;
   it.each([
-    ['a caller-set value reaches every run unchanged', { TEST_SLOTS_WAIT_MS: '4321' }, '4321'],
-    ['an ambient shell value is scrubbed, so the wait is derived', {}, String(2 * 30 * 60_000)],
-  ])('TEST_SLOTS_WAIT_MS: %s', async (_label, stub, expected) => {
+    ['a caller value below the derived wait is floored to it', 2, false, { TEST_SLOTS_WAIT_MS: '4321' }, String(floor(2)), true],
+    ['a floor that scales with --runs', 3, false, { TEST_SLOTS_WAIT_MS: String(floor(2)) }, String(floor(3)), true],
+    ['a control-arm caller value below the derived wait is floored to it', 2, true, { TEST_SLOTS_WAIT_MS: '4321' }, String(floor(2)), true],
+    ['an empty caller value is floored like zero', 2, false, { TEST_SLOTS_WAIT_MS: '' }, String(floor(2)), true],
+    ['a caller value equal to the derived wait reaches every run', 2, false, { TEST_SLOTS_WAIT_MS: String(floor(2)) }, String(floor(2)), false],
+    ['a caller value above the derived wait is kept', 2, false, { TEST_SLOTS_WAIT_MS: String(floor(2) + 1) }, String(floor(2) + 1), false],
+    ['an ambient shell value is scrubbed, so the wait is derived', 2, false, {}, String(floor(2)), false],
+  ])('TEST_SLOTS_WAIT_MS: %s', async (_label, runs, control, stub, expected, noted) => {
     vi.stubEnv('TEST_SLOTS_WAIT_MS', '777');
     const repo = stubRepo();
     const stateDir = tempDir('tw-contention-state-');
@@ -588,8 +594,10 @@ describe('runContention end to end (stub npm test)', () => {
       envs.push(o.env);
       return 0;
     };
-    await runContention({ runs: 2, control: false }, deps(repo, stateDir, { stub, runTest }));
-    expect(envs.map((e) => e.TEST_SLOTS_WAIT_MS)).toEqual([expected, expected]);
+    const d = deps(repo, stateDir, { stub, runTest });
+    await runContention({ runs, control }, d);
+    expect(envs.map((e) => e.TEST_SLOTS_WAIT_MS)).toEqual(Array(runs).fill(expected));
+    expect(d.out.some((l) => l.includes(`raised to ${expected}`))).toBe(noted);
   });
 
   it('withholds the verdict when a run writes no report, and still removes every worktree', async () => {
@@ -611,6 +619,28 @@ describe('runContention end to end (stub npm test)', () => {
     const d = deps(repo, stateDir, { processList });
     expect(await runContention({ runs: 2, control: false }, d)).toBe(CONTENTION_EXIT.NO_VERDICT);
     expect(d.out.join('\n')).toContain('ERR refused');
+    expect(worktreeCount(repo)).toBe(1);
+    expect(existsSync(path.join(stateDir, 'history.jsonl'))).toBe(false);
+  });
+
+  it.each([
+    ['abc', false],
+    ['-1', false],
+    ['1.5', false],
+    ['Infinity', false],
+    ['abc', true],
+  ])('refuses TEST_SLOTS_WAIT_MS=%j (control: %s) before running anything', async (raw, control) => {
+    const repo = stubRepo();
+    const stateDir = tempDir('tw-contention-state-');
+    let started = 0;
+    const runTest = async () => {
+      started++;
+      return 0;
+    };
+    const d = deps(repo, stateDir, { stub: { TEST_SLOTS_WAIT_MS: raw }, runTest });
+    expect(await runContention({ runs: 2, control }, d)).toBe(CONTENTION_EXIT.NO_VERDICT);
+    expect(d.out.join('\n')).toContain(`ERR refused: TEST_SLOTS_WAIT_MS=${JSON.stringify(raw)}`);
+    expect(started).toBe(0);
     expect(worktreeCount(repo)).toBe(1);
     expect(existsSync(path.join(stateDir, 'history.jsonl'))).toBe(false);
   });
