@@ -344,3 +344,37 @@ describe('launcher and manifest regressions (tkt-c4a4a79bec8a review)', () => {
     }
   });
 });
+
+// tkt-9bfcf207a376: `node_modules/` matches directories only, so the symlink a worktree links in stays
+// untracked. Decided by git's own verdict on a materialized link, never by reading the rule's text.
+describe('shipped .gitignore files ignore node_modules as a symlink', () => {
+  function ignores(rules: string, shape: 'symlink' | 'directory', rel = 'node_modules'): boolean {
+    const repo = mkdtempSync(path.join(tmpdir(), 'tw-nm-ignore-'));
+    tempDirs.push(repo);
+    execFileSync('git', ['init', '-q', '--template='], { cwd: repo });
+    writeFileSync(path.join(repo, '.gitignore'), rules);
+    const target = path.join(repo, 'real-modules');
+    mkdirSync(target);
+    if (shape === 'symlink') symlinkSync(target, path.join(repo, 'node_modules'), 'dir');
+    else mkdirSync(path.join(repo, 'node_modules'));
+    // Empty excludesFile: a rule in the auditor's global ignore file must not rescue the repo's own.
+    const r = spawnSync('git', ['-c', 'core.excludesFile=', 'check-ignore', '-q', '--', rel], { cwd: repo, encoding: 'utf8' });
+    if (r.status !== 0 && r.status !== 1) throw new Error(`git check-ignore exited ${String(r.status)}: ${r.stderr}`);
+    return r.status === 0;
+  }
+
+  it.each([
+    ['this repo', path.join(PKG_ROOT, '.gitignore')],
+    ['the init template', path.join(REAL_TEMPLATES_DIR, 'core/gitignore')],
+  ])('%s ignores node_modules as a symlink AND as a directory', (_label, file) => {
+    const rules = readFileSync(file, 'utf8');
+    expect(ignores(rules, 'symlink'), 'a symlinked node_modules is left untracked').toBe(true);
+    expect(ignores(rules, 'directory')).toBe(true);
+  });
+
+  it('control: the trailing-slash form misses the symlink, and an unrelated path is not ignored', () => {
+    expect(ignores('node_modules/\n', 'symlink')).toBe(false);
+    expect(ignores('node_modules/\n', 'directory')).toBe(true);
+    expect(ignores('node_modules\n', 'symlink', 'README.md')).toBe(false);
+  });
+});
