@@ -169,6 +169,25 @@ describe('parseReport', () => {
     const text = report([{ name: '/wt/src/c.test.ts', fileMessage: 'The setup phase of "aroundAll" hook timed out after 10000ms.' }]);
     expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/c.test.ts', failed: 1, timeouts: 1, mixed: [] }] });
   });
+  // vitest's `message` is file.result.errors[0].message, set beside failing tests too (tkt-a9c71c324ac7).
+  it.each([
+    ['cleanup error', "Cannot read properties of undefined (reading 'close')"],
+    ['hook timeout, which may hide a later error,', 'Hook timed out in 10000ms.'],
+  ])('names a file-level %s beside a timed-out test as mixed, so the file is not contention-shaped', (_label, fileMessage) => {
+    const text = report([{ name: '/wt/src/a.test.ts', failed: [VITEST4_TIMEOUT], fileMessage }]);
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1, mixed: ['<file-level error>'] }] });
+    const runs = [summarizeRun({ index: 0, exitCode: 1, report: text, log: '', roots: ['/wt'] })];
+    expect(contentionShaped(runs)).toBe(false);
+    expect(mixedTests(runs)).toEqual(['src/a.test.ts › <file-level error>']);
+  });
+  it('does not name a file-level error beside only assertion failures as mixed', () => {
+    const text = report([{ name: '/wt/src/a.test.ts', failed: ['AssertionError: expected 1 to be 2'], fileMessage: 'boom' }]);
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0, mixed: [] }] });
+  });
+  it('does not read an empty file-level message beside a timed-out test as an error', () => {
+    const text = report([{ name: '/wt/src/a.test.ts', failed: [VITEST4_TIMEOUT], fileMessage: '' }]);
+    expect(parseReport(text, ['/wt'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 1, mixed: [] }] });
+  });
   it('does not count a vitest header behind a class vitest never uses for it', () => {
     const text = report([{ name: '/wt/run-1/src/a.test.ts', failed: ['AssertionError: Test timed out in 5ms.\n    at x'] }]);
     expect(parseReport(text, ['/wt/run-1'])).toEqual({ success: false, files: [{ file: 'src/a.test.ts', failed: 1, timeouts: 0, mixed: [] }] });
