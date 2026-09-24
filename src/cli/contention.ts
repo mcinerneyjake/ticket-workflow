@@ -167,25 +167,39 @@ export function parseEvidence(text: string | null): RunEvidence | null {
   }
   if (
     !isObject(raw) ||
-    !('version' in raw) || raw.version !== 1 ||
+    !('version' in raw) || raw.version !== 2 ||
     !('unhandledErrors' in raw) || typeof raw.unhandledErrors !== 'number' || !Number.isInteger(raw.unhandledErrors) || raw.unhandledErrors < 0 ||
-    !('coverageAfterFailure' in raw) || typeof raw.coverageAfterFailure !== 'boolean'
+    !('coverageAfterFailure' in raw) || typeof raw.coverageAfterFailure !== 'boolean' ||
+    !('foreignGlobalSetup' in raw) || !Array.isArray(raw.foreignGlobalSetup) ||
+    !('ownGlobalSetup' in raw) || typeof raw.ownGlobalSetup !== 'boolean'
   ) {
     return null;
   }
-  return { version: 1, unhandledErrors: raw.unhandledErrors, coverageAfterFailure: raw.coverageAfterFailure };
+  const foreign: unknown[] = raw.foreignGlobalSetup;
+  if (!foreign.every((f) => typeof f === 'string')) return null;
+  return {
+    version: 2,
+    unhandledErrors: raw.unhandledErrors,
+    coverageAfterFailure: raw.coverageAfterFailure,
+    foreignGlobalSetup: foreign.filter((f): f is string => typeof f === 'string'),
+    ownGlobalSetup: raw.ownGlobalSetup,
+  };
 }
+
+// vitest logs a globalSetup teardown rejection from close() and sets no exit code, so this line is all it leaves.
+// Unanchored: stdout and stderr share one fd, so a partial line can precede it, and a false match only withholds.
+const CLOSE_ERROR = /error during close\b/;
 
 export function summarizeRun(input: {
   readonly index: number;
   readonly exitCode: number | null;
   readonly report: string | null;
   readonly evidence: string | null;
-  readonly log: string;
+  readonly log: string | null;
   readonly roots: readonly string[];
 }): RunOutcome {
-  const { index, exitCode } = input;
-  const slots = slotBound(input.log);
+  const { index, exitCode, log } = input;
+  const slots = log === null ? null : slotBound(log);
   if (input.report === null) {
     return { kind: 'undetermined', index, exitCode, slots, reason: `no JSON report (exit ${exitCode ?? 'signal'})` };
   }
@@ -198,9 +212,16 @@ export function summarizeRun(input: {
     if (evidence === null) {
       return { kind: 'undetermined', index, exitCode, slots, reason: 'no readable run evidence from the contention reporter (it needs vitest >= 3 for onTestRunEnd)' };
     }
+    // The log is evidence of an absence here, so an unreadable one cannot vouch for it.
+    if (log === null) return { kind: 'undetermined', index, exitCode, slots, reason: 'no readable run log, so a close error cannot be ruled out' };
     const beside = [
       ...(evidence.unhandledErrors > 0 ? [`<unhandled errors in the run: ${evidence.unhandledErrors}>`] : []),
       ...(evidence.coverageAfterFailure ? ['<coverage thresholds checked after the failure>'] : []),
+      ...(CLOSE_ERROR.test(log) ? ['<error during vitest close>'] : []),
+      ...evidence.foreignGlobalSetup.map((f) => `<globalSetup with an unobservable exit code: ${relativeTo(f, input.roots)}>`),
+      ...(slots !== null && !evidence.ownGlobalSetup ? ['<slot released by an exit hook, whose failure is unobservable>'] : []),
+      // vitest sets exactly 1 before onTestRunEnd, so any other code was set by something else.
+      ...(exitCode !== 1 ? [`<run exited ${exitCode ?? 'by signal'}, not vitest's 1>`] : []),
     ];
     if (beside.length > 0) files = files.map((f) => (f.timeouts > 0 ? { ...f, mixed: [...f.mixed, ...beside] } : f));
   }
@@ -617,7 +638,7 @@ export async function runContention(args: ContentionArgs, deps: ContentionDeps):
         exitCode: exits[i] ?? null,
         report: read(path.join(artifacts, `run-${i + 1}.json`)),
         evidence: read(path.join(artifacts, `run-${i + 1}.evidence.json`)),
-        log: read(path.join(artifacts, `run-${i + 1}.log`)) ?? '',
+        log: read(path.join(artifacts, `run-${i + 1}.log`)),
         roots: [dir, real],
       });
     });

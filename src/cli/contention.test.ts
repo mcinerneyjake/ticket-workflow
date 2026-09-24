@@ -55,8 +55,8 @@ function report(files: { name: string; failed?: (string | string[])[]; fileMessa
   });
 }
 
-const evidence = (over: { unhandledErrors?: number; coverageAfterFailure?: boolean } = {}): string =>
-  JSON.stringify({ version: 1, unhandledErrors: 0, coverageAfterFailure: false, ...over });
+const evidence = (over: { unhandledErrors?: number; coverageAfterFailure?: boolean; foreignGlobalSetup?: string[]; ownGlobalSetup?: boolean } = {}): string =>
+  JSON.stringify({ version: 2, unhandledErrors: 0, coverageAfterFailure: false, foreignGlobalSetup: [], ownGlobalSetup: true, ...over });
 const CLEAN = evidence();
 
 const green = (index: number, slots: number | null = 2): RunOutcome => ({ kind: 'determined', index, exitCode: 0, green: true, files: [], slots });
@@ -271,8 +271,8 @@ describe('summarizeRun', () => {
 
   // The JSON report drops unhandled errors, and vitest exits 1 for them exactly as for a timeout (tkt-b1182a02fb14).
   const timedOut = report([{ name: '/wt/src/a.test.ts', failed: ['Error: STACK_TRACE_ERROR'] }, { name: '/wt/src/b.test.ts' }]);
-  const run = (ev: string | null, text = timedOut, exitCode: number | null = 1): RunOutcome =>
-    summarizeRun({ evidence: ev, index: 0, exitCode, report: text, log: '', roots: ['/wt'] });
+  const run = (ev: string | null, text = timedOut, exitCode: number | null = 1, log: string | null = ''): RunOutcome =>
+    summarizeRun({ evidence: ev, index: 0, exitCode, report: text, log, roots: ['/wt'] });
   it('names an unhandled error beside a timed-out test as mixed, so the run is not contention-shaped', () => {
     const runs = [run(evidence({ unhandledErrors: 2 }))];
     expect(contentionShaped(runs)).toBe(false);
@@ -286,13 +286,51 @@ describe('summarizeRun', () => {
   it('keeps a timed-out run contention-shaped when the evidence is clean', () => {
     expect(contentionShaped([run(CLEAN)])).toBe(true);
   });
+  // A globalSetup teardown runs after the evidence is written (tkt-e51870afd0da).
+  it("names vitest's close error beside a timed-out test as mixed: a failed teardown may have set the exit code", () => {
+    const runs = [run(CLEAN, timedOut, 1, '[test-run] slot 1/2\nerror during close Error: late release\n    at teardown (/wt/gs.mjs:1:1)\n')];
+    expect(contentionShaped(runs)).toBe(false);
+    expect(mixedTests(runs)).toEqual(['src/a.test.ts › <error during vitest close>']);
+  });
+  it('matches the close error after a partial line too: stdout and stderr share one fd, and a false match only withholds', () => {
+    expect(mixedTests([run(CLEAN, timedOut, 1, 'partial stdout...error during close Error: late\n')])).toEqual(['src/a.test.ts › <error during vitest close>']);
+  });
+  it('is undetermined when a timed-out run left no readable log, which alone can show a close error', () => {
+    expect(run(CLEAN, timedOut, 1, null)).toMatchObject({ kind: 'undetermined', reason: expect.stringContaining('log') });
+    expect(run(null, report([{ name: '/wt/src/a.test.ts' }]), 0, null).kind).toBe('determined');
+  });
+  it("names a held slot with no ticket-workflow globalSetup to release it: the exit hook's failure is unobservable", () => {
+    const held = '[test-run] slot 1/2 · TMPDIR=/t\n';
+    expect(mixedTests([run(evidence({ ownGlobalSetup: false }), timedOut, 1, held)])).toEqual(['src/a.test.ts › <slot released by an exit hook, whose failure is unobservable>']);
+    expect(contentionShaped([run(CLEAN, timedOut, 1, held)])).toBe(true);
+    expect(contentionShaped([run(evidence({ ownGlobalSetup: false }), timedOut, 1, '')])).toBe(true);
+  });
+  it.each([
+    [75, "<run exited 75, not vitest's 1>"],
+    [0, "<run exited 0, not vitest's 1>"],
+    [null, "<run exited by signal, not vitest's 1>"],
+  ])('names a timed-out run exiting %s as mixed: vitest itself only ever sets 1', (exitCode, marker) => {
+    expect(mixedTests([run(CLEAN, timedOut, exitCode)])).toEqual([`src/a.test.ts › ${marker}`]);
+  });
+  it('names each foreign globalSetup beside a timed-out test as mixed, even with a clean log', () => {
+    const runs = [run(evidence({ foreignGlobalSetup: ['/wt/vitest.globalSetup.ts', '/elsewhere/gs.mjs'] }))];
+    expect(contentionShaped(runs)).toBe(false);
+    expect(mixedTests(runs)).toEqual([
+      'src/a.test.ts › <globalSetup with an unobservable exit code: vitest.globalSetup.ts>',
+      'src/a.test.ts › <globalSetup with an unobservable exit code: /elsewhere/gs.mjs>',
+    ]);
+  });
   it.each([
     ['no evidence', null],
     ['evidence that is not JSON', '{'],
-    ['evidence of another version', JSON.stringify({ version: 2, unhandledErrors: 0, coverageAfterFailure: false })],
+    ['evidence of the previous version, which never saw globalSetup', JSON.stringify({ version: 1, unhandledErrors: 0, coverageAfterFailure: false })],
     ['a negative count', evidence({ unhandledErrors: -1 })],
     ['a fractional count', evidence({ unhandledErrors: 0.5 })],
-    ['a missing coverage flag', JSON.stringify({ version: 1, unhandledErrors: 0 })],
+    ['a missing coverage flag', JSON.stringify({ version: 2, unhandledErrors: 0, foreignGlobalSetup: [] })],
+    ['a missing globalSetup list', JSON.stringify({ version: 2, unhandledErrors: 0, coverageAfterFailure: false })],
+    ['a globalSetup list that is not an array', JSON.stringify({ version: 2, unhandledErrors: 0, coverageAfterFailure: false, foreignGlobalSetup: '/wt/gs.mjs' })],
+    ['a globalSetup entry that is not a string', JSON.stringify({ version: 2, unhandledErrors: 0, coverageAfterFailure: false, foreignGlobalSetup: [7], ownGlobalSetup: true })],
+    ['a missing own-globalSetup flag', JSON.stringify({ version: 2, unhandledErrors: 0, coverageAfterFailure: false, foreignGlobalSetup: [] })],
   ])('is undetermined on a non-zero run with a timeout and %s', (_label, ev) => {
     expect(run(ev)).toMatchObject({ kind: 'undetermined', reason: expect.stringContaining('evidence') });
     expect(run(ev, timedOut, null).kind).toBe('undetermined');
@@ -464,7 +502,7 @@ const file = (n, failed) => ({ name: path.join(process.cwd(), n), status: failed
   assertionResults: [{ status: failed ? 'failed' : 'passed', failureMessages: failed ? ['Error: Test timed out in 20000ms.'] : [] }] });
 writeFileSync(out, JSON.stringify({ success: !bad, testResults: [file('src/a.test.ts', bad), file('src/b.test.ts', false)] }));
 const evidence = process.env.TEST_CONTENTION_EVIDENCE;
-if (evidence) writeFileSync(evidence, JSON.stringify({ version: 1, unhandledErrors: mode === 'unhandled' ? 1 : 0, coverageAfterFailure: false }));
+if (evidence) writeFileSync(evidence, JSON.stringify({ version: 2, unhandledErrors: mode === 'unhandled' ? 1 : 0, coverageAfterFailure: false, foreignGlobalSetup: [], ownGlobalSetup: true }));
 process.exit(bad ? 1 : 0);
 `;
 
@@ -699,16 +737,17 @@ describe('defaultRunTest over a real vitest run', () => {
   ].join('\n');
   const TIMEOUT_ONLY = ["import { it } from 'vitest';", "it('times out', async () => { await new Promise(() => {}); }, 100);"].join('\n');
 
-  async function realRun(test: string, config: object = {}): Promise<RunOutcome> {
+  async function realRun(test: string, config: object = {}, extra: Record<string, string> = {}): Promise<RunOutcome> {
     const repo = tempDir('tw-contention-vitest-');
     writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ name: 'v', private: true, type: 'module', scripts: { test: 'vitest run' } }));
     writeFileSync(path.join(repo, 'vitest.config.mjs'), `export default ${JSON.stringify({ test: { include: ['a.t.mjs'], ...config } })};`);
     writeFileSync(path.join(repo, 'a.t.mjs'), test);
+    for (const [name, text] of Object.entries(extra)) writeFileSync(path.join(repo, name), text);
     symlinkSync(fileURLToPath(new URL('../../node_modules', import.meta.url)), path.join(repo, 'node_modules'));
     const files = { reportFile: path.join(repo, 'r.json'), logFile: path.join(repo, 'r.log'), evidenceFile: path.join(repo, 'e.json') };
     const exitCode = await defaultRunTest({ cwd: repo, env: scrubbedEnv(), ...files });
     const read = (f: string): string | null => (existsSync(f) ? readFileSync(f, 'utf8') : null);
-    return summarizeRun({ index: 0, exitCode, report: read(files.reportFile), evidence: read(files.evidenceFile), log: read(files.logFile) ?? '', roots: [repo, realpathSync(repo)] });
+    return summarizeRun({ index: 0, exitCode, report: read(files.reportFile), evidence: read(files.evidenceFile), log: read(files.logFile), roots: [repo, realpathSync(repo)] });
   }
 
   const REAL_RUN_MS = 60_000;
@@ -724,6 +763,24 @@ describe('defaultRunTest over a real vitest run', () => {
   });
   it('still reads a lone timeout as contention (control)', { timeout: REAL_RUN_MS }, async () => {
     const r = await realRun(TIMEOUT_ONLY);
+    expect(r).toMatchObject({ kind: 'determined', exitCode: 1 });
+    expect(contentionShaped([r])).toBe(true);
+  });
+  // Teardown runs in close(), after onTestRunEnd wrote the evidence: hold.ts's own failed release is this shape (tkt-e51870afd0da).
+  it('sees a globalSetup teardown that sets the exit code after the evidence was written', { timeout: REAL_RUN_MS }, async () => {
+    const r = await realRun(TIMEOUT_ONLY, { globalSetup: ['./gs.mjs'] }, { 'gs.mjs': "export default () => () => { process.exitCode = 1; throw new Error('late release'); };" });
+    expect(r).toMatchObject({ kind: 'determined', exitCode: 1 });
+    expect(contentionShaped([r])).toBe(false);
+    expect(mixedTests([r])).toEqual(['a.t.mjs › <error during vitest close>', 'a.t.mjs › <globalSetup with an unobservable exit code: gs.mjs>']);
+  });
+  it('sees a globalSetup that only a project under a projects split declares', { timeout: REAL_RUN_MS }, async () => {
+    const r = await realRun(TIMEOUT_ONLY, { projects: [{ test: { name: 'p', include: ['a.t.mjs'], globalSetup: ['./gs.mjs'] } }] }, { 'gs.mjs': 'export default () => () => {};' });
+    expect(r).toMatchObject({ kind: 'determined', exitCode: 1 });
+    expect(mixedTests([r])).toEqual(['a.t.mjs › <globalSetup with an unobservable exit code: gs.mjs>']);
+  });
+  it("still reads a lone timeout as contention when the only globalSetup is ticket-workflow's own (control)", { timeout: REAL_RUN_MS }, async () => {
+    const own = fileURLToPath(new URL('../test-run/globalSetup.ts', import.meta.url));
+    const r = await realRun(TIMEOUT_ONLY, { globalSetup: [own] });
     expect(r).toMatchObject({ kind: 'determined', exitCode: 1 });
     expect(contentionShaped([r])).toBe(true);
   });

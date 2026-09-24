@@ -706,6 +706,15 @@ entry that cannot be read): the report cannot tell a timeout's side effect from 
 verdict is withheld and each such test is named, `(×k)` when k tests in one run share a name. The
 `timeouts` column still counts it.
 
+Some exit causes land after the report is written, so a run with a timeout is withheld the same way
+when vitest logged `error during close` (a globalSetup teardown failed), when the run exited with any
+code but vitest's own 1, when its log cannot be read, when its config (root or any project) declares a
+globalSetup other than ticket-workflow's own, or when it held a slot without declaring
+`TEST_RUN_GLOBAL_SETUP` (the release then runs from an exit hook). A teardown can set the exit code
+silently, and nothing in the run can see that, so a repo with its own globalSetup gets no verdict on
+a run with a timeout. Not covered: other code that runs after the report and silently sets exit code
+1, such as a `vitest.onClose` callback or an exit listener the config registers.
+
 The verdict is also withheld when any run wrote no readable report, or when a run held no slot or
 K ≥ N. A repo whose vitest config does not await `holdTestRun` is unbounded. It is withheld as well
 when a vitest process outside this command's own process tree appeared during the runs. The process
