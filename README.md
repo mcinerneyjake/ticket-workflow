@@ -712,6 +712,11 @@ entry that cannot be read): the report cannot tell a timeout's side effect from 
 verdict is withheld and each such test is named, `(×k)` when k tests in one run share a name. The
 `timeouts` column still counts it.
 
+The bounded arm applies the same rule to its own runs. It prints FAIL when at least one file failed
+only on timeouts, since one clean timeout under the bound shows the bound did not hold. A red arm
+whose failures are all mixed tests has shown nothing, so it gets no verdict (exit 2) and is not
+recorded as red. Any assertion failure beside those tests is reported too.
+
 Some exit causes land after the report is written, so a run with a timeout is withheld the same way
 when vitest logged `error during close` (a globalSetup teardown failed), when the run exited with any
 code but vitest's own 1, when its log cannot be read, when its config (root or any project) declares a

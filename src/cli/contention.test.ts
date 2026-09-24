@@ -365,7 +365,49 @@ describe('decide — bounded arm', () => {
     expect(d.lines.join('\n')).toContain('PASS');
   });
   it('fails red runs against a same-day red control', () => {
-    expect(decide({ ...base, runs: oneRed, history: [control()] }).exit).toBe(CONTENTION_EXIT.FAIL);
+    expect(decide({ ...base, runs: oneRed, history: [control()] })).toMatchObject({ exit: CONTENTION_EXIT.FAIL, recorded: 'red' });
+  });
+  const bounded = (index: number, text: string, ev = CLEAN): RunOutcome =>
+    summarizeRun({ evidence: ev, index, exitCode: 1, report: text, log: '[test-run] slot 1/2', roots: ['/wt'] });
+  it.each([
+    ['a file-level error', report([{ name: '/wt/src/a.test.ts', failed: ['Error: Test timed out in 20000ms.'], fileMessage: 'TypeError: x' }]), CLEAN, '<file-level error>'],
+    ['another message on the test', report([{ name: '/wt/src/a.test.ts', failed: [['Error: Test timed out in 20000ms.', 'TypeError: x']] }]), CLEAN, 't0'],
+    ['an unhandled error', report([{ name: '/wt/src/a.test.ts', failed: ['Error: Test timed out in 20000ms.'] }]), evidence({ unhandledErrors: 1 }), '<unhandled errors in the run: 1>'],
+  ])('withholds the verdict, never recording red, when a bounded timeout sat beside %s', (_label, text, ev, marker) => {
+    const runs = [green(0), green(1), bounded(2, text, ev), bounded(3, text, ev)];
+    const d = decide({ ...base, runs, history: [control()] });
+    expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+    const out = d.lines.join('\n');
+    expect(out).toContain('timed out beside another error');
+    expect(out.split(`src/a.test.ts › ${marker}`)).toHaveLength(2);
+  });
+  const mixedText = report([{ name: '/wt/src/a.test.ts', failed: [['Error: Test timed out in 20000ms.', 'TypeError: x']] }]);
+  it('asks for a control first when a mixed bounded arm has none, naming the mixed test and never recording red', () => {
+    const d = decide({ ...base, runs: [green(0), green(1), green(2), bounded(3, mixedText)], history: [] });
+    expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+    expect(d.lines[0]).toContain('Run test-contention --runs 4 --control first');
+    expect(d.lines.join('\n')).toContain('src/a.test.ts › t0');
+  });
+  it('still records a plain red bounded arm with no control as red', () => {
+    expect(decide({ ...base, runs: oneRed, history: [] })).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'red' });
+  });
+  it('fails when a clean timeout in another run shows the bound failed, whatever a mixed run says', () => {
+    const d = decide({ ...base, runs: [green(0), green(1), red(2), bounded(3, mixedText)], history: [control()] });
+    expect(d).toMatchObject({ exit: CONTENTION_EXIT.FAIL, recorded: 'red' });
+  });
+  it('names a plain assertion failure beside a mixed test instead of hiding it', () => {
+    const text = report([
+      { name: '/wt/src/a.test.ts', failed: [['Error: Test timed out in 20000ms.', 'TypeError: x']] },
+      { name: '/wt/src/b.test.ts', failed: ['AssertionError: expected 1 to be 2'] },
+    ]);
+    const d = decide({ ...base, runs: [green(0), green(1), green(2), bounded(3, text)], history: [control()] });
+    expect(d).toMatchObject({ exit: CONTENTION_EXIT.NO_VERDICT, recorded: 'undetermined' });
+    expect(d.lines[0]).toContain('the bounded arm failed on something other than timeouts');
+    expect(d.lines[1]).toContain('src/a.test.ts › t0');
+  });
+  it('still fails a bounded arm red only on an assertion, with no mixed test', () => {
+    const broken: RunOutcome = { kind: 'determined', index: 3, exitCode: 1, green: false, files: [{ file: 'src/b.test.ts', failed: 1, timeouts: 0, mixed: [] }], slots: 2 };
+    expect(decide({ ...base, runs: [green(0), green(1), green(2), broken], history: [control()] })).toMatchObject({ exit: CONTENTION_EXIT.FAIL, recorded: 'red' });
   });
   it.each([
     ['no control at all', []],
