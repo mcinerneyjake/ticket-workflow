@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { listTickets, listBoard, listProjects, getTicket, createTicket, updateTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, lastCheckpoint, HttpError } from './tickets.js';
+import { listTickets, listBoard, listProjects, getTicket, createTicket, updateTicket, startTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, lastCheckpoint, HttpError } from './tickets.js';
 import { readEvents } from './events.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 import { setLogger } from '../logger.js';
@@ -553,17 +553,139 @@ describe('normalize raw-file coercion (invalid enums + blockers)', () => {
     expect((await getTicket('tkt-badprio')).priority).toBe('medium');
   });
 
-  it('falls back to "backlog" for an invalid status in a raw file', async () => {
-    await writeRaw('tkt-badstat', makeRaw('Bad status', 1, { status: 'limbo' }));
-    expect((await getTicket('tkt-badstat')).status).toBe('backlog');
-  });
-
   it('filters out non-string entries from a blockers array', async () => {
     // YAML array with mixed types; normalize keeps only the string members.
     await writeRaw('tkt-blockers', makeRaw('Mixed blockers', 1, {
       blockers: '["tkt-aaa", 42, true, "tkt-bbb"]',
     }));
     expect((await getTicket('tkt-blockers')).blockers).toEqual(['tkt-aaa', 'tkt-bbb']);
+  });
+});
+
+// tkt-ee3f3315cdd8 — a non-member status used to read as `backlog`. The service never writes one, so
+// there is no intended column to recover: every case is unreadable, none repaired-with-warning.
+const INVALID_STATUSES: [string, string | null][] = [
+  ['absent', null],
+  ['the reported typo', 'in progres'],
+  ['empty string', "''"],
+  ['empty value (YAML null)', ''],
+  ['valid word, wrong case', 'In-Progress'],
+  ['valid word, quoted trailing space', "'todo '"],
+  ['a type value', 'task'],
+  ['a priority value', 'high'],
+  ['a number', '42'],
+  ['a boolean', 'true'],
+  ['null', 'null'],
+  ['a list', '[todo]'],
+  ['a map', '{ id: todo }'],
+];
+
+function rawWithStatus(title: string, status: string | null): string {
+  const raw = makeRaw(title, 1, status === null ? {} : { status });
+  return status === null ? raw.replace(/^status: .*\n/m, '') : raw;
+}
+
+describe('invalid status in a raw file is unreadable, never coerced', () => {
+  it('rawWithStatus drops the status line for the absent case (fixture control)', () => {
+    expect(rawWithStatus('A', null)).not.toMatch(/^status:/m);
+    expect(rawWithStatus('A', 'todo')).toMatch(/^status: todo$/m);
+  });
+
+  it.each(INVALID_STATUSES)('unreadable: %s', async (_label, status) => {
+    const good = await createTicket({ title: 'Good one' });
+    await writeRaw('tkt-badstat', rawWithStatus('Bad status', status));
+
+    const board = await listBoard();
+
+    expect(board.tickets.map((t) => t.id)).toEqual([good.id]);
+    expect(board.unreadable).toEqual([{ file: 'tkt-badstat.md', reason: 'invalid status' }]);
+  });
+
+  it.each(INVALID_STATUSES)('getTicket refuses: %s', async (_label, status) => {
+    await writeRaw('tkt-badstat', rawWithStatus('Bad status', status));
+    const err = await httpError(getTicket('tkt-badstat'));
+    expect(err.status).toBe(500);
+    expect(err.message).toContain('invalid status');
+  });
+
+  it('valid: unquoted trailing whitespace, which YAML strips before the enum check', async () => {
+    await writeRaw('tkt-trailing', makeRaw('Trailing', 1, { status: 'todo   ' }));
+    expect((await getTicket('tkt-trailing')).status).toBe('todo');
+    expect((await listBoard()).unreadable).toEqual([]);
+  });
+
+  it('valid statuses stay on the board (positive control)', async () => {
+    await writeRaw('tkt-goodstat', makeRaw('Good status', 1, { status: 'qa' }));
+    const board = await listBoard();
+    expect(board.tickets.map((t) => [t.id, t.status])).toEqual([['tkt-goodstat', 'qa']]);
+    expect(board.unreadable).toEqual([]);
+  });
+
+  it('does not echo the file value to the caller, but logs it server-side', async () => {
+    const captured = captureLog();
+    await writeRaw('tkt-badstat', rawWithStatus('Bad status', 'secret-ish value'));
+
+    const board = await listBoard();
+    const err = await httpError(getTicket('tkt-badstat'));
+
+    expect(board.unreadable[0]?.reason).not.toContain('secret-ish');
+    expect(err.message).not.toContain('secret-ish');
+    expect(captured.warn.join(' ')).toContain('tkt-badstat.md');
+  });
+
+  it('updateTicket with a valid status repairs the file', async () => {
+    await writeRaw('tkt-badstat', rawWithStatus('Bad status', 'in progres'));
+
+    const fixed = await updateTicket('tkt-badstat', { status: 'in-progress' });
+
+    expect(fixed.status).toBe('in-progress');
+    expect(fixed.title).toBe('Bad status');
+    expect((await getTicket('tkt-badstat')).status).toBe('in-progress');
+    expect((await listBoard()).unreadable).toEqual([]);
+    // The file's prior column is unknown, so a repair claims no transition.
+    expect((await readEvents('tkt-badstat')).events).toEqual([]);
+  });
+
+  it('updateTicket without a status still refuses, and leaves the file untouched', async () => {
+    const raw = rawWithStatus('Bad status', 'in progres');
+    await writeRaw('tkt-badstat', raw);
+
+    const err = await httpError(updateTicket('tkt-badstat', { title: 'Renamed' }));
+
+    expect(err.status).toBe(500);
+    expect(await fs.readFile(path.join(dirs.tickets, 'tkt-badstat.md'), 'utf8')).toBe(raw);
+  });
+
+  // The corrupt value may be a mangled `in-progress`, so start_ticket cannot tell whether it is held.
+  it('startTicket refuses, even with force, and the message sends a human to check for a holder', async () => {
+    await writeRaw('tkt-badstat', rawWithStatus('Bad status', 'in progres'));
+    const err = await httpError(startTicket('tkt-badstat'));
+    expect(err.status).toBe(500);
+    expect(err.message).toContain('no session is working it');
+    expect((await httpError(startTicket('tkt-badstat', { force: true }))).status).toBe(500);
+  });
+
+  it('a repair snapshots the original file byte for byte, invalid value and invalid UTF-8 included', async () => {
+    const original = Buffer.concat([Buffer.from(rawWithStatus('Bad status', 'in progres')), Buffer.from('\nBEFORE'), Buffer.from([0xff]), Buffer.from('AFTER\n')]);
+    await fs.writeFile(path.join(dirs.tickets, 'tkt-badstat.md'), original);
+    await updateTicket('tkt-badstat', { status: 'todo' });
+    const dir = path.join(dirs.tickets, '.history', 'tkt-badstat');
+    const snaps = await Promise.all((await fs.readdir(dir)).map((f) => fs.readFile(path.join(dir, f))));
+    expect(snaps).toEqual([original]);
+  });
+
+  // Integrity checks read links, not columns, so an unreadable-status ticket must stay visible to them.
+  it('the parent-cycle guard still sees a descendant whose status is invalid', async () => {
+    const a = await createTicket({ title: 'A' });
+    await writeRaw('tkt-badchild', makeRaw('Child', 1, { status: 'In-Progress', parent: a.id }));
+    const err = await httpError(updateTicket(a.id, { parent: 'tkt-badchild' }));
+    expect(err.status).toBe(400);
+    expect(err.message).toContain('cycle');
+  });
+
+  it('createTicket orders after a ticket whose status is invalid', async () => {
+    await writeRaw('tkt-badstat', makeRaw('Bad status', 50, { status: 'limbo' }));
+    expect((await createTicket({ title: 'New' })).order).toBe(51);
   });
 });
 

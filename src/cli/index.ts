@@ -139,7 +139,9 @@ export async function cmdRestore(args: string[]): Promise<void> {
   if (undelete) {
     const result = await undeleteFromHistory(id);
     console.log(`Recreated ${id} from ${result.from}`);
-    console.log(`  ${result.ticket.status}  ${result.ticket.title}`);
+    console.log(`  ${result.ticket.status ?? 'INVALID STATUS'}  ${result.ticket.title}`);
+    if (result.ticket.status === null)
+      console.log('  its status is invalid, so it is listed as unreadable — repair it with an update that sets status');
     if (result.edges.length > 0) {
       // Printed, never re-linked: those tickets may have been edited or deleted since.
       console.log(`  re-link by hand if still wanted: ${result.edges.map(edgeLabel).join(', ')}`);

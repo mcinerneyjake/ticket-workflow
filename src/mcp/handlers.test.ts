@@ -292,6 +292,27 @@ describe('list_tickets', () => {
       expect(String(env.note)).toContain('tkt-colon.md');
     });
 
+    // tkt-ee3f3315cdd8 — the repair differs by reason, so the note must not send this one hunting for a colon.
+    it('names the update_ticket repair for an invalid-status file, and only for that reason', async () => {
+      await seed({ title: 'Good', project: 'kanban' });
+      await fs.writeFile(path.join(dirs.tickets, 'tkt-badstat.md'), '---\ntitle: Bad\nstatus: in progres\n---\n', 'utf8');
+
+      const env = asEnvelope(await handleToolCall('list_tickets', undefined));
+
+      expect(env.unreadable).toEqual([{ file: 'tkt-badstat.md', reason: 'invalid status' }]);
+      expect(String(env.note)).toContain('tkt-badstat.md');
+      expect(String(env.note)).toContain('update_ticket');
+      expect(String(env.note)).not.toContain('colon');
+      expect(JSON.stringify(env)).not.toContain('in progres');
+    });
+
+    it('keeps the colon hint for an unparseable file and omits the status repair', async () => {
+      await writeCorrupt();
+      const env = asEnvelope(await handleToolCall('list_tickets', undefined));
+      expect(String(env.note)).toContain('colon');
+      expect(String(env.note)).not.toContain('update_ticket');
+    });
+
     it('reports unreadable files even when a filter excludes every readable ticket', async () => {
       // A file that won't parse has no status to filter on — a filter must not hide it.
       await seed({ title: 'Good', status: 'todo' });
