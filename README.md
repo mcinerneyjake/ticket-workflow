@@ -779,16 +779,31 @@ only on timeouts, since one clean timeout under the bound shows the bound did no
 whose failures are all mixed tests has shown nothing, so it gets no verdict (exit 2) and is not
 recorded as red. Any assertion failure beside those tests is reported too.
 
-Some exit causes land after the report is written, so a run with a timeout is withheld the same way
-when vitest logged `error during close` (a globalSetup teardown failed), when the run exited with any
-code but vitest's own 1, when its log cannot be read, when its config (root or any project) declares a
+Unless `dangerouslyIgnoreUnhandledErrors` is set, vitest exits 1 for an unhandled error just as for a
+timeout, and its JSON report drops the error. So a run with both a timeout and an unhandled error
+reads as contention from the report alone (`tkt-b1182a02fb14`). Each run therefore also loads a
+second reporter, `contentionReporter`, whose `onTestRunEnd` hook writes an evidence file beside the
+report. That hook needs vitest 3 or later. Any run with a timed-out test needs readable evidence,
+whatever its exit code. Without it the run is undetermined and the verdict is withheld. On vitest 2
+or earlier that is every run with a timeout, so the control can never be recorded red and the command
+never reaches a verdict. Nothing checks the version first. On newer vitest there is no evidence either
+when a globalSetup entry is not a string path, or when the `test` script does not end in the vitest
+command, so the appended `--reporter` flags never reach it. With evidence, a run with a timeout is
+withheld as above when it records any unhandled error, ignored ones included, or when coverage is
+`enabled` with `reportOnFailure` and a non-empty `thresholds` object, since a threshold checked after
+the failure also exits 1. Any key makes it non-empty, `perFile` or `autoUpdate` alone included.
+
+Other exit causes land after that evidence is written, so a run with a timeout is withheld the same
+way when vitest logged `error during close` (a globalSetup teardown failed), when the run exited with
+any code but vitest's own 1, when its config (root or any project) declares a
 globalSetup other than ticket-workflow's own, or when it held a slot without declaring
 `TEST_RUN_GLOBAL_SETUP` (the release then runs from an exit hook). A teardown can set the exit code
 silently, and nothing in the run can see that, so a repo with its own globalSetup gets no verdict on
 a run with a timeout. Not covered: other code that runs after the report and silently sets exit code
 1, such as a `vitest.onClose` callback or an exit listener the config registers.
 
-The verdict is also withheld when any run wrote no readable report, or when a run held no slot or
+The verdict is also withheld when any run wrote no readable report, when a run with a timeout left no
+readable log (a close error cannot then be ruled out), or when a run held no slot or
 K ≥ N. A repo whose vitest config does not await `holdTestRun` is unbounded. It is withheld as well
 when a vitest process outside this command's own process tree appeared during the runs. The process
 list is polled every 5 s.
