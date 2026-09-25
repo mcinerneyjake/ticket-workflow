@@ -30,11 +30,17 @@
 // fails closed on.
 //
 // RESIDUALS — stated, never called containment:
-//   - Non-git Bash writes. `sed -i`, `>`, heredocs and `npm install` are never judged, and a `cd`
-//     into a primary checkout is itself not a verdict — so a RELATIVE write after one lands in the
-//     primary too. (An earlier version of this header claimed the residual was limited to absolute
-//     paths, on the grounds that a session in a worktree writes relatively. That is wrong whenever
-//     the command cd's out first, and it under-reported the gap.)
+//   - Non-git writers off the denylist: `npm run`/`exec`, `node -e`, `dd of=`, `find -delete`,
+//     `curl -o`, `rsync`, an interpreter's own I/O. Listed writers are judged where they land.
+//   - Shapes the write rules misread: `>(…)` process substitution, brace expansion, `for ((…))`
+//     and `[[ … && a > b ]]`, and relative or `$VAR` words feeding xargs (tkt-019899cb717a).
+//   - Anything under a primary's `.git/`, which worktreeKind reads as 'none' (tkt-b181fcaed28a).
+//   - A bare `&` leaves the next command inside the previous piece, unjudged (tkt-1949a886e811).
+//   - Backslash-escaped quotes, which quotedTokens reads as opening a quote (tkt-5ad1c320bc0a).
+//   - Value-taking wrappers (`sudo -u x`, `nice -n 5`) and `timeout` (tkt-cc86e71e6454).
+//   - A `cd` behind a pipe is read as a real move of this shell (tkt-72f1ad204ea6).
+//   - Heredoc bodies are judged line by line, as git always was: `=>` or `a > b` in one false-blocks
+//     from a primary cwd, and an apostrophe in one desyncs quoting after it (tkt-cee27aa7d421).
 //   - Command substitution: `VAR=$(cd /primary && git checkout -- .)` is not decomposed, the same
 //     gap hooks/lib/shell.mjs documents for its own scanners (tkt-b9c0eda6c630).
 //   - Deleting the marker, or a wrapper this file does not know — the same SCOPE statement as
@@ -50,13 +56,13 @@
 // parent arms its subagents (measured, tkt-2ef9d53ea8b5).
 
 import { spawnSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { isMain } from './lib/is-main.mjs';
 import { worktreeKind } from './lib/worktree.mjs';
 import { protectedBranches, tryGit } from './lib/default-branch.mjs';
-import { quotedTokens, resolveDir, SHELL_KEYWORDS, splitSegments, subshellParens, WRAPPERS } from './lib/shell.mjs';
+import { dequote, quotedTokens, resolveDir, SHELL_KEYWORDS, splitSegments, subshellParens, WRAPPERS } from './lib/shell.mjs';
 import { parseGit } from './guard-bash.mjs';
 
 const TAG = '[guard-worktree]';
@@ -221,9 +227,9 @@ function priorMarker(sessionId, env) {
 }
 
 export function decide(payload, opts = {}) {
-  const { kindOf = worktreeKind, ticket = null, marker = null, mergeState = ghMergeState } = opts;
+  const { kindOf = worktreeKind, ticket = null, marker = null, mergeState = ghMergeState, env = process.env } = opts;
   const tool = payload?.tool_name;
-  if (tool === 'Bash') return decideBash(payload, kindOf, ticket, { marker, mergeState });
+  if (tool === 'Bash') return decideBash(payload, kindOf, ticket, { marker, mergeState }, env);
   if (GUARDED_EDITS.has(tool)) return decideEdit(payload, kindOf, ticket);
   return ALLOW;
 }
@@ -269,7 +275,17 @@ function containingDir(target, cwd) {
   return null;
 }
 
-function decideBash(payload, kindOf, ticket, postMerge) {
+/** Where a write through a dangling link creates its file, resolved from the link's REAL directory. */
+function danglingLinkTarget(p) {
+  try {
+    if (!lstatSync(p).isSymbolicLink() || existsSync(p)) return null;
+    return resolve(realpathSync(dirname(p)), readlinkSync(p));
+  } catch {
+    return null;
+  }
+}
+
+function decideBash(payload, kindOf, ticket, postMerge, env) {
   const command = payload?.tool_input?.command;
   if (typeof command !== 'string' || !command.trim()) return ALLOW;
 
@@ -290,9 +306,19 @@ function decideBash(payload, kindOf, ticket, postMerge) {
     const parens = subshellParens(segment);
     for (let i = parens.open; i > 0; i--) outer.push([dir, unknownDir]);
 
+    // Words of earlier pipeline stages: what an operand-less `xargs rm` is fed from.
+    const upstream = [];
     for (const piece of commandPieces(segment)) {
-      const { envAssignments, tokens } = analysePiece(piece);
+      const { words, targets } = splitRedirects(quotedTokens(piece));
+      const { envAssignments, tokens } = analysePiece(words.join(' '));
       const name = tokens[0];
+      const judge = writeJudge(dir, unknownDir, kindFor, ticket, start, command, env);
+
+      // Before any move: a cd's own redirect opens in the directory it leaves.
+      for (const target of targets) {
+        const denied = judge.path(target, `a redirect to ${target}`);
+        if (denied) return denied;
+      }
 
       if (name === 'cd' || name === 'pushd' || name === 'popd') {
         // popd returns to a stack this does not track, so it reports unresolvable rather than
@@ -300,11 +326,15 @@ function decideBash(payload, kindOf, ticket, postMerge) {
         const moved = name === 'popd' ? null : operandDir(tokens, dir);
         dir = moved;
         unknownDir = moved === null;
+        upstream.push(...words);
         continue;
       }
 
-      const verdict = judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, ticket, start, postMerge);
+      const verdict =
+        judgeWriter(tokens, words.includes('xargs'), upstream, judge) ??
+        judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, ticket, start, postMerge);
       if (verdict) return verdict;
+      upstream.push(...words);
     }
 
     for (let i = parens.close; i > 0 && outer.length; i--) [dir, unknownDir] = outer.pop();
@@ -330,6 +360,10 @@ function commandPieces(segment) {
     if (subst > 0) { buf += c; if (c === '(') subst++; else if (c === ')') subst--; continue; }
     if (!dq && c === '|') {
       if (segment[i + 1] === '|') { buf += '||'; i++; continue; } // a separator splitSegments owns
+      if (segment[i + 1] === '&') { out.push(buf); buf = ''; i++; continue; } // `|&` pipes stderr too
+      // `>|` clobbers, and splitting it hides the target. An escaped `\>` is a literal, so that `|`
+      // is a real pipe, and fusing it would hide the command after it.
+      if (buf.endsWith('>') && !buf.endsWith('\\>')) { buf += c; continue; }
       out.push(buf); buf = ''; continue;
     }
     buf += c;
@@ -374,9 +408,7 @@ function analysePiece(piece) {
 
 /** The directory operand of a cd/pushd, or null when it names something this cannot resolve. */
 function operandDir(tokens, dir) {
-  const args = tokens.slice(1);
-  const redirect = args.findIndex((a) => /^[0-9]*[<>]/.test(a));
-  const operands = redirect === -1 ? args : args.slice(0, redirect);
+  const operands = tokens.slice(1);
   let i = 0;
   while (i < operands.length && operands[i] !== '-' && operands[i].startsWith('-')) {
     const doubleDash = operands[i] === '--';
@@ -450,6 +482,293 @@ function judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, tick
     return judgeDir(dir, kindFor, ticket, start, 'gh pr checkout');
   }
   return null;
+}
+
+// Non-git writes, judged by WHERE THEY LAND (tkt-12cbf1b396aa). A DENYLIST on purpose: an allowlist
+// of readers false-blocks the probes the docs prescribe running in a primary.
+const OPERAND_WRITERS = new Set(['rm', 'rmdir', 'unlink', 'touch', 'mkdir', 'truncate', 'shred', 'mv', 'chmod', 'chown', 'chgrp']);
+// These act on a symlink itself, never on what it points at.
+const ON_THE_LINK = new Set(['rm', 'rmdir', 'unlink']);
+const MODE_FIRST = new Set(['chmod', 'chown', 'chgrp']);
+const DEST_WRITERS = new Set(['cp', 'ln', 'install']);
+// Only argument-free switches may precede the `i`: in perl's `-Ilib` the i is an argument.
+const IN_PLACE = { sed: /^-[nrsuzE]*[iI]/, perl: /^-[0-9nplaswTtWX]*i/ };
+const SCRIPT_FLAGS = new Set(['-e', '-E', '-f', '--expression', '--file']);
+// Flags whose next word is a value, which read as an operand would resolve to a bogus path.
+const VALUE_FLAGS = {
+  truncate: ['-s', '--size', '-r', '--reference'],
+  touch: ['-d', '-t', '-r', '--date', '--reference'],
+  mkdir: ['-m', '--mode'],
+  install: ['-m', '--mode', '-o', '--owner', '-g', '--group', '-t', '--target-directory'],
+  cp: ['-t', '--target-directory'],
+  ln: ['-t', '--target-directory'],
+  sed: ['-e', '--expression', '-f', '--file', '-l'],
+  perl: ['-e', '-E', '-M', '-m', '-I', '-x'],
+  chmod: ['--reference'],
+  chown: ['--reference'],
+  chgrp: ['--reference'],
+};
+const PACKAGE_MANAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
+const PACKAGE_WRITES = new Set([
+  'install', 'i', 'in', 'ci', 'it', 'cit', 'install-test', 'install-ci-test', 'add', 'remove', 'rm', 'r',
+  'uninstall', 'un', 'update', 'up', 'upgrade', 'link', 'dedupe', 'prune', 'rebuild', 'init',
+]);
+const PACKAGE_DIR_FLAGS = new Set(['--prefix', '-C', '--dir', '--cwd']);
+const PACKAGE_VALUE_FLAGS = new Set([...PACKAGE_DIR_FLAGS, '--loglevel', '--filter', '-F', '--workspace', '--registry', '--tag', '--cache', '--userconfig', '--reporter']);
+const YARN_QUERIES = new Set(['--version', '-v', '--help', '-h']);
+const SCRIPT_RUNS = new Set(['run', 'run-script', 'rum', 'urn', 'test', 't', 'tst', 'start', 'stop', 'restart', 'exec', 'x']);
+
+function writeJudge(dir, unknownDir, kindFor, ticket, start, command, env) {
+  const here = (what) =>
+    unknownDir || dir === null ? block(unresolvable(what, ticket)) : judgeDir(dir, kindFor, ticket, start, what);
+  const landing = (resolved, what, follow) => {
+    // A write through a dangling link creates its target, yet a tool may replace the link instead,
+    // so both places are judged.
+    const through = follow ? danglingLinkTarget(resolved) : null;
+    for (const p of through === null ? [resolved] : [resolved, through]) {
+      const at = follow ? containingDir(p, dir) : linkLanding(p, dir);
+      const denied = at === null ? block(unresolvable(what, ticket)) : judgeDir(at, kindFor, ticket, start, what);
+      if (denied) return denied;
+    }
+    return null;
+  };
+  const path = (word, what, follow = true) => {
+    let literal = dequote(word);
+    if (literal === null) return block(unresolvable(what, ticket));
+    const expanded = expandKnownVar(literal, command, env);
+    if (expanded !== literal) word = literal = expanded;
+    const resolved = resolveDir(dir, word);
+    // `rm -r link/` acts through the link; path.resolve drops the slash that says so.
+    if (resolved !== null) return landing(resolved, what, follow || literal.endsWith('/'));
+    // A `$VAR` or glob leaf still sits in whatever directory its literal prefix names.
+    const cut = literal.search(/[$*?[{]/);
+    const prefix = cut === -1 ? '' : literal.slice(0, literal.lastIndexOf('/', cut) + 1);
+    if (!prefix) return here(what);
+    const base = resolveDir(dir, prefix);
+    return base === null ? block(unresolvable(what, ticket)) : landing(base, what, true);
+  };
+  return { here, path };
+}
+
+const KNOWN_VARS = ['HOME', 'TMPDIR'];
+
+/** `$TMPDIR/x` → the hook's own TMPDIR, unless this command assigns or reads into that variable. */
+function expandKnownVar(literal, command, env) {
+  for (const v of KNOWN_VARS) {
+    const m = literal.match(new RegExp(`^(?:\\$${v}|\\$\\{${v}\\})(?=/|$)`));
+    const value = env?.[v];
+    if (!m || typeof value !== 'string' || !isAbsolute(value)) continue;
+    const set = new RegExp(`(?:^|[^A-Za-z0-9_])${v}=|\\b(?:export|read|declare|local|typeset|unset|for)\\b[^;&|\\n]*\\b${v}\\b`);
+    if (set.test(command)) continue;
+    return value + literal.slice(m[0].length);
+  }
+  return literal;
+}
+
+/** A symlink is judged where it sits; anything else where it resolves. */
+function linkLanding(p, cwd) {
+  try {
+    if (lstatSync(p).isSymbolicLink()) return containingDir(dirname(p), cwd);
+  } catch {
+    // Absent: nothing to follow, so the walk below finds its nearest existing ancestor.
+  }
+  return containingDir(p, cwd);
+}
+
+function judgeWriter(tokens, fedByXargs, upstream, judge) {
+  const name = commandName(tokens[0]);
+  const written = writtenPaths(name, tokens.slice(1));
+  if (written === null) return null;
+  if (written.length === 0 || fedByXargs) {
+    // Targets arriving on stdin (`find /primary | xargs rm`, `xargs -I{} rm {}`) land where the
+    // absolute paths of the earlier stages say.
+    if (!PACKAGE_MANAGERS.has(name)) {
+      for (const w of upstream) {
+        const literal = dequote(w);
+        if (literal === null || !/^[/~]/.test(literal)) continue;
+        const denied = judge.path(w, `${name} fed from ${w}`);
+        if (denied) return denied;
+      }
+    }
+    if (written.length === 0) return judge.here(name);
+  }
+  for (const [p, follow] of written) {
+    const denied = judge.path(p, `${name} ${p}`, follow);
+    if (denied) return denied;
+  }
+  return null;
+}
+
+/** `/bin/rm`, `\rm` and `"rm"` all run rm. */
+function commandName(token) {
+  const d = dequote(token ?? '');
+  return d === null ? '' : basename(d.replace(/^\\/, ''));
+}
+
+const REDIRECT_OP = /^(?:<>|&>>|&>|>>|>\||>&|>|<<<|<<-|<<|<&|<)/;
+const WRITE_OPS = new Set(['<>', '&>>', '&>', '>>', '>|', '>&', '>']);
+
+/**
+ * A piece's redirect targets and its remaining words. Arithmetic compares; `>&2` duplicates a
+ * descriptor. unquotedIndex honours backslashes and quotedTokens does not (tkt-5ad1c320bc0a).
+ */
+function splitRedirects(tokens) {
+  const words = [];
+  const targets = [];
+  let skip = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const raw = tokens[i];
+    let t = raw;
+    const atCommand = i === 0 || SHELL_KEYWORDS.has(tokens[i - 1]);
+    if (!skip && atCommand && (raw === '[[' || raw.startsWith('(('))) {
+      skip = raw === '[[' ? ']]' : '))';
+      t = raw.slice(2);
+    }
+    if (skip) {
+      const end = t.indexOf(skip);
+      if (end === -1) { words.push(raw); continue; }
+      t = t.slice(end + skip.length);
+      skip = null;
+    }
+    for (let open = unquotedIndex(t, '$(('); open !== -1; open = unquotedIndex(t, '$((')) {
+      const end = t.indexOf('))', open + 3);
+      if (end === -1) { skip = '))'; t = t.slice(0, open); break; }
+      t = t.slice(0, open) + t.slice(end + 2);
+    }
+
+    let at = unquotedIndex(t, '<', '>');
+    if (at === -1) { words.push(raw); continue; }
+    if (t[at] === '>' && at > 0 && t[at - 1] === '&') at--;
+    const lead = t.slice(0, at);
+    if (lead && !/^[0-9]+$/.test(lead)) words.push(lead);
+    t = t.slice(at);
+    // A token can fuse several: `2>/dev/null>out`, `<in>out`.
+    while (t !== '') {
+      const [op] = t.match(REDIRECT_OP) ?? [''];
+      t = t.slice(op.length);
+      let word;
+      if (t === '') {
+        word = tokens[++i] ?? '';
+      } else {
+        const next = unquotedIndex(t, '<', '>');
+        const cut = next > 0 && t[next] === '>' && t[next - 1] === '&' ? next - 1 : next;
+        word = cut === -1 ? t : t.slice(0, cut).replace(/[0-9]+$/, '');
+        t = cut === -1 ? '' : t.slice(cut);
+      }
+      if (!WRITE_OPS.has(op)) continue;
+      if (op === '>&' && /^(?:[0-9]+-?|-)$/.test(word)) continue;
+      word = word.replace(/\)+$/, '');
+      if (word === '' || word.startsWith('(')) continue;
+      targets.push(word);
+    }
+  }
+  return { words, targets };
+}
+
+/** Index of the first unquoted occurrence of any needle, honouring backslash escapes. */
+function unquotedIndex(token, ...needles) {
+  let quote = null;
+  for (let i = 0; i < token.length; i++) {
+    const c = token[i];
+    if (c === '\\' && quote !== "'") { i++; continue; }
+    if (quote) { if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (needles.some((n) => token.startsWith(n, i))) return i;
+  }
+  return -1;
+}
+
+/**
+ * [path, followLink] pairs a recognised writer writes; [] means "the directory itself", null means
+ * not a writer.
+ */
+function writtenPaths(name, args) {
+  const valueFlags = new Set(VALUE_FLAGS[name] ?? []);
+  const operands = [];
+  let target = null;
+  let scriptGiven = false;
+  let inPlace = false;
+  let flagsDone = false;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (flagsDone || a === '-' || !a.startsWith('-')) { operands.push(a); continue; }
+    if (a === '--') { flagsDone = true; continue; }
+    if (a.startsWith('--target-directory=')) { target = a.slice('--target-directory='.length); continue; }
+    if (name === 'chmod' && /^-[rwxXst]+$/.test(a)) { operands.push(a); continue; }
+    if (valueFlags.has(a)) {
+      if (SCRIPT_FLAGS.has(a)) scriptGiven = true;
+      const value = args[++i];
+      if (a === '-t' || a === '--target-directory') target = value ?? null;
+      continue;
+    }
+    if (name in IN_PLACE && (IN_PLACE[name].test(a) || a.startsWith('--in-place'))) {
+      inPlace = true;
+      // BSD's `-i ''` takes its (empty) suffix as a separate word.
+      if (name === 'sed' && (a === '-i' || a === '-I') && dequote(args[i + 1] ?? 'x') === '') i++;
+    }
+    // A bundled script switch (`-pe`, `-ne`) takes the next word as the script.
+    if (name in IN_PLACE && /^-[A-Za-z0-9]+[eE]$/.test(a) && !/^--/.test(a)) { scriptGiven = true; i++; }
+  }
+
+  if (name === 'tee') return operands.length ? operands.map((p) => [p, true]) : null;
+  // Without -n/-h/-T, an ln or mv onto a link to a directory writes INSIDE that directory.
+  const destIsLink = args.some((a) => /^-[A-Za-z]*[nhT]/.test(a) || a === '--no-dereference' || a === '--no-target-directory');
+  if (name === 'mv' && !target && operands.length > 1)
+    return [...operands.slice(0, -1).map((p) => [p, false]), [operands[operands.length - 1], !destIsLink]];
+  if (OPERAND_WRITERS.has(name)) {
+    const refGiven = args.some((a) => a === '--reference' || a.startsWith('--reference='));
+    const paths = MODE_FIRST.has(name) && !refGiven ? operands.slice(1) : operands;
+    return paths.map((p) => [p, !ON_THE_LINK.has(name) && name !== 'mv']);
+  }
+  if (DEST_WRITERS.has(name)) {
+    if (target) return [[target, true]];
+    if (name === 'ln' && operands.length === 1) return [];
+    return operands.length ? [[operands[operands.length - 1], name !== 'ln' || !destIsLink]] : [];
+  }
+  if (name in IN_PLACE) {
+    if (!inPlace) return null;
+    return (scriptGiven ? operands : operands.slice(1)).map((p) => [p, true]);
+  }
+  if (PACKAGE_MANAGERS.has(name)) return packageWrite(name, args);
+  return null;
+}
+
+function packageWrite(name, args) {
+  if (args.some((a) => a === '--dry-run' || a === '-g' || a === '--global')) return null;
+  let prefix = null;
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--') break;
+    const eq = a.indexOf('=');
+    if (a.startsWith('-') && eq !== -1) {
+      if (PACKAGE_DIR_FLAGS.has(a.slice(0, eq))) prefix = a.slice(eq + 1);
+      continue;
+    }
+    if (PACKAGE_VALUE_FLAGS.has(a)) {
+      const value = args[++i] ?? null;
+      if (PACKAGE_DIR_FLAGS.has(a)) prefix = value;
+      continue;
+    }
+    if (a.startsWith('-')) continue;
+    positional.push(a);
+  }
+  // Any positional, not just the first: an unknown value flag (`-w pkg`) or `yarn workspace <name>`
+  // would otherwise pose as the subcommand. A script run is never an install, whatever its args.
+  if (SCRIPT_RUNS.has(positional[0])) return null;
+  const writes =
+    (positional.length === 0 && name === 'yarn' && !args.some((a) => YARN_QUERIES.has(a))) ||
+    positional.some((p, k) => {
+      const next = positional[k + 1];
+      if (p === 'pkg') return ['set', 'delete', 'fix'].includes(next);
+      if (p === 'audit') return next === 'fix';
+      if (p === 'version') return next !== undefined;
+      return PACKAGE_WRITES.has(p);
+    });
+  if (!writes) return null;
+  // node_modules too: a worktree's is routinely a link into the primary's.
+  const root = prefix ?? '.';
+  return [[root, true], [`${root}/node_modules`, true]];
 }
 
 function judgeDir(target, kindFor, ticket, start, what) {
