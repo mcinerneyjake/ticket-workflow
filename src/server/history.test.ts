@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createTicket, deleteTicket, getTicket, listBoard, updateTicket, restoreRawTicketFile, DELETE_RECORD_FILE, HttpError } from './tickets.js';
@@ -122,6 +122,67 @@ describe('listHistory', () => {
     expect(bodies[0]).toContain('V2');
     expect(bodies[1]).toContain('V1');
     expect(listing.snapshots[0].bytes).toBeGreaterThan(0);
+  });
+
+  // tkt-fb4cf9f6296d: same-millisecond snapshots used to be ordered by their random suffix.
+  it('lists snapshots newest-first even when they share one millisecond', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-01-01T00:00:00.000Z') });
+    try {
+      const t = await createTicket({ title: 'Burst', body: 'V0' });
+      for (let i = 1; i <= 8; i++) await updateTicket(t.id, { body: `V${i}` });
+
+      const listing = await listHistory(t.id);
+      const bodies = await Promise.all(listing.snapshots.map((s) =>
+        fs.readFile(path.join(histDir(t.id), s.file), 'utf8')));
+      expect(bodies.map((b) => /V\d/.exec(b.split('---').at(-1) ?? '')?.[0])).toEqual(
+        ['V7', 'V6', 'V5', 'V4', 'V3', 'V2', 'V1', 'V0']);
+      for (const s of listing.snapshots) expect(s.file).toMatch(/^\d{4}-\d{2}-\d{2}T[\d-]+Z-[0-9a-f]{8}\.md$/);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('orders a snapshot after names already on disk when the clock has stepped back', async () => {
+    const t = await createTicket({ title: 'Stepped', body: 'OLD' });
+    await updateTicket(t.id, { body: 'MID' }); // real-clock snapshot of OLD
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2020-01-01T00:00:00.000Z') });
+    try {
+      await updateTicket(t.id, { body: 'NEW' }); // snapshot of MID, written "in 2020"
+      const listing = await listHistory(t.id);
+      const newest = await fs.readFile(path.join(histDir(t.id), listing.snapshots[0].file), 'utf8');
+      expect(newest).toContain('MID');
+      expect(listing.snapshots[0].file.startsWith('2020')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a stamp-shaped name it cannot parse, and never stamps past year 9999', async () => {
+    const t = await createTicket({ title: 'Odd names', body: 'V1' });
+    await updateTicket(t.id, { body: 'V2' });
+    await fs.writeFile(path.join(histDir(t.id), '2026-13-01T00-00-00-000Z-aaaaaaaa.md'), 'junk', 'utf8');
+    await updateTicket(t.id, { body: 'V3' });
+    await fs.rm(path.join(histDir(t.id), '2026-13-01T00-00-00-000Z-aaaaaaaa.md'));
+    await fs.writeFile(path.join(histDir(t.id), '9999-12-31T23-59-59-999Z-aaaaaaaa.md'), 'junk', 'utf8');
+    await updateTicket(t.id, { body: 'V4' });
+    const files = await historyFiles(t.id);
+    expect(files).toHaveLength(4);
+    expect(files.filter((f) => !/^\d{4}-/.test(f))).toEqual([]);
+  });
+
+  it('still snapshots when the history directory cannot be listed', async () => {
+    silenceLog();
+    const t = await createTicket({ title: 'Unlistable', body: 'V1' });
+    await updateTicket(t.id, { body: 'V2' });
+    await fs.chmod(histDir(t.id), 0o300); // write + search, no read: readdir fails, writes succeed
+    try {
+      await updateTicket(t.id, { body: 'V3' });
+      await deleteTicket(t.id);
+    } finally {
+      await fs.chmod(histDir(t.id), 0o700);
+    }
+    expect(await ticketFileExists(t.id)).toBe(false);
+    expect((await historyFiles(t.id)).filter((f) => f.endsWith('.md'))).toHaveLength(3);
   });
 
   it('reports a deleted id as not live, with its tombstone', async () => {
@@ -376,6 +437,23 @@ describe('restore --undelete', () => {
     expect(err.status).toBe(400);
     expect(err.message).toContain('invalid status');
     expect((await getTicket(t.id)).body).toBe('B');
+  });
+
+  it('lists the final-state snapshot first when a delete lands in the same millisecond as edits', async () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: new Date('2026-01-01T00:00:00.000Z') });
+    try {
+      const t = await createTicket({ title: 'Quick', body: 'V0' });
+      for (let i = 1; i <= 8; i++) await updateTicket(t.id, { body: `V${i}` });
+      await deleteTicket(t.id);
+      const listing = await listHistory(t.id);
+      expect(listing.snapshots[0].file).toBe(listing.deletion?.snapshot);
+      const bodies = await Promise.all(listing.snapshots.map((s) =>
+        fs.readFile(path.join(histDir(t.id), s.file), 'utf8')));
+      expect(bodies.map((b) => /V\d/.exec(b.split('---').at(-1) ?? '')?.[0])).toEqual(
+        ['V8', 'V7', 'V6', 'V5', 'V4', 'V3', 'V2', 'V1', 'V0']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('round-trips create -> edit -> delete -> undelete with the final body intact', async () => {
