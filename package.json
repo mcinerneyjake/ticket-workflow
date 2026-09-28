@@ -25,6 +25,7 @@
       "default": "./dist/test-run/index.js"
     },
     "./hooks/guard-bash.mjs": "./hooks/guard-bash.mjs",
+    "./hooks/guard-board-writes.mjs": "./hooks/guard-board-writes.mjs",
     "./hooks/guard-review-target.mjs": "./hooks/guard-review-target.mjs",
     "./hooks/guard-subagent-gates.mjs": "./hooks/guard-subagent-gates.mjs",
     "./hooks/guard-ticket.mjs": "./hooks/guard-ticket.mjs",
@@ -41,6 +42,7 @@
     "hooks/lib/shell.mjs",
     "hooks/lib/worktree.mjs",
     "hooks/guard-bash.mjs",
+    "hooks/guard-board-writes.mjs",
     "hooks/guard-review-target.mjs",
     "hooks/guard-subagent-gates.mjs",
     "hooks/guard-ticket.mjs",
