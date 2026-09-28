@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PreToolUse(mcp__kanban__create_ticket) guardrail — wired in .claude/settings.json.
+// PreToolUse(mcp__kanban__create_ticket) guardrail — wired at user scope (a consumer may add a project-scope entry).
 //
 // Enforces the "Ticket creation flow" split (tkt-2492e26a277a): every NEW ticket
 // must be authored by the consumer's configured intake path, so its
