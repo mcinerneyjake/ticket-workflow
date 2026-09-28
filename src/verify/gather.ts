@@ -69,7 +69,7 @@ export async function gatherTicketFacts(opts: GatherOptions = {}): Promise<Gathe
     }
     // Trust is recorded PER STEP and read from the same event that supplied the step's state, so
     // the two can never come from different rows. Only hook-written steps carry an outcome at all;
-    // the service writes started/qa/done, which assert nothing about how a command went.
+    // the service writes started/qa/done/archived, which assert nothing about how a command went.
     const trustedSteps: Record<string, boolean> = {};
     const steps: Record<string, string> = {};
     // Last write wins, and a `cleared` marker reverts the step — mirroring reducePipeline, so this

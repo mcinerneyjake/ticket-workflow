@@ -578,11 +578,11 @@ function collectDescendants(id: string, all: ParsedTicket[]): Set<string> {
 // Best-effort telemetry: a transition into a tracked milestone records a 'reached'
 // event. Single choke point for MCP + HTTP; a telemetry failure must never break
 // the write (swallowed).
-async function emitStatusStep(id: string, status: StatusId): Promise<void> {
+async function emitStatusStep(id: string, status: StatusId, detail?: string): Promise<void> {
   const step = STATUS_STEP[status];
   if (!step) return;
   try {
-    await appendEvent({ ticketId: id, step, state: 'reached' });
+    await appendEvent({ ticketId: id, step, state: 'reached', detail });
   } catch (err) {
     log.error('[events] failed to record status step', err);
   }
@@ -749,7 +749,10 @@ async function updateTicketLocked(id: string, patch: TicketPatch, provenance?: P
   await writeTicket(merged);
   // Emit only on a real status change — body/priority/reorder patches must not record a milestone.
   // A repair emits nothing: the file's prior column is unknown, so no transition can be claimed.
-  if (merged.status !== existing.status) await emitStatusStep(id, merged.status);
+  if (merged.status !== existing.status) {
+    // archive_ticket accepts any status, so the prior one is what tells retired work from abandoned.
+    await emitStatusStep(id, merged.status, merged.status === 'archived' ? `from ${existing.status}` : undefined);
+  }
   return merged;
 }
 
@@ -776,6 +779,8 @@ export async function archiveStaleTickets(): Promise<number> {
     });
     if (!cur || cur.status !== 'done') return;
     await writeTicket({ ...cur, status: 'archived', updated: archived });
+    // Only a done ticket reaches this line, so the row doubles as evidence the ticket was done.
+    await emitStatusStep(cur.id, 'archived', 'from done');
     count += 1;
   })));
   log.info(`[archive] Archived ${count} stale ticket(s)`);

@@ -34,8 +34,8 @@ describe('the evidence base', () => {
 
   it('excludes review, which has two writers, and the service-written statuses', () => {
     // `review` is derived by the hook from a passing commit AND appended by record_review, so its
-    // presence witnesses neither. started/qa/done are pure status transitions.
-    for (const s of ['review', 'started', 'qa', 'done']) expect(HOOK_ONLY_STEPS).not.toContain(s);
+    // presence witnesses neither. started/qa/done/archived are pure status transitions.
+    for (const s of ['review', 'started', 'qa', 'done', 'archived']) expect(HOOK_ONLY_STEPS).not.toContain(s);
   });
 
   it('is derived from STEP_IDS, so a step added upstream cannot go unclassified', () => {
