@@ -42,7 +42,30 @@ It ships three pieces:
   `events/` under the other repo's ticket id, where nothing joins to it;
   and an opt-in `PreToolUse` guard (`guard-ticket.mjs`) that blocks
   `create_ticket` so new tickets are authored by a metered local-LLM intake
-  agent instead of by the model driving the session; and a `SessionStart`
+  agent instead of by the model driving the session; and an opt-in `PreToolUse`
+  guard (`guard-board-writes.mjs`) that refuses an `Edit`/`Write`/`NotebookEdit`
+  aimed at a board's own ticket or event file, so board data is written through
+  `update_ticket` rather than edited as text. It blocks on either of two
+  independent tests — a `tkt-<12 hex>.md` directly inside a `tickets/` directory
+  (or a `tkt-<12 hex>.jsonl` inside `events/`), which needs no environment and so
+  catches an absolute write from a session rooted in another repo; or any path
+  inside the board dirs this package resolves
+  (`TICKETS_DIR_OVERRIDE`/`EVENTS_DIR_OVERRIDE`, else `BOARD_DIR_OVERRIDE` /
+  `CLAUDE_PROJECT_DIR` / cwd), which catches a non-ticket name — and the
+  `tickets/.history/` snapshots — sitting in a real board. Case is folded on both,
+  because a case-insensitive filesystem makes `Tickets/` the same file. The second
+  test fires only where the board is **declared** by an explicit override or
+  **evidenced** by the directory actually holding a `tkt-` file: keying it on the
+  bare `CLAUDE_PROJECT_DIR` fallback, which is set in every session, refused every
+  edit into any repo whose `tickets/` is ordinary documentation. Where a session
+  has called `start_ticket`, `guard-worktree` already refuses writes into a
+  repository's primary checkout, which covers a board that lives in one — not a
+  board reached by `BOARD_DIR_OVERRIDE` into a directory that is not a primary
+  checkout, and not a session that never claimed a ticket, which is what this
+  guard is for. It guards the **tool**: a shell write (`sed -i`, `>`, a heredoc)
+  reaches no `PreToolUse` Edit/Write hook and is not covered by this or any other
+  guard here, and a non-`tkt-`-named file in a board *other* than the one the
+  environment resolves is reachable by neither test; and a `SessionStart`
   **staleness warning**
   (`warn-stale-worktree.mjs`) that reports when the session opened in a git
   worktree whose `CLAUDE.md` / `AGENTS.md` / `.cursorrules` has since changed on
@@ -83,7 +106,8 @@ It ships three pieces:
   PRs are read, so an older merge reads as unmerged; the check runs before
   the command, so a compound command that writes a file and then restores it
   in one line is not protected; and sessions armed before this release keep
-  a single-ticket marker and never reach this state. Wire `guard-ticket` and
+  a single-ticket marker and never reach this state. Wire `guard-ticket`,
+  `guard-board-writes` and
   the `guard-worktree` pair only if you want those policies — the others suit
   any consumer.
 - **CLI viewer** (`ticket-workflow`) — `list` and `show <id>`, rendering a
@@ -375,6 +399,7 @@ nothing to block and must not wedge the session — but note it exits **1, not 0
 |---|---|---|
 | `guard-bash` | `PreToolUse` | **closed** (exit 2) |
 | `guard-ticket` | `PreToolUse` | **closed** (exit 2) |
+| `guard-board-writes` | `PreToolUse` | **closed** (exit 2) |
 | `guard-review-target` | `UserPromptExpansion` | **closed** (exit 2) |
 | `guard-subagent-gates` | `PreToolUse` | **closed** (exit 2) |
 | `guard-worktree` | `PreToolUse` | **closed** (exit 2) |
@@ -400,7 +425,11 @@ Two honest limits on that table:
   returns true on any error, and an unreadable directory falls back to the *session* repo's branch,
   which can block a commit that was never going near a protected branch. Check the code.
   `guard-ticket` and `guard-review-target` do fail closed
-  internally. `guard-subagent-gates` is split: it fails **closed** when it knows the rule applies (a
+  internally. `guard-board-writes` is split, and in the same direction as the precheck it sits beside:
+  **closed** on a payload it cannot parse, but **allowing** a payload that parsed and named no path at
+  all, because that matcher covers every edit on the machine and an unattributable payload shape is
+  not worth wedging them over. That second case is a residual, not a guarantee.
+  `guard-subagent-gates` is split: it fails **closed** when it knows the rule applies (a
   subagent whose command it cannot read) and **exits 1** when it cannot even establish that (an
   unparseable payload) — blocking there would wedge every main-thread command over a case the rule
   never covers, so it is loud rather than silent.
