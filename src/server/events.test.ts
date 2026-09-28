@@ -61,6 +61,37 @@ describe('appendEvent', () => {
     expect(out.pipeline.find((p) => p.step === 'test')?.state).toBe('unattributed');
   });
 
+  it('round-trips the gate measurements: exitCode, durationMs and test counts', async () => {
+    await appendEvent({
+      ticketId: 'tkt-abc', step: 'test', state: 'failed', outcomeFrom: 'event',
+      exitCode: 1, durationMs: 4200, tests: { passed: 10, failed: 2, skipped: 1 },
+    });
+    const [e] = (await readEvents('tkt-abc')).events;
+    expect(e).toMatchObject({ exitCode: 1, durationMs: 4200, tests: { passed: 10, failed: 2, skipped: 1 } });
+  });
+
+  it('rejects a malformed measurement on write with 400, writing nothing', async () => {
+    for (const bad of [{ exitCode: 1.5 }, { exitCode: Number.NaN }, { durationMs: -1 }, { durationMs: 2500.4 }, { tests: { passed: 1, failed: -1, skipped: 0 } }]) {
+      const err = await httpError(appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'passed', ...bad }));
+      expect(err.status).toBe(400);
+    }
+    expect((await readEvents('tkt-abc')).events).toEqual([]);
+  });
+
+  it('drops a malformed measurement but keeps the milestone and counts no damage', async () => {
+    await writeRaw('tkt-abc', [
+      JSON.stringify({ ticketId: 'tkt-abc', step: 'test', state: 'passed', at: 'x', exitCode: '0', durationMs: -5, tests: { passed: 1, failed: 'no', skipped: 0 } }),
+      JSON.stringify({ ticketId: 'tkt-abc', step: 'lint', state: 'passed', at: 'x', exitCode: 1.5, tests: { passed: 1 } }),
+      '',
+    ]);
+    const { events, skipped, unrecognized } = await readEvents('tkt-abc');
+    expect([skipped, unrecognized]).toEqual([0, 0]);
+    expect(events).toEqual([
+      { ticketId: 'tkt-abc', step: 'test', state: 'passed', at: 'x' },
+      { ticketId: 'tkt-abc', step: 'lint', state: 'passed', at: 'x' },
+    ]);
+  });
+
   it('appends (never overwrites) across calls', async () => {
     await appendEvent({ ticketId: 'tkt-abc', step: 'branch', state: 'passed' });
     await appendEvent({ ticketId: 'tkt-abc', step: 'commit', state: 'passed' });

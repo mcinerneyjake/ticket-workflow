@@ -599,6 +599,57 @@ reaches for `git add -A` and commits another session's in-flight work. The check
 ignore effect in a scratch repository holding only this repo's committed ignore files, so neither
 your global ignore file nor a directory already on disk can change the verdict.
 
+## `gate` — run the quality gate and record what it did
+
+```bash
+npx ticket-workflow gate
+```
+
+Runs the repo's `typecheck`, `lint` and `test` scripts in that order and appends one event per
+script to the ticket named by the current branch. Each event carries the `passed`/`failed` state read
+from the script's own exit code, plus `exitCode`, `durationMs` and, for `test`, the
+passed/failed/skipped counts from vitest's `Tests` summary line. That line is read only directly
+after vitest's `Test Files` line, and only when its parts add up to its own total. Otherwise the counts
+are left off, never zeroed. A script that exits 0 while its summary reports failures (`vitest run ||
+true`) is recorded `failed`. `show` prints the measurements beside each step, and `verify` trusts them
+as observed outcomes.
+
+**Every defined script runs even after one fails, and each writes a row.** Stopping early, or
+writing nothing, would leave a step's earlier `passed` row as its latest state and vouch for code
+that was never checked. So a script that could not be started is recorded `unattributed`, which
+`verify` reads as unknown.
+
+It exists because the `track-steps` hook infers gate results from Bash command text, so a gate run
+inside `git commit`'s pre-commit hook, behind a pipe, or after a `;` leaves no milestone. `gate` reads
+its own exit codes, so it works from a session and from a git hook alike. The scripts run with stdin
+closed, so a bare `vitest` script cannot drop into watch mode. They also run without git's
+repo-local variables (from `git rev-parse --local-env-vars`) and without any board variable,
+`CLAUDE_PROJECT_DIR` included. The gate returns when npm exits, even if a background process the
+script left behind still holds its output.
+
+**It writes only to a board that holds the ticket.** A shell or a git hook usually has no board
+variable set, and falling back to the cwd would put the events in the wrong board without any sign.
+So when `<tickets>/<id>.md` is not there, `gate` still runs the scripts, prints `NOT RECORDED` with
+the path it checked, and writes nothing. That skip is reserved for the case where no board was
+configured. A **configured** board that is wrong fails with exit 3 instead: no `tickets/` directory
+there, only one of `TICKETS_DIR_OVERRIDE` and `EVENTS_DIR_OVERRIDE` set, or `TICKET_WORKFLOW_BOARD_DIR`
+set alongside either of them. A typo would otherwise record nothing, forever, with no signal. The
+branch must name exactly one ticket id.
+
+To record into a central board from a shell or a hook, export **`TICKET_WORKFLOW_BOARD_DIR`** (the
+board's root) in the shell profile. Only `gate` reads it. Exporting `BOARD_DIR_OVERRIDE` globally
+instead would also aim every test run on the machine at the real board.
+
+| exit | meaning |
+|---|---|
+| `0` | every gate script that exists passed |
+| `1` | a gate failed |
+| `2` | something was not checked: arguments given, no readable `package.json`, none of the three scripts defined, or a script that could not be started |
+| `3` | a record could not be written, the board could not be checked, or a configured board is wrong. This wins over the others, since a lost record is otherwise invisible |
+
+A missing script is named and never counted as a pass. A branch with no ticket id (such as `main`) is
+not an error: the scripts run and the exit code is theirs.
+
 ## `verify` — checking a ticket's claims against the record
 
 Every ticket ends with an agent-authored `## Implementation summary` asserting `Tests: N added` and a
