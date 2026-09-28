@@ -180,6 +180,17 @@ describe('cmdShow', () => {
     const row = lines.find((l) => l.includes('2026-07-01T00:00:00.000Z'));
     expect(row?.startsWith('  ?')).toBe(true);
   });
+
+  it("prints the latest event's gate measurements beside its step", async () => {
+    const t = await createTicket({ title: 'Measured', type: 'chore', priority: 'low', status: 'todo' });
+    await appendEvent({ ticketId: t.id, step: 'test', state: 'failed', exitCode: 1, durationMs: 900 });
+    await appendEvent({ ticketId: t.id, step: 'test', state: 'passed', exitCode: 0, durationMs: 12345, tests: { passed: 8, failed: 0, skipped: 2 } });
+    await appendEvent({ ticketId: t.id, step: 'lint', state: 'passed' });
+    const lines = captureLog();
+    await cmdShow(t.id);
+    expect(lines.find((l) => l.includes('Tests'))).toContain('[exit 0, 12.3s, 8 passed · 0 failed · 2 skipped]');
+    expect(lines.find((l) => l.includes('Lint'))).not.toContain('[');
+  });
 });
 
 describe('cmdList', () => {

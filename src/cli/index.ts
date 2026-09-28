@@ -5,7 +5,7 @@ import { clearStaleSlots, DEFAULT_TTL_MS, formatSlot, listSlots, pidLiveness, Te
 import { listTickets, getTicket, DELETE_RECORD_FILE, type StrippedEdge } from '../server/tickets.js';
 import { listHistory, restoreFromSnapshot, undeleteFromHistory } from '../server/history.js';
 import { getTicketEvents } from '../server/events.js';
-import { isStatusId, STATUS_IDS, type StepState } from '../shared/constants.js';
+import { isStatusId, STATUS_IDS, type StepState, type TicketEvent } from '../shared/constants.js';
 import { runChecks, exitCodeFor, formatResults } from '../doctor/checks.js';
 import { gatherFacts } from '../doctor/gather.js';
 import { runAudit, auditExitCode, formatAudit } from '../audit/run.js';
@@ -17,6 +17,7 @@ import { provisionFailed, provisionWorktree } from '../worktree/provision.js';
 import { sweep } from '../vacuous/probe.js';
 import { checkRoot, vacuousExitCode, EXIT as VACUOUS_EXIT } from '../vacuous/ratchet.js';
 import { cmdTestContention } from './contention.js';
+import { applyGateBoard, currentBranch, GATE_EXIT, readScripts, resolveRecording, runGate, spawnScript } from '../gate/run.js';
 
 // Lightweight per-repo board viewer. Resolves the board from the cwd/
 // CLAUDE_PROJECT_DIR (see paths.ts), so it shows whichever repo it runs in.
@@ -44,17 +45,29 @@ export async function cmdList(statusFilter: string | null): Promise<void> {
   }
 }
 
+function measurements(e: TicketEvent | undefined): string {
+  if (!e) return '';
+  const parts = [
+    e.exitCode !== undefined ? `exit ${e.exitCode}` : null,
+    e.durationMs !== undefined ? `${(e.durationMs / 1000).toFixed(1)}s` : null,
+    e.tests ? `${e.tests.passed} passed · ${e.tests.failed} failed · ${e.tests.skipped} skipped` : null,
+  ].filter((p) => p !== null);
+  return parts.length > 0 ? `  [${parts.join(', ')}]` : '';
+}
+
 export async function cmdShow(id: string): Promise<void> {
   // Verify the ticket exists first — getTicket throws HttpError(404) for a missing
   // id (caught in main → exit 1). Without this, getTicketEvents on a typo'd/deleted
   // id returns an all-pending pipeline, indistinguishable from a real un-started one.
   const ticket = await getTicket(id);
-  const { pipeline, skipped, unrecognized } = await getTicketEvents(id);
+  const { pipeline, events, skipped, unrecognized } = await getTicketEvents(id);
+  const latest = new Map(events.map((e) => [e.step, e]));
   console.log(`${ticket.id}  ${ticket.status}  ${ticket.title}`);
   for (const step of pipeline) {
     const glyph = GLYPH[step.state];
     const when = step.at ? `  (${step.at})` : '';
-    console.log(`  ${glyph} ${step.label}${when}`);
+    const measured = step.state === 'pending' ? '' : measurements(latest.get(step.step));
+    console.log(`  ${glyph} ${step.label}${when}${measured}`);
   }
   // Without this the pipeline above renders a discarded event as a never-run step — the exact
   // ambiguity the counts exist to remove. Returning them from readEvents does NOT force a caller
@@ -506,6 +519,23 @@ export async function cmdWorktree(
   console.log(`  git worktree remove ${result.path}`);
 }
 
+export async function cmdGate(args: readonly string[], cwd: string = process.cwd()): Promise<number> {
+  if (args.length > 0) {
+    console.error(`usage: ticket-workflow gate — takes no arguments (got ${args.join(' ')})`);
+    return GATE_EXIT.NOT_CHECKED;
+  }
+  let scripts: ReadonlySet<string>;
+  try {
+    scripts = await readScripts(cwd);
+  } catch (err) {
+    console.error(`gate: could not read ${cwd}/package.json: ${err instanceof Error ? err.message : String(err)}`);
+    return GATE_EXIT.NOT_CHECKED;
+  }
+  applyGateBoard();
+  const recording = await resolveRecording(currentBranch(cwd));
+  return runGate({ scripts, recording, run: spawnScript(cwd) });
+}
+
 export async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   switch (cmd) {
@@ -551,12 +581,15 @@ export async function main(): Promise<void> {
     case 'restore':
       await cmdRestore(rest);
       break;
+    case 'gate':
+      process.exitCode = await cmdGate(rest);
+      break;
     default:
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
           'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json] | ' +
           'vacuous <path> [--check] | test-slots [status|clear-stale] [--json] | test-contention [--runs <N>] [--control] | ' +
-          'history <id> | restore <id> (--at <snapshot> [--full] | --undelete) | ' +
+          'history <id> | restore <id> (--at <snapshot> [--full] | --undelete) | gate | ' +
           'worktree <ticket-id> [--branch <name>] [--base <ref>] [--name <dir>] [--repo <path>]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;
