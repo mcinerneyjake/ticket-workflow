@@ -152,7 +152,7 @@ describe('catalog parity with shared/constants.ts', () => {
     // Every catalog step must be accounted for by exactly one producer: the hook
     // (shell milestones + the commit-derived review) or a status transition. This
     // still fails on an UNINTENTIONAL new step that nothing produces.
-    const statusSteps = ['started', 'qa', 'done'];
+    const statusSteps = ['started', 'qa', 'done', 'archived'];
     expect(new Set([...HOOK_STEPS, ...statusSteps])).toEqual(new Set(STEP_IDS));
   });
 

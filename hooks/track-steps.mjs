@@ -13,7 +13,7 @@
 // already ran) and must never disrupt the workflow: it always exits 0, never
 // writes stderr, and swallows every error.
 //
-// Status milestones (started/qa/done) are emitted server-side by updateTicket,
+// Status milestones (started/qa/done/archived) are emitted server-side by the ticket service,
 // NOT here: after `gh pr merge --delete-branch` the branch is gone, so the
 // branch-correlation this hook relies on wouldn't resolve the ticket anyway.
 //
@@ -35,7 +35,7 @@ import { dirTarget, hasTopLevelBackground, hasTopLevelPipe, hiddenDirMove, resol
 
 // The milestones this hook can emit. MUST stay a subset of shared/constants.ts
 // STEP_IDS — track-steps.test.mjs asserts parity so the two can't drift.
-// (started/qa/done are service-emitted, so they are absent here.) `review` is
+// (started/qa/done/archived are service-emitted, so they are absent here.) `review` is
 // derived: a successful `git commit` implies the "Ready to commit?" review gate
 // was passed, so the hook records `review` alongside `commit` (see recordsFor).
 export const HOOK_STEPS = ['branch', 'typecheck', 'lint', 'test', 'commit', 'pr_opened', 'review'];

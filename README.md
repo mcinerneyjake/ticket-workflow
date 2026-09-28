@@ -92,6 +92,12 @@ It ships three pieces:
 The pipeline a ticket flows through:
 **Started · Branch · Typecheck · Lint · Tests · Review · Commit · PR · QA · Done.**
 
+Archiving logs an `archived` event, never `done`, since `archive_ticket` also retires abandoned
+work. The row's detail names the prior status (`from done`, `from todo`, …), which is how retired
+work is told from abandoned. `archiveStaleTickets` archives only `done` tickets, so its rows always
+read `from done`. `archived` is an end state rather than a stage, so it is absent from the rendered
+pipeline (`PIPELINE_STEPS`) and appears only in the event log.
+
 ## Board location
 
 The board root is resolved at runtime as

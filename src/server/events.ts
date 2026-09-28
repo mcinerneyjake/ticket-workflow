@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  STEPS,
+  PIPELINE_STEPS,
   isStepId,
   isStepState,
   type StepId,
@@ -167,7 +167,7 @@ export const REVIEW_CLEARED = 'cleared';
 export function reducePipeline(events: TicketEvent[]): PipelineStep[] {
   const latest = new Map<StepId, TicketEvent>();
   for (const e of events) latest.set(e.step, e);
-  return STEPS.map((s) => {
+  return PIPELINE_STEPS.map((s) => {
     const e = latest.get(s.id);
     const active = e && e.detail !== REVIEW_CLEARED ? e : undefined;
     return {

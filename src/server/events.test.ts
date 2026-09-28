@@ -224,8 +224,17 @@ describe('readEvents', () => {
 describe('reducePipeline', () => {
   it('yields every canonical step in order, pending when no event arrived', () => {
     const pipeline = reducePipeline([]);
-    expect(pipeline.map((p) => p.step)).toEqual(STEP_IDS);
+    expect(pipeline.map((p) => p.step)).toEqual(STEP_IDS.filter((s) => s !== 'archived'));
     expect(pipeline.every((p) => p.state === 'pending' && p.at === null)).toBe(true);
+  });
+
+  it('keeps archived out of the pipeline: an end state, not a stage (tkt-9e662d918959)', () => {
+    const pipeline = reducePipeline([
+      { ticketId: 't', step: 'done', state: 'reached', at: '2026-07-01T00:00:00.000Z' },
+      { ticketId: 't', step: 'archived', state: 'reached', at: '2026-07-02T00:00:00.000Z', detail: 'from done' },
+    ]);
+    expect(pipeline.map((p) => p.step)).not.toContain('archived');
+    expect(pipeline.find((p) => p.step === 'done')?.state).toBe('reached');
   });
 
   it('takes the LATEST event per step (failed-then-passed retry lands on passed)', () => {
