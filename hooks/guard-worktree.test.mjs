@@ -1,11 +1,11 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, existsSync, readFileSync, realpathSync, utimesSync, chmodSync, copyFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, realpathSync, utimesSync, chmodSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { arm, decide, isArmed, markerPath, MARKER_MAX_AGE_MS } from './guard-worktree.mjs';
-import { worktreeKind } from './lib/worktree.mjs';
+import { buildFixtures, realKind, SID, TICKET } from '../src/test-support/guardWorktreeFixtures.mjs';
 
 /**
  * guard-worktree: once a session has called start_ticket, it may not write to a repository's
@@ -15,70 +15,17 @@ import { worktreeKind } from './lib/worktree.mjs';
  * stop is a fail-OPEN, and a fail-open lives in the dimension nobody sampled. The dimensions here are
  * marker state, payload shape, checkout kind, and — for Bash — how the directory is named.
  *
- * The checkout fixtures are REAL repos with REAL linked worktrees. A stubbed worktreeKind would make
- * every case below a test of the stub: "is this a linked worktree" is precisely the question the
- * guard can get wrong, and git is the only thing that answers it authoritatively.
+ * Fixtures are real repos and worktrees (src/test-support/guardWorktreeFixtures.mjs). The non-git
+ * write rules live in guard-worktree.writes.test.mjs.
  */
 
 const HOOKS_DIR = path.dirname(fileURLToPath(import.meta.url));
-const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-const SID = 'ses-0123456789abcdef';
-const TICKET = 'tkt-abcdef123456';
 
 let fx;
 let stateDir;
 
-function seedRepo(dir) {
-  mkdirSync(dir, { recursive: true });
-  git(['init', '-q', '-b', 'main', '.'], dir);
-  git(['config', 'user.email', 't@t'], dir);
-  git(['config', 'user.name', 't'], dir);
-  writeFileSync(path.join(dir, 'tracked.txt'), 'v1\n');
-  writeFileSync(path.join(dir, '.gitignore'), 'ignored/\n');
-  git(['add', 'tracked.txt', '.gitignore'], dir);
-  git(['commit', '-qm', 'init'], dir);
-}
-
 beforeAll(() => {
-  const root = mkdtempSync(path.join(tmpdir(), 'tw-wtguard-'));
-
-  const primary = path.join(root, 'primary');
-  seedRepo(primary);
-  mkdirSync(path.join(primary, 'ignored'));
-  writeFileSync(path.join(primary, 'ignored', 'note.txt'), 'x\n');
-
-  const linked = path.join(root, 'linked');
-  git(['worktree', 'add', '-q', '-b', 'side', linked], primary);
-
-  // The shape EnterWorktree produces: a worktree NESTED inside the primary's own tree. It is still a
-  // linked checkout, and reading it as "inside the primary, therefore blocked" would make the guard
-  // forbid the only thing it tells you to do.
-  const nested = path.join(primary, '.claude', 'worktrees', TICKET);
-  git(['worktree', 'add', '-q', '-b', 'nested', nested], primary);
-
-  const plain = path.join(root, 'plain');
-  mkdirSync(plain);
-
-  const foreign = path.join(root, 'foreign');
-  seedRepo(foreign);
-  const foreignWt = path.join(foreign, '.claude', 'worktrees', TICKET);
-  git(['worktree', 'add', '-q', '-b', 'fside', foreignWt], foreign);
-
-  symlinkSync(path.join(primary, 'tracked.txt'), path.join(linked, 'link-to-primary.txt'));
-
-  // A primary whose path contains a SPACE, with a real directory sitting at the point an unquoted
-  // operand truncates to. Without that neighbour the truncated path resolves to nothing and the
-  // guard blocks for the wrong reason, so the case would pass while proving nothing.
-  const spaced = path.join(root, 'my repo');
-  mkdirSync(path.join(root, 'my'));
-  seedRepo(spaced);
-  const spacedWt = path.join(root, 'spaced-wt');
-  git(['worktree', 'add', '-q', '-b', 'spacedside', spacedWt], spaced);
-
-  mkdirSync(path.join(primary, 'src'));
-  writeFileSync(path.join(primary, 'src', 'deep.txt'), 'x\n');
-
-  fx = { root, primary, linked, nested, plain, foreign, foreignWt, spaced, spacedWt };
+  fx = buildFixtures();
 });
 
 beforeEach(() => {
@@ -96,21 +43,6 @@ const running = (command, cwd, extra = {}) => ({
   session_id: SID, tool_name: 'Bash', tool_input: { command }, cwd, ...extra,
 });
 const verdict = (payload, opts = {}) => decide(payload, { ticket: TICKET, kindOf: realKind, ...opts });
-
-/**
- * REAL detection, memoised per directory.
- *
- * Still git answering "primary or linked" — a stub would make these cases tests of the stub — but
- * asked once per fixture rather than once per row. The fixtures are built in beforeAll and their
- * kind never changes, so the cache cannot mask a transition. Measured reason: three `git rev-parse`
- * spawns per decide() across ~40 rows starved the slower suites sharing the run, timing out audit
- * tests that pass on their own.
- */
-const kindCache = new Map();
-const realKind = (dir) => {
-  if (!kindCache.has(dir)) kindCache.set(dir, worktreeKind(dir));
-  return kindCache.get(dir);
-};
 
 const COMMIT = 'commit -m x';
 const gitCmd = (rest) => `git ${rest}`;
@@ -211,6 +143,14 @@ describe('edit targets', () => {
 
   // null is git failing to answer, NOT "no repo". Folding the two together is the fail-open this
   // guard's detection helper is split to prevent, so it gets its own case.
+  it.each([
+    // HEAD's verdicts; the round-4 review measured a dangling-link follow in containingDir flipping both.
+    ['a dangling link reached through a worktree node_modules link', () => path.join(fx.foreignWt, 'node_modules', '.bin', 'dl'), () => fx.foreignWt],
+    ['a dangling link that sits in the primary', () => path.join(fx.primary, 'dang-out'), () => fx.linked],
+  ])('blocks an edit to %s', (_label, file, cwd) => {
+    expect(verdict(editing(file(), { cwd: cwd() })).blocked).toBe(true);
+  });
+
   it('blocks when the checkout kind cannot be determined', () => {
     expect(verdict(editing(path.join(fx.linked, 'tracked.txt')), { kindOf: () => null }).blocked).toBe(true);
   });
