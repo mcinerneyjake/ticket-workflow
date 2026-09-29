@@ -200,9 +200,9 @@ describe('runGate', () => {
     expect(code).toBe(GATE_EXIT.OK);
     expect(calls).toEqual(['typecheck', 'lint', 'test']);
     expect(append.mock.calls).toEqual([
-      [{ ticketId: ID, step: 'typecheck', state: 'passed', outcomeFrom: 'event', durationMs: 1000, exitCode: 0 }],
-      [{ ticketId: ID, step: 'lint', state: 'passed', outcomeFrom: 'event', durationMs: 1000, exitCode: 0 }],
-      [{ ticketId: ID, step: 'test', state: 'passed', outcomeFrom: 'event', durationMs: 2500, exitCode: 0, tests: { passed: 9, failed: 0, skipped: 0 } }],
+      [{ ticketId: ID, step: 'typecheck', state: 'passed', source: 'gate', outcomeFrom: 'event', durationMs: 1000, exitCode: 0 }],
+      [{ ticketId: ID, step: 'lint', state: 'passed', source: 'gate', outcomeFrom: 'event', durationMs: 1000, exitCode: 0 }],
+      [{ ticketId: ID, step: 'test', state: 'passed', source: 'gate', outcomeFrom: 'event', durationMs: 2500, exitCode: 0, tests: { passed: 9, failed: 0, skipped: 0 } }],
     ]);
   });
 
@@ -225,7 +225,7 @@ describe('runGate', () => {
     expect(await runGate({ scripts: ALL, recording: RECORD, run, append, print: out.print })).toBe(GATE_EXIT.NOT_CHECKED);
     expect(calls).toEqual(['typecheck', 'lint', 'test']);
     expect(append.mock.calls.map(([e]) => [e.step, e.state])).toEqual([['typecheck', 'passed'], ['lint', 'unattributed'], ['test', 'passed']]);
-    expect(append).toHaveBeenCalledWith({ ticketId: ID, step: 'lint', state: 'unattributed', outcomeFrom: 'event' });
+    expect(append).toHaveBeenCalledWith({ ticketId: ID, step: 'lint', state: 'unattributed', source: 'gate', outcomeFrom: 'event' });
     expect(out.lines.some((l) => l.includes('lint could not be started') && l.includes('ENOENT'))).toBe(true);
   });
 
@@ -239,7 +239,7 @@ describe('runGate', () => {
     const { run } = runner({ typecheck: { exitCode: null } });
     const append = vi.fn<Append>(async () => {});
     expect(await runGate({ scripts: ALL, recording: RECORD, run, append, print: collect().print })).toBe(GATE_EXIT.GATE_FAILED);
-    expect(append).toHaveBeenCalledWith({ ticketId: ID, step: 'typecheck', state: 'failed', outcomeFrom: 'event', durationMs: 1000 });
+    expect(append).toHaveBeenCalledWith({ ticketId: ID, step: 'typecheck', state: 'failed', source: 'gate', outcomeFrom: 'event', durationMs: 1000 });
   });
 
   it('records failed when the summary reports failures, even at exit 0', async () => {
@@ -416,6 +416,7 @@ describe('cmdGate end to end', () => {
     ]);
     expect(events[2].tests).toEqual({ passed: 4, failed: 0, skipped: 1 });
     expect(events.every((e) => typeof e.durationMs === 'number')).toBe(true);
+    expect(events.map((e) => e.source)).toEqual(['gate', 'gate', 'gate']);
     const { facts } = await gatherTicketFacts({ id: t.id });
     expect(facts[0].trustedSteps).toMatchObject({ typecheck: true, lint: true, test: true });
   });

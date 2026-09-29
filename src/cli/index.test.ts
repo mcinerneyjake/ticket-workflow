@@ -10,6 +10,7 @@ import { appendEvent, getTicketEvents } from '../server/events.js';
 import { STATUS_IDS } from '../shared/constants.js';
 import type { DoctorFacts } from '../doctor/checks.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
+import { eventsDir } from '../paths.js';
 
 // Wrapped (not stubbed) so cmdShow's ordering is observable: the real implementation still runs.
 vi.mock('../server/events.js', async (importOriginal) => {
@@ -155,7 +156,7 @@ describe('cmdShow', () => {
 
   it('stays quiet on a clean log — a warning on every show would train the reader to ignore it', async () => {
     const t = await createTicket({ title: 'Clean', type: 'chore', priority: 'low', status: 'todo' });
-    await appendEvent({ ticketId: t.id, step: 'lint', state: 'passed' });
+    await appendEvent({ ticketId: t.id, step: 'lint', state: 'passed', source: 'hook' });
     const lines = captureLog();
     await cmdShow(t.id);
     expect(lines.some((l) => l.includes('!'))).toBe(false);
@@ -163,7 +164,7 @@ describe('cmdShow', () => {
 
   it('prints the ticket header and one line per pipeline step', async () => {
     const t = await createTicket({ title: 'CLI show fixture', type: 'chore', priority: 'low', status: 'todo' });
-    await appendEvent({ ticketId: t.id, step: 'typecheck', state: 'passed', at: '2026-07-01T00:00:00.000Z' });
+    await appendEvent({ ticketId: t.id, step: 'typecheck', state: 'passed', source: 'hook', at: '2026-07-01T00:00:00.000Z' });
     const lines = captureLog();
     await cmdShow(t.id);
     expect(lines[0]).toBe(`${t.id}  todo  CLI show fixture`);
@@ -174,7 +175,7 @@ describe('cmdShow', () => {
   // Rendered as pending, a recorded failure reads as a step that never ran (tkt-24925929919c).
   it('renders an unattributed step with its own glyph, not the pending one', async () => {
     const t = await createTicket({ title: 'Unattributed', type: 'chore', priority: 'low', status: 'todo' });
-    await appendEvent({ ticketId: t.id, step: 'test', state: 'unattributed', at: '2026-07-01T00:00:00.000Z' });
+    await appendEvent({ ticketId: t.id, step: 'test', state: 'unattributed', source: 'hook', at: '2026-07-01T00:00:00.000Z' });
     const lines = captureLog();
     await cmdShow(t.id);
     const row = lines.find((l) => l.includes('2026-07-01T00:00:00.000Z'));
@@ -183,13 +184,25 @@ describe('cmdShow', () => {
 
   it("prints the latest event's gate measurements beside its step", async () => {
     const t = await createTicket({ title: 'Measured', type: 'chore', priority: 'low', status: 'todo' });
-    await appendEvent({ ticketId: t.id, step: 'test', state: 'failed', exitCode: 1, durationMs: 900 });
-    await appendEvent({ ticketId: t.id, step: 'test', state: 'passed', exitCode: 0, durationMs: 12345, tests: { passed: 8, failed: 0, skipped: 2 } });
-    await appendEvent({ ticketId: t.id, step: 'lint', state: 'passed' });
+    await appendEvent({ ticketId: t.id, step: 'test', state: 'failed', source: 'gate', exitCode: 1, durationMs: 900 });
+    await appendEvent({ ticketId: t.id, step: 'test', state: 'passed', source: 'gate', exitCode: 0, durationMs: 12345, tests: { passed: 8, failed: 0, skipped: 2 } });
+    await appendEvent({ ticketId: t.id, step: 'lint', state: 'passed', source: 'hook' });
     const lines = captureLog();
     await cmdShow(t.id);
     expect(lines.find((l) => l.includes('Tests'))).toContain('[exit 0, 12.3s, 8 passed · 0 failed · 2 skipped]');
     expect(lines.find((l) => l.includes('Lint'))).not.toContain('[');
+  });
+
+  it("names the latest event's writer beside its step, and nothing for a pre-source row", async () => {
+    const t = await createTicket({ title: 'Sourced', type: 'chore', priority: 'low', status: 'todo' });
+    await appendEvent({ ticketId: t.id, step: 'test', state: 'passed', source: 'hook' });
+    await appendEvent({ ticketId: t.id, step: 'test', state: 'passed', source: 'gate' });
+    await fs.appendFile(path.join(eventsDir(), `${t.id}.jsonl`), `${JSON.stringify({ ticketId: t.id, step: 'lint', state: 'passed', at: 'x' })}\n`);
+    const lines = captureLog();
+    await cmdShow(t.id);
+    expect(lines.find((l) => l.includes('Tests'))).toContain('via gate');
+    expect(lines.find((l) => l.includes('Tests'))).not.toContain('via hook');
+    expect(lines.find((l) => l.includes('Lint'))).not.toContain('via');
   });
 });
 

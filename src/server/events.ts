@@ -4,6 +4,8 @@ import {
   PIPELINE_STEPS,
   isStepId,
   isStepState,
+  isEventSource,
+  type EventSourceId,
   type StepId,
   type TicketEvent,
   type TestCounts,
@@ -40,6 +42,7 @@ export async function appendEvent(event: {
   step: string
   state: string
   at?: string
+  source: EventSourceId
   detail?: string
   /** Only a writer that derived `state` from an observed outcome (hook event, or `gate`'s own exit
    *  code) may set this; `verify` reads it as provenance. Status milestones leave it unset. */
@@ -51,6 +54,7 @@ export async function appendEvent(event: {
   const file = eventsPath(event.ticketId);
   if (!isStepId(event.step)) throw new HttpError(400, `Invalid step: ${event.step}`);
   if (!isStepState(event.state)) throw new HttpError(400, `Invalid state: ${event.state}`);
+  if (!isEventSource(event.source)) throw new HttpError(400, `Invalid source: ${String(event.source)}`);
   // Rejected here because the reader drops a bad measurement silently, so a writer bug would
   // otherwise surface as a healthy log that simply lacks the numbers.
   if (event.exitCode !== undefined && !Number.isInteger(event.exitCode)) throw new HttpError(400, `Invalid exitCode: ${event.exitCode}`);
@@ -62,6 +66,7 @@ export async function appendEvent(event: {
     step: event.step,
     state: event.state,
     at: event.at ?? new Date().toISOString(),
+    source: event.source,
     ...(event.detail ? { detail: event.detail } : {}),
     ...(event.outcomeFrom === 'event' ? { outcomeFrom: 'event' as const } : {}),
     ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
@@ -76,7 +81,7 @@ export async function appendEvent(event: {
 // A JSONL line with keys present but not type-checked; in-narrowed, no cast.
 type RawEvent = {
   ticketId: unknown; step: unknown; state: unknown; at: unknown
-  detail?: unknown; outcomeFrom?: unknown; exitCode?: unknown; durationMs?: unknown; tests?: unknown
+  source?: unknown; detail?: unknown; outcomeFrom?: unknown; exitCode?: unknown; durationMs?: unknown; tests?: unknown
 }
 
 function asRawEvent(v: unknown): RawEvent | null {
@@ -126,6 +131,8 @@ function parseEventLine(line: string): ParsedLine {
       step: raw.step,
       state: raw.state,
       at: raw.at,
+      // Dropped, never a skip: a writer newer than this reader may name a source it lacks.
+      ...(isEventSource(raw.source) ? { source: raw.source } : {}),
       ...(typeof raw.detail === 'string' ? { detail: raw.detail } : {}),
       // Whitelisted through deliberately: this is what lets `verify` tell a row whose state was
       // derived from the delivered event from a pre-fix row that said `passed` regardless. Any

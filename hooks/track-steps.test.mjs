@@ -4,8 +4,8 @@ import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSyn
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { commandToMilestones, extractTicketId, stateFromEvent, recordsFor, HOOK_STEPS, UNATTRIBUTED } from './track-steps.mjs';
-import { STEP_IDS, STEP_STATES, BRANCH_TICKET_ID_RE } from '../src/shared/constants.js';
+import { commandToMilestones, extractTicketId, stateFromEvent, recordsFor, HOOK_STEPS, UNATTRIBUTED, SOURCE } from './track-steps.mjs';
+import { STEP_IDS, STEP_STATES, BRANCH_TICKET_ID_RE, EVENT_SOURCES } from '../src/shared/constants.js';
 
 const HOOK = path.join(path.dirname(fileURLToPath(import.meta.url)), 'track-steps.mjs');
 
@@ -53,6 +53,8 @@ function runHook({ command, cwd, eventsRoot, event = 'PostToolUse' }) {
 const filesIn = (dir) => readdirSync(dir).sort();
 const stepsIn = (dir, file) =>
   readFileSync(path.join(dir, file), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l).step);
+const sourcesIn = (dir, file) =>
+  readFileSync(path.join(dir, file), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l).source);
 const statesIn = (dir, file) =>
   readFileSync(path.join(dir, file), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l).state);
 
@@ -164,6 +166,12 @@ describe('catalog parity with shared/constants.ts', () => {
   // as version skew and answers UNKNOWN for the whole ticket.
   it('the unattributed state is a valid shared StepState', () => {
     expect(STEP_STATES).toContain(UNATTRIBUTED);
+  });
+
+  // A source missing from EVENT_SOURCES is dropped by every reader, so hook rows would read as sourceless.
+  it('writes a source that is in the shared EVENT_SOURCES vocabulary', () => {
+    expect(SOURCE).toBe('hook');
+    expect(EVENT_SOURCES).toContain(SOURCE);
   });
 });
 
@@ -578,6 +586,8 @@ describe('hook boundary — a milestone is attributed to the repo it ran in (tkt
     const dir = fromA(`cd ${target} && git commit -m x`);
     expect(filesIn(dir)).toEqual([`${B}.jsonl`]);
     expect(stepsIn(dir, `${B}.jsonl`)).toEqual(['review', 'commit']);
+    // Marks this review as inferred from a commit, never confirmed through record_review.
+    expect(sourcesIn(dir, `${B}.jsonl`)).toEqual(['hook', 'hook']);
   });
 
   // Every boundary case above drives a PASSING command, so none of them binds that the exit state

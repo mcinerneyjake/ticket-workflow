@@ -335,7 +335,7 @@ export async function handleToolCall(
         // Verify existence first (404) — else a typo'd id creates a ghost
         // events/<id>.jsonl. Writes via the service directly, so it works with no web server running.
         await getTicket(id);
-        await appendEvent({ ticketId: id, step: 'review', state: 'reached' });
+        await appendEvent({ ticketId: id, step: 'review', state: 'reached', source: 'review' });
         return { content: [textContent(JSON.stringify(await getTicketEvents(id), null, 2))] };
       }
 

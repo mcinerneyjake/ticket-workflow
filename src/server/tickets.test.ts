@@ -1026,7 +1026,7 @@ describe('updateTicket — status-milestone telemetry', () => {
     await updateTicket(t.id, { status: 'in-progress' });
     const { events } = await readEvents(t.id);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ step: 'started', state: 'reached' });
+    expect(events[0]).toMatchObject({ step: 'started', state: 'reached', source: 'engine' });
   });
 
   it('maps qa and done transitions to their steps', async () => {
