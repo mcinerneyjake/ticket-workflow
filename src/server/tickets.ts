@@ -582,7 +582,7 @@ async function emitStatusStep(id: string, status: StatusId, detail?: string): Pr
   const step = STATUS_STEP[status];
   if (!step) return;
   try {
-    await appendEvent({ ticketId: id, step, state: 'reached', detail });
+    await appendEvent({ ticketId: id, step, state: 'reached', source: 'engine', detail });
   } catch (err) {
     log.error('[events] failed to record status step', err);
   }

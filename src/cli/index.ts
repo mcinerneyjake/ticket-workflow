@@ -66,8 +66,9 @@ export async function cmdShow(id: string): Promise<void> {
   for (const step of pipeline) {
     const glyph = GLYPH[step.state];
     const when = step.at ? `  (${step.at})` : '';
-    const measured = step.state === 'pending' ? '' : measurements(latest.get(step.step));
-    console.log(`  ${glyph} ${step.label}${when}${measured}`);
+    const e = step.state === 'pending' ? undefined : latest.get(step.step);
+    const via = e?.source ? `  via ${e.source}` : '';
+    console.log(`  ${glyph} ${step.label}${when}${via}${measurements(e)}`);
   }
   // Without this the pipeline above renders a discarded event as a never-run step — the exact
   // ambiguity the counts exist to remove. Returning them from readEvents does NOT force a caller

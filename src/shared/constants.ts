@@ -127,11 +127,21 @@ export const STATUS_STEP: Partial<Record<StatusId, StepId>> = {
   archived: 'archived',
 };
 
+// Which writer appended a row — a label the writer sets, not an attestation (tkt-5350b624e3cc).
+export const EVENT_SOURCES = ['engine', 'review', 'web', 'hook', 'gate'] as const;
+export type EventSourceId = (typeof EVENT_SOURCES)[number]
+
+export function isEventSource(val: unknown): val is EventSourceId {
+  return EVENT_SOURCES.find((s) => s === val) !== undefined;
+}
+
 export type TicketEvent = {
   ticketId: string
   step: StepId
   state: StepState
   at: string
+  /** Absent on rows written before tkt-5350b624e3cc. */
+  source?: EventSourceId
   detail?: string
   /** `'event'` when the writer derived `state` from an observed outcome — the delivered hook event, or
    *  the exit code `gate` read itself. Absent on rows written before tkt-31f693ac8bb0, whose state was

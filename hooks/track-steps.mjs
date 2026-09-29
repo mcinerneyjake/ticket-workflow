@@ -304,6 +304,9 @@ function eventsDir() {
   return path.join(root, 'events');
 }
 
+// Must stay in shared/constants EVENT_SOURCES, or every reader drops it; a parity test pins that.
+export const SOURCE = 'hook';
+
 function record(ticketId, step, state, at) {
   if (!ID_RE.test(ticketId)) return;
   const dir = eventsDir();
@@ -312,7 +315,7 @@ function record(ticketId, step, state, at) {
   // delivered event from the pre-fix rows that said `passed` regardless. A DATE cannot do it — the
   // writer is per-machine and unversioned, so a machine that never bumps its pin keeps writing
   // success-only rows that a cutover date would start trusting (tkt-31f693ac8bb0).
-  const line = `${JSON.stringify({ ticketId, step, state, at, outcomeFrom: 'event' })}\n`;
+  const line = `${JSON.stringify({ ticketId, step, state, at, source: SOURCE, outcomeFrom: 'event' })}\n`;
   appendFileSync(path.join(dir, `${ticketId}.jsonl`), line, { encoding: 'utf8', flag: 'a' });
 }
 

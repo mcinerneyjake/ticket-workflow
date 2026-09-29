@@ -28,7 +28,7 @@ async function seed(opts: {
   if (opts.project !== undefined) await updateTicket(t.id, { project: opts.project });
   if (opts.status) await updateTicket(t.id, { status: opts.status });
   for (const [step, state] of opts.steps ?? [])
-    await appendEvent({ ticketId: t.id, step, state, ...(opts.trusted === false ? {} : { outcomeFrom: 'event' as const }) });
+    await appendEvent({ ticketId: t.id, step, state, source: 'hook', ...(opts.trusted === false ? {} : { outcomeFrom: 'event' as const }) });
   return t.id;
 }
 
@@ -147,8 +147,8 @@ describe('reading the record', () => {
     // reducePipeline reverts a step whose latest event carries the cleared detail. Reading raw state
     // would report a step the board itself renders as pending.
     const id = await seed({ title: 'Cleared', status: 'done', summary: 'Tests: 2 added — x', steps: [['branch', 'passed']] });
-    await appendEvent({ ticketId: id, step: 'review', state: 'reached' });
-    await appendEvent({ ticketId: id, step: 'review', state: 'reached', detail: 'cleared' });
+    await appendEvent({ ticketId: id, step: 'review', state: 'reached', source: 'review' });
+    await appendEvent({ ticketId: id, step: 'review', state: 'reached', source: 'web', detail: 'cleared' });
     const { facts } = await gatherTicketFacts({ id });
     expect(facts[0].steps.review).toBeUndefined();
   });

@@ -789,6 +789,15 @@ describe('start_ticket', () => {
   });
 });
 
+describe('record_review', () => {
+  it('appends a review milestone sourced `review`, distinguishable from the hook-inferred one', async () => {
+    const t = await createTicket({ title: 'Reviewed', type: 'task' });
+    await handleToolCall('record_review', { id: t.id });
+    const { events } = await readEvents(t.id);
+    expect(events.map((e) => [e.step, e.state, e.source])).toEqual([['review', 'reached', 'review']]);
+  });
+});
+
 describe('archive_ticket', () => {
   it('archives an active ticket (happy path)', async () => {
     const id = await seed({ status: 'backlog' });

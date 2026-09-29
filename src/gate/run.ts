@@ -252,6 +252,7 @@ export async function runGate(opts: GateOptions): Promise<number> {
         ticketId: recording.ticketId,
         step,
         state,
+        source: 'gate',
         outcomeFrom: 'event',
         ...(result.startError === undefined ? { durationMs: Math.round(result.durationMs) } : {}),
         ...(result.exitCode !== null ? { exitCode: result.exitCode } : {}),

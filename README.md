@@ -253,6 +253,31 @@ Once any later event lands it is no longer last, and it is counted from then on.
 > counts as **required** fields — optional ones would let a consumer default them with
 > `?? 0` and report a damaged log as healthy.
 
+## Event sources
+
+Every event line names the writer that appended it in `source`:
+
+| `source` | writer | what its `state` rests on |
+|---|---|---|
+| `engine` | the service, on a status transition (`started`, `qa`, `done`, `archived`) | its own write |
+| `review` | the `record_review` tool | the caller's say-so |
+| `web` | a consumer's web UI, e.g. hardpack's review toggle (including its `cleared` un-review) | a human click |
+| `hook` | `track-steps`, from Bash command text — including the `review` it derives from a passing commit | the delivered hook event |
+| `gate` | `ticket-workflow gate` | the script's own exit code |
+
+A row with no `source` came from a writer that predates the field — not necessarily an old row: the
+`track-steps` hook is installed once per machine at its own pin, so a machine whose `~/.claude/tools`
+install was never bumped keeps writing sourceless rows. A reader passes a known value through and
+drops an unknown or non-string one **without** counting the line as `skipped` or `unrecognized`,
+because the milestone itself is still sound. `show` prints it as `via <source>` beside each step.
+
+`source` is a label the writer sets, not an authentication: anything that can append to `events/`
+can write any value. `verify`'s trust decision still keys on `outcomeFrom`.
+
+> **Breaking (`tkt-5350b624e3cc`):** `appendEvent()` requires `source` and answers 400 for a value outside
+> `EVENT_SOURCES`, writing nothing. A TypeScript caller that omits it no longer compiles; that is
+> deliberate, so no writer can go on appending unlabelled rows.
+
 ## Unassigned tickets
 
 A ticket with no `project` is absent from every project-filtered view, so a work

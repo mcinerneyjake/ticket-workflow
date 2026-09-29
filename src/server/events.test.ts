@@ -37,7 +37,7 @@ async function writeRaw(ticketId: string, lines: string[]) {
 
 describe('appendEvent', () => {
   it('appends a well-formed line and readEvents round-trips it', async () => {
-    await appendEvent({ ticketId: 'tkt-abc', step: 'typecheck', state: 'passed' });
+    await appendEvent({ ticketId: 'tkt-abc', step: 'typecheck', state: 'passed', source: 'hook' });
     const { events } = await readEvents('tkt-abc');
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ ticketId: 'tkt-abc', step: 'typecheck', state: 'passed' });
@@ -45,7 +45,7 @@ describe('appendEvent', () => {
   });
 
   it('preserves an explicit `at` and an optional `detail`', async () => {
-    await appendEvent({ ticketId: 'tkt-abc', step: 'lint', state: 'failed', at: '2026-07-01T00:00:00.000Z', detail: '2 errors' });
+    await appendEvent({ ticketId: 'tkt-abc', step: 'lint', state: 'failed', source: 'hook', at: '2026-07-01T00:00:00.000Z', detail: '2 errors' });
     const [e] = (await readEvents('tkt-abc')).events;
     expect(e).toMatchObject({ at: '2026-07-01T00:00:00.000Z', detail: '2 errors' });
   });
@@ -53,8 +53,8 @@ describe('appendEvent', () => {
   // Written by the hook for a failed chain it cannot attribute; a reader that counted it as
   // `unrecognized` would turn every such ticket's verify verdict into UNKNOWN (tkt-24925929919c).
   it('accepts the unattributed state, and the reducer surfaces it over an earlier pass', async () => {
-    await appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'passed' });
-    await appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'unattributed', outcomeFrom: 'event' });
+    await appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'passed', source: 'hook' });
+    await appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'unattributed', source: 'hook', outcomeFrom: 'event' });
     const out = await getTicketEvents('tkt-abc');
     expect(out.unrecognized).toBe(0);
     expect(out.skipped).toBe(0);
@@ -63,7 +63,7 @@ describe('appendEvent', () => {
 
   it('round-trips the gate measurements: exitCode, durationMs and test counts', async () => {
     await appendEvent({
-      ticketId: 'tkt-abc', step: 'test', state: 'failed', outcomeFrom: 'event',
+      ticketId: 'tkt-abc', step: 'test', state: 'failed', source: 'gate', outcomeFrom: 'event',
       exitCode: 1, durationMs: 4200, tests: { passed: 10, failed: 2, skipped: 1 },
     });
     const [e] = (await readEvents('tkt-abc')).events;
@@ -72,7 +72,7 @@ describe('appendEvent', () => {
 
   it('rejects a malformed measurement on write with 400, writing nothing', async () => {
     for (const bad of [{ exitCode: 1.5 }, { exitCode: Number.NaN }, { durationMs: -1 }, { durationMs: 2500.4 }, { tests: { passed: 1, failed: -1, skipped: 0 } }]) {
-      const err = await httpError(appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'passed', ...bad }));
+      const err = await httpError(appendEvent({ ticketId: 'tkt-abc', step: 'test', state: 'passed', source: 'hook', ...bad }));
       expect(err.status).toBe(400);
     }
     expect((await readEvents('tkt-abc')).events).toEqual([]);
@@ -93,24 +93,40 @@ describe('appendEvent', () => {
   });
 
   it('appends (never overwrites) across calls', async () => {
-    await appendEvent({ ticketId: 'tkt-abc', step: 'branch', state: 'passed' });
-    await appendEvent({ ticketId: 'tkt-abc', step: 'commit', state: 'passed' });
+    await appendEvent({ ticketId: 'tkt-abc', step: 'branch', state: 'passed', source: 'hook' });
+    await appendEvent({ ticketId: 'tkt-abc', step: 'commit', state: 'passed', source: 'hook' });
     expect((await readEvents('tkt-abc')).events).toHaveLength(2);
   });
 
   it('rejects an invalid step with 400', async () => {
-    const err = await httpError(appendEvent({ ticketId: 'tkt-abc', step: 'bogus', state: 'passed' }));
+    const err = await httpError(appendEvent({ ticketId: 'tkt-abc', step: 'bogus', state: 'passed', source: 'hook' }));
     expect(err.status).toBe(400);
   });
 
   it('rejects an invalid state with 400', async () => {
-    const err = await httpError(appendEvent({ ticketId: 'tkt-abc', step: 'lint', state: 'exploded' }));
+    const err = await httpError(appendEvent({ ticketId: 'tkt-abc', step: 'lint', state: 'exploded', source: 'hook' }));
     expect(err.status).toBe(400);
   });
 
   it('rejects a path-traversal id with 400 (never writes outside the events dir)', async () => {
-    const err = await httpError(appendEvent({ ticketId: '../escape', step: 'lint', state: 'passed' }));
+    const err = await httpError(appendEvent({ ticketId: '../escape', step: 'lint', state: 'passed', source: 'hook' }));
     expect(err.status).toBe(400);
+  });
+
+  it('persists the source on the written line and reads it back', async () => {
+    await appendEvent({ ticketId: 'tkt-abc', step: 'started', state: 'reached', source: 'engine' });
+    const raw = JSON.parse((await fs.readFile(path.join(tmpDir, 'tkt-abc.jsonl'), 'utf8')).trim());
+    expect(raw.source).toBe('engine');
+    expect((await readEvents('tkt-abc')).events[0]?.source).toBe('engine');
+  });
+
+  // The type forbids these; an untyped caller (the .mjs hook, a consumer's JS) can still send them.
+  it('rejects a source outside the vocabulary with 400, writing nothing', async () => {
+    for (const bad of JSON.parse('["bogus", "", null, 7]')) {
+      const err = await httpError(appendEvent({ ticketId: 'tkt-abc', step: 'lint', state: 'passed', source: bad }));
+      expect(err.status).toBe(400);
+    }
+    await expect(fs.access(path.join(tmpDir, 'tkt-abc.jsonl'))).rejects.toThrow();
   });
 });
 
@@ -202,11 +218,25 @@ describe('readEvents', () => {
       expect(skipped).toBe(0); // the load-bearing half: version skew must not read as damage
     });
 
+    // A newer writer may name a source this reader lacks; the milestone itself is still sound.
+    it('drops an unknown or non-string source without counting the line, and reads old rows sourceless', async () => {
+      await writeRaw('tkt-src', [
+        JSON.stringify({ ticketId: 'tkt-src', step: 'lint', state: 'passed', at: 'x', source: 'webhook' }),
+        JSON.stringify({ ticketId: 'tkt-src', step: 'test', state: 'passed', at: 'x', source: 3 }),
+        JSON.stringify({ ticketId: 'tkt-src', step: 'commit', state: 'passed', at: 'x' }),
+        JSON.stringify({ ticketId: 'tkt-src', step: 'branch', state: 'passed', at: 'x', source: 'hook' }),
+      ]);
+      const { events, skipped, unrecognized } = await readEvents('tkt-src');
+      expect([skipped, unrecognized]).toEqual([0, 0]);
+      expect(events.map((e) => e.source)).toEqual([undefined, undefined, undefined, 'hook']);
+      expect(events.slice(0, 3).every((e) => !('source' in e))).toBe(true);
+    });
+
     // The negative control. A counter wired to a constant, or incrementing unconditionally, passes
     // the tests above and fails this one.
     it('reports 0/0 for a clean log', async () => {
-      await appendEvent({ ticketId: 'tkt-clean', step: 'lint', state: 'passed' });
-      await appendEvent({ ticketId: 'tkt-clean', step: 'test', state: 'passed' });
+      await appendEvent({ ticketId: 'tkt-clean', step: 'lint', state: 'passed', source: 'hook' });
+      await appendEvent({ ticketId: 'tkt-clean', step: 'test', state: 'passed', source: 'hook' });
       const { events, skipped, unrecognized } = await readEvents('tkt-clean');
       expect(events).toHaveLength(2);
       expect(skipped).toBe(0);
@@ -296,7 +326,7 @@ describe('reducePipeline', () => {
 
 describe('getTicketEvents', () => {
   it('returns the raw events plus the reduced pipeline', async () => {
-    await appendEvent({ ticketId: 'tkt-abc', step: 'started', state: 'reached' });
+    await appendEvent({ ticketId: 'tkt-abc', step: 'started', state: 'reached', source: 'engine' });
     const out = await getTicketEvents('tkt-abc');
     expect(out.ticketId).toBe('tkt-abc');
     expect(out.events).toHaveLength(1);
@@ -320,7 +350,7 @@ describe('getTicketEvents', () => {
   });
 
   it('reports 0 skipped on a clean log', async () => {
-    await appendEvent({ ticketId: 'tkt-ok', step: 'started', state: 'reached' });
+    await appendEvent({ ticketId: 'tkt-ok', step: 'started', state: 'reached', source: 'engine' });
     expect((await getTicketEvents('tkt-ok')).skipped).toBe(0);
   });
 });
