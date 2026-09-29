@@ -210,6 +210,57 @@ describe('board resolution', () => {
   });
 });
 
+describe('hook liveness from the event log', () => {
+  const lastHook = async (rows: readonly Record<string, unknown>[]) => {
+    const events = path.join(root, 'events');
+    fs.mkdirSync(events, { recursive: true });
+    fs.writeFileSync(path.join(events, 'tkt-000000000001.jsonl'), rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const facts = await gatherFacts({ home, cwd: repo, env: { EVENTS_DIR_OVERRIDE: events }, probeMcpServer: false });
+    return facts.lastHookEventAt;
+  };
+
+  it('does not read a gate run as the hook being alive (tkt-b703d8c1249e)', async () => {
+    expect(
+      await lastHook([
+        { step: 'typecheck', at: '2026-08-15T00:00:00.000Z', source: 'gate' },
+        { step: 'test', at: '2026-08-15T00:01:00.000Z', source: 'gate' },
+      ]),
+    ).toBeNull();
+  });
+
+  it('keeps the hook row when a newer gate row sits beside it', async () => {
+    expect(
+      await lastHook([
+        { step: 'lint', at: '2026-08-14T00:00:00.000Z', source: 'hook' },
+        { step: 'lint', at: '2026-08-15T00:00:00.000Z', source: 'gate' },
+      ]),
+    ).toBe('2026-08-14T00:00:00.000Z');
+  });
+
+  it('takes the newest hook row across every ticket log, not the last file read', async () => {
+    const events = path.join(root, 'events');
+    fs.mkdirSync(events, { recursive: true });
+    const write = (id: string, row: Record<string, unknown>) =>
+      fs.writeFileSync(path.join(events, `${id}.jsonl`), JSON.stringify(row) + '\n');
+    write('tkt-000000000001', { step: 'commit', at: '2026-08-15T00:00:00.000Z', source: 'hook' });
+    write('tkt-000000000002', { step: 'commit', at: '2026-08-10T00:00:00.000Z', source: 'hook' });
+    write('tkt-000000000003', { step: 'test', at: '2026-08-15T12:00:00.000Z', source: 'gate' });
+    const facts = await gatherFacts({ home, cwd: repo, env: { EVENTS_DIR_OVERRIDE: events }, probeMcpServer: false });
+    expect(facts.lastHookEventAt).toBe('2026-08-15T00:00:00.000Z');
+  });
+
+  it('still counts a sourceless row, which a hook on an older pin writes', async () => {
+    expect(await lastHook([{ step: 'commit', at: '2026-08-13T00:00:00.000Z' }])).toBe('2026-08-13T00:00:00.000Z');
+  });
+
+  it.each([['engine'], ['review'], ['web'], ['some-future-writer'], [7], [null]])(
+    'does not count a row whose source is %j',
+    async (source) => {
+      expect(await lastHook([{ step: 'branch', at: '2026-08-15T00:00:00.000Z', source }])).toBeNull();
+    },
+  );
+});
+
 describe('probing the MCP server', () => {
   // A server that answers `initialize` and then exits immediately.
   //

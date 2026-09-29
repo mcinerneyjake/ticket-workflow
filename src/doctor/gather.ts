@@ -18,6 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { resolveBoardRoot } from '../paths.js';
+import type { EventSourceId } from '../shared/constants.js';
 import { HOOK_ONLY_STEPS, type DoctorFacts, type PostToolUseHook, type WiredHook } from './checks.js';
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -406,8 +407,10 @@ function git(args: string[], cwd: string): string | null {
 // Events
 // ---------------------------------------------------------------------------------------------
 
+const HOOK_SOURCE: EventSourceId = 'hook';
+
 /**
- * The newest event written by a step ONLY the hook can produce.
+ * The newest event the hook wrote: a hook-only step whose row names the hook or no writer at all.
  *
  * Reads the whole board's logs rather than one ticket's: liveness is a property of the machine's
  * writer, not of whatever ticket happens to be open.
@@ -432,6 +435,9 @@ async function lastHookEvent(eventsDir: string): Promise<string | null> {
       const rec = asRecord(readJsonText(line));
       if (!rec || typeof rec.step !== 'string' || typeof rec.at !== 'string') continue;
       if (!HOOK_ONLY_STEPS.some((s) => s === rec.step)) continue;
+      // Allowlist, not `!== 'gate'`: `gate` writes these steps too, and the next non-hook writer must
+      // not vouch for the hook either. Sourceless rows stay — a hook on an older pin writes them.
+      if (rec.source !== undefined && rec.source !== HOOK_SOURCE) continue;
       if (latest === null || rec.at > latest) latest = rec.at;
     }
   }
