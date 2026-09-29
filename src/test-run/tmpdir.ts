@@ -16,6 +16,8 @@ export interface PrepareOptions {
   readonly now: number;
   readonly tmpTtlMs: number;
   readonly log: (line: string) => void;
+  /** Run dirs of this process's live holds: our own pid always reads alive, so only the TTL would guard them. */
+  readonly keep?: ReadonlySet<string>;
 }
 
 export interface PreparedTmpDir {
@@ -37,7 +39,7 @@ function sweepSiblings(runRoot: string, own: string, opts: PrepareOptions): stri
   const removed: string[] = [];
   for (const name of readdirSync(runRoot)) {
     const full = path.join(runRoot, name);
-    if (full === own) continue;
+    if (full === own || opts.keep?.has(full) === true) continue;
     const m = RUN_NAME.exec(name);
     if (m === null) continue;
     const pid = Number(m[1]);
