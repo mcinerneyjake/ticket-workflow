@@ -483,6 +483,104 @@ describe('a hostile registerExit cannot cost the release', () => {
   });
 });
 
+// A throw after the slot is claimed must release it: the token is gone and the heartbeat keeps the
+// file fresh, so no other process could ever reclaim it (tkt-6503321ee9cd).
+describe('an acquire that fails after claiming gives the slot back', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('frees the slot and stops the heartbeat when registerExit throws', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    const h = harness({ registerExit: () => { throw new Error('registerExit blew up'); } });
+    await expect(holdTestRun(h.opts)).rejects.toThrow('registerExit blew up');
+    expect(readdirSync(h.stateDir)).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('frees the slot and unregisters the exit hook when log throws after registerExit succeeded', async () => {
+    const removed: Array<() => void> = [];
+    const h = harness({
+      registerExit: (fn) => () => removed.push(fn),
+      log: (l) => {
+        if (l.startsWith('[test-run] slot ')) throw new Error('log blew up');
+      },
+    });
+    await expect(holdTestRun(h.opts)).rejects.toThrow('log blew up');
+    expect(readdirSync(h.stateDir)).toEqual([]);
+    expect(removed).toHaveLength(1);
+  });
+
+  it('still throws the original error, restores TMPDIR, and fails the run loudly when the cleanup release itself throws', async () => {
+    const h = harness({}, { TMPDIR: '/outer/tmp' });
+    const opts: HoldTestRunOptions = {
+      ...h.opts,
+      registerExit: () => {
+        // A directory where the slot file was: releaseSlot's read fails with EISDIR, not ENOENT.
+        const file = path.join(h.stateDir, 'slot-0');
+        unlinkSync(file);
+        mkdirSync(file);
+        throw new Error('registerExit blew up');
+      },
+    };
+    await expect(holdTestRun(opts)).rejects.toThrow('registerExit blew up');
+    expect(h.exitCodes.length).toBeGreaterThan(0);
+    expect(h.exitCodes.every((c) => c === 1)).toBe(true);
+    expect(h.env.TMPDIR).toBe('/outer/tmp');
+    expect(h.log.some((l) => l.includes('could not release slot 0 after a failed acquire'))).toBe(true);
+  });
+
+  it('keeps the original error when the cleanup warning’s own log throws too', async () => {
+    const h = harness();
+    const opts: HoldTestRunOptions = {
+      ...h.opts,
+      log: (l) => {
+        if (l.includes('could not release slot')) throw new Error('log blew up');
+      },
+      registerExit: () => {
+        const file = path.join(h.stateDir, 'slot-0');
+        unlinkSync(file);
+        mkdirSync(file);
+        throw new Error('registerExit blew up');
+      },
+    };
+    await expect(holdTestRun(opts)).rejects.toThrow('registerExit blew up');
+  });
+
+  it('never frees a live sibling hold’s slot, nor takes its TMPDIR in a shared env', async () => {
+    const env: NodeJS.ProcessEnv = { TMPDIR: '/outer/tmp' };
+    const sibling = harness({ slots: 2 }, env);
+    const held = await holdTestRun(sibling.opts);
+    const broken = harness({ slots: 2, stateDir: sibling.stateDir, tmpRoot: sibling.tmpRoot, registerExit: () => { throw new Error('registerExit blew up'); } }, env);
+    await expect(holdTestRun(broken.opts)).rejects.toThrow('registerExit blew up');
+    expect(readdirSync(sibling.stateDir)).toEqual(['slot-0']);
+    expect(env.TMPDIR).toBe(held.kind === 'held' ? held.tmpDir : '');
+    await releaseTestRun(sibling.registry);
+    expect(readdirSync(sibling.stateDir)).toEqual([]);
+    expect(env.TMPDIR).toBe('/outer/tmp');
+  });
+
+  it('lets a watch re-run re-acquire, holding exactly one slot', async () => {
+    let fail = true;
+    const h = harness({
+      slots: 2,
+      registerExit: (fn) => {
+        if (fail) throw new Error('registerExit blew up');
+        h.exitHooks.push(fn);
+      },
+    });
+    await expect(holdTestRun(h.opts)).rejects.toThrow('registerExit blew up');
+    // Freed at the failure, not merely self-reclaimed by the re-run, which would mask the leak.
+    expect(readdirSync(h.stateDir)).toEqual([]);
+    fail = false;
+    expect((await holdTestRun(h.opts)).kind).toBe('held');
+    expect(readdirSync(h.stateDir)).toHaveLength(1);
+    expect(h.log.some((l) => l.includes('our own orphaned slot'))).toBe(false);
+    await releaseTestRun(h.registry);
+    expect(readdirSync(h.stateDir)).toEqual([]);
+  });
+});
+
 // Two live holds in one process (tkt-a99209bedbb9). `registry` is public API and the config and
 // globalSetup load through different module registries, so "one hold per process" was an assumption
 // the reclaim branch relied on and nothing enforced.
