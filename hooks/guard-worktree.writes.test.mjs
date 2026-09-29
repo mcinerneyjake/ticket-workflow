@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll } from 'vitest';
+import { mkdirSync } from 'node:fs';
+import path from 'node:path';
 import { decide } from './guard-worktree.mjs';
 import { buildFixtures, realKind, SID, TICKET } from '../src/test-support/guardWorktreeFixtures.mjs';
 
@@ -6,12 +8,20 @@ import { buildFixtures, realKind, SID, TICKET } from '../src/test-support/guardW
 // guard-worktree.test.mjs they pushed that file's first process spawn past testTimeout.
 
 let fx;
+let env;
 beforeAll(() => {
   fx = buildFixtures();
+  const home = path.join(fx.plain, 'home');
+  const tmp = path.join(fx.plain, 'tmp');
+  mkdirSync(home);
+  mkdirSync(tmp);
+  // Pinned for every case: CI's runner has no TMPDIR, so an unpinned $TMPDIR case passed locally only.
+  // Distinct dirs, so expanding one variable with the other's value cannot pass.
+  env = { ...process.env, HOME: home, TMPDIR: tmp };
 });
 
 const running = (command, cwd) => ({ session_id: SID, tool_name: 'Bash', tool_input: { command }, cwd });
-const verdict = (payload) => decide(payload, { ticket: TICKET, kindOf: realKind });
+const verdict = (payload, opts = {}) => decide(payload, { ticket: TICKET, kindOf: realKind, env, ...opts });
 
 describe('bash: non-git writes judged by where they land (tkt-12cbf1b396aa)', () => {
   const into = (rest) => () => `cd ${fx.primary} && ${rest}`;
@@ -251,6 +261,22 @@ describe('bash: non-git writes judged by where they land (tkt-12cbf1b396aa)', ()
       ['tee under ${TMPDIR}', () => 'node x.mjs | tee "${TMPDIR}/log"'],
     ])('allows from a session sitting in the primary: %s', (_label, command) => {
       expect(verdict(running(command(), fx.primary)).blocked).toBe(false);
+    });
+
+    it.each([
+      ['TMPDIR', () => 'echo x > "$TMPDIR/out.json"'],
+      ['HOME', () => 'node x.mjs > $HOME/x.json'],
+    ])('blocks from a worktree when $%s expands into the primary', (name, command) => {
+      const into = { env: { ...env, [name]: fx.primary } };
+      expect(verdict(running(command(), fx.linked), into).blocked).toBe(true);
+    });
+
+    it.each([
+      ['blocks in the primary', () => fx.primary, true],
+      ['allows in a worktree', () => fx.linked, false],
+    ])('with no TMPDIR to expand, a $TMPDIR redirect is judged at the cwd: %s', (_label, cwd, blocked) => {
+      const bare = { env: { ...env, TMPDIR: undefined } };
+      expect(verdict(running('echo x > "$TMPDIR/out.json"', cwd()), bare).blocked).toBe(blocked);
     });
 
     it('does not trust $TMPDIR once the command reassigns it', () => {
