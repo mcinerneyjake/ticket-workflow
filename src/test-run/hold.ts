@@ -307,9 +307,23 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
     // token goes with it, so a slot file linked before the throw is reclaimable rather than wedged
     // behind a token no Held will ever release.
     heldTokens().delete(token);
-    // A dead entry would never let its stack empty, so TMPDIR could never return to the original.
-    if (pushed !== null) popTmpDir(pushed);
-    if (runDir !== null) removeRunTmpDir(runDir);
+    // Past the claim a Held exists, and only a full release stops its heartbeat keeping the slot
+    // fresh for other processes forever (tkt-6503321ee9cd). It removes the run dir too.
+    if (pushed !== null) {
+      try {
+        releaseHeld(pushed);
+      } catch (releaseErr) {
+        // The original error is the one to report; a leaked slot still fails the run, and says so.
+        setExitCode(1);
+        try {
+          log(`[test-run] WARNING: could not release slot ${pushed.slot} after a failed acquire: ${releaseErr instanceof Error ? releaseErr.message : String(releaseErr)}`);
+        } catch {
+          // A throwing consumer log must not replace the original error either.
+        }
+      }
+    } else if (runDir !== null) {
+      removeRunTmpDir(runDir);
+    }
     if (err instanceof TestRunRefusal) setExitCode(err.code);
     throw err;
   }
