@@ -54,6 +54,12 @@ const PROBES = {
     payload: { tool_name: 'mcp__kanban__create_ticket', tool_input: { title: 'x' } },
     check: (r) => expect(r.status, r.stderr).toBe(2),
   }),
+  // Drives the SHAPE predicate, which needs no board env — an empty payload exits 0 here, and a
+  // root-predicate probe would additionally depend on this process's cwd.
+  'guard-board-writes.mjs': () => ({
+    payload: { tool_name: 'Write', tool_input: { file_path: `/elsewhere/tickets/${TICKET}.md` } },
+    check: (r) => expect(r.status, r.stderr).toBe(2),
+  }),
   'guard-review-target.mjs': () => ({
     payload: {}, // decide() fails closed on a payload carrying no command name
     check: (r) => expect(r.status, r.stderr).toBe(2),

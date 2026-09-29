@@ -1,11 +1,14 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
-  STEPS,
+  PIPELINE_STEPS,
   isStepId,
   isStepState,
+  isEventSource,
+  type EventSourceId,
   type StepId,
   type TicketEvent,
+  type TestCounts,
   type PipelineStep,
   type TicketEventsResponse,
 } from '../shared/constants.js';
@@ -39,21 +42,36 @@ export async function appendEvent(event: {
   step: string
   state: string
   at?: string
+  source: EventSourceId
   detail?: string
-  /** Only a writer that derived `state` from a delivered hook event may set this; `verify` reads it
-   *  as provenance. The service's own status milestones carry no outcome and must leave it unset. */
+  /** Only a writer that derived `state` from an observed outcome (hook event, or `gate`'s own exit
+   *  code) may set this; `verify` reads it as provenance. Status milestones leave it unset. */
   outcomeFrom?: 'event'
+  exitCode?: number
+  durationMs?: number
+  tests?: TestCounts
 }): Promise<void> {
   const file = eventsPath(event.ticketId);
   if (!isStepId(event.step)) throw new HttpError(400, `Invalid step: ${event.step}`);
   if (!isStepState(event.state)) throw new HttpError(400, `Invalid state: ${event.state}`);
+  if (!isEventSource(event.source)) throw new HttpError(400, `Invalid source: ${String(event.source)}`);
+  // Rejected here because the reader drops a bad measurement silently, so a writer bug would
+  // otherwise surface as a healthy log that simply lacks the numbers.
+  if (event.exitCode !== undefined && !Number.isInteger(event.exitCode)) throw new HttpError(400, `Invalid exitCode: ${event.exitCode}`);
+  if (event.durationMs !== undefined && !isCount(event.durationMs)) throw new HttpError(400, `Invalid durationMs: ${event.durationMs}`);
+  const tests = event.tests === undefined ? null : asTestCounts(event.tests);
+  if (event.tests !== undefined && tests === null) throw new HttpError(400, 'Invalid tests counts');
   const record: TicketEvent = {
     ticketId: event.ticketId,
     step: event.step,
     state: event.state,
     at: event.at ?? new Date().toISOString(),
+    source: event.source,
     ...(event.detail ? { detail: event.detail } : {}),
     ...(event.outcomeFrom === 'event' ? { outcomeFrom: 'event' as const } : {}),
+    ...(event.exitCode !== undefined ? { exitCode: event.exitCode } : {}),
+    ...(event.durationMs !== undefined ? { durationMs: event.durationMs } : {}),
+    ...(tests ? { tests } : {}),
   };
   await fs.mkdir(getEventsDir(), { recursive: true });
   // flag 'a' = O_APPEND: line-atomic across the two writer processes.
@@ -61,12 +79,26 @@ export async function appendEvent(event: {
 }
 
 // A JSONL line with keys present but not type-checked; in-narrowed, no cast.
-type RawEvent = { ticketId: unknown; step: unknown; state: unknown; at: unknown; detail?: unknown; outcomeFrom?: unknown }
+type RawEvent = {
+  ticketId: unknown; step: unknown; state: unknown; at: unknown
+  source?: unknown; detail?: unknown; outcomeFrom?: unknown; exitCode?: unknown; durationMs?: unknown; tests?: unknown
+}
 
 function asRawEvent(v: unknown): RawEvent | null {
   if (typeof v !== 'object' || v === null) return null;
   if (!('ticketId' in v) || !('step' in v) || !('state' in v) || !('at' in v)) return null;
   return v;
+}
+
+const isCount = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+
+// The gate's measurements are optional extras: a bad one is dropped, never a reason to call the
+// milestone itself malformed, which would under-count a log whose step/state are sound.
+function asTestCounts(v: unknown): TestCounts | null {
+  if (typeof v !== 'object' || v === null) return null;
+  if (!('passed' in v) || !('failed' in v) || !('skipped' in v)) return null;
+  const { passed, failed, skipped } = v;
+  return isCount(passed) && isCount(failed) && isCount(skipped) ? { passed, failed, skipped } : null;
 }
 
 // Two ways a line fails, and conflating them makes the count lie. `malformed` is data loss — the
@@ -91,6 +123,7 @@ function parseEventLine(line: string): ParsedLine {
   if (typeof raw.step !== 'string' || typeof raw.state !== 'string') return { ok: false, reason: 'malformed' };
   // Shape is sound; only the vocabulary is unknown.
   if (!isStepId(raw.step) || !isStepState(raw.state)) return { ok: false, reason: 'unrecognized' };
+  const tests = asTestCounts(raw.tests);
   return {
     ok: true,
     event: {
@@ -98,11 +131,16 @@ function parseEventLine(line: string): ParsedLine {
       step: raw.step,
       state: raw.state,
       at: raw.at,
+      // Dropped, never a skip: a writer newer than this reader may name a source it lacks.
+      ...(isEventSource(raw.source) ? { source: raw.source } : {}),
       ...(typeof raw.detail === 'string' ? { detail: raw.detail } : {}),
       // Whitelisted through deliberately: this is what lets `verify` tell a row whose state was
       // derived from the delivered event from a pre-fix row that said `passed` regardless. Any
       // other value is dropped, so a forged or unknown marker reads as absent — untrusted.
       ...(raw.outcomeFrom === 'event' ? { outcomeFrom: 'event' as const } : {}),
+      ...(typeof raw.exitCode === 'number' && Number.isInteger(raw.exitCode) ? { exitCode: raw.exitCode } : {}),
+      ...(isCount(raw.durationMs) ? { durationMs: raw.durationMs } : {}),
+      ...(tests ? { tests } : {}),
     },
   };
 }
@@ -167,7 +205,7 @@ export const REVIEW_CLEARED = 'cleared';
 export function reducePipeline(events: TicketEvent[]): PipelineStep[] {
   const latest = new Map<StepId, TicketEvent>();
   for (const e of events) latest.set(e.step, e);
-  return STEPS.map((s) => {
+  return PIPELINE_STEPS.map((s) => {
     const e = latest.get(s.id);
     const active = e && e.detail !== REVIEW_CLEARED ? e : undefined;
     return {

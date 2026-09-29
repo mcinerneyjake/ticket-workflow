@@ -85,7 +85,7 @@ export type PriorityCount = { priority: Priority; count: number }
 
 // --- Workflow-step telemetry ----------------------------------------------
 // Ordered milestones a ticket passes through. Shared so emitters + reader can't drift (tkt-512f9b15ddb8).
-// Split: started/qa/done are STATUS transitions (updateTicket); the rest are shell commands (PostToolUse hook).
+// Split: started/qa/done/archived are STATUS transitions (updateTicket, archive sweep); the rest are shell commands (PostToolUse hook).
 
 export const STEPS = [
   { id: 'started', label: 'Started' },
@@ -98,9 +98,14 @@ export const STEPS = [
   { id: 'pr_opened', label: 'PR opened' },
   { id: 'qa', label: 'QA' },
   { id: 'done', label: 'Done' },
+  { id: 'archived', label: 'Archived' },
 ] as const;
 
 export const STEP_IDS = STEPS.map((s) => s.id);
+
+// The rendered stages. `archived` is a logged end state, not a stage: as a node it would trail every
+// live ticket as pending and stay reached after an un-archive (tkt-9e662d918959).
+export const PIPELINE_STEPS = STEPS.filter((s) => s.id !== 'archived');
 export type StepId = (typeof STEPS)[number]['id']
 
 // The ticket-id shape embedded in a <type>/<id>-<slug> branch name — the single
@@ -118,19 +123,36 @@ export const STATUS_STEP: Partial<Record<StatusId, StepId>> = {
   'in-progress': 'started',
   qa: 'qa',
   done: 'done',
+  // Its own step, never `done`: archive_ticket retires abandoned work too (tkt-9e662d918959).
+  archived: 'archived',
 };
+
+// Which writer appended a row — a label the writer sets, not an attestation (tkt-5350b624e3cc).
+export const EVENT_SOURCES = ['engine', 'review', 'web', 'hook', 'gate'] as const;
+export type EventSourceId = (typeof EVENT_SOURCES)[number]
+
+export function isEventSource(val: unknown): val is EventSourceId {
+  return EVENT_SOURCES.find((s) => s === val) !== undefined;
+}
 
 export type TicketEvent = {
   ticketId: string
   step: StepId
   state: StepState
   at: string
+  /** Absent on rows written before tkt-5350b624e3cc. */
+  source?: EventSourceId
   detail?: string
-  /** `'event'` when the writer derived `state` from the delivered hook event. Absent on rows written
-   *  before tkt-31f693ac8bb0, whose state was `passed` regardless of how the command went, and on
-   *  service-written status milestones, which carry no outcome at all. */
+  /** `'event'` when the writer derived `state` from an observed outcome — the delivered hook event, or
+   *  the exit code `gate` read itself. Absent on rows written before tkt-31f693ac8bb0, whose state was
+   *  `passed` regardless of how the command went, and on service-written status milestones. */
   outcomeFrom?: 'event'
+  exitCode?: number
+  durationMs?: number
+  tests?: TestCounts
 }
+
+export type TestCounts = { passed: number; failed: number; skipped: number }
 
 // A reduced pipeline node: latest state per step, or pending if none arrived.
 export type PipelineStep = {

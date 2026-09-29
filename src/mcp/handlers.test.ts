@@ -4,6 +4,7 @@ import path from 'node:path';
 import { handleToolCall, TOOLS } from './handlers.js';
 import { CREATE_STATUS_ENUM, UPDATE_STATUS_ENUM } from '../server/validation.js';
 import { createTicket, updateTicket, listTickets, getTicket } from '../server/tickets.js';
+import { readEvents } from '../server/events.js';
 import { STATUS_IDS, type StatusId } from '../shared/constants.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 import { setLogger } from '../logger.js';
@@ -788,6 +789,15 @@ describe('start_ticket', () => {
   });
 });
 
+describe('record_review', () => {
+  it('appends a review milestone sourced `review`, distinguishable from the hook-inferred one', async () => {
+    const t = await createTicket({ title: 'Reviewed', type: 'task' });
+    await handleToolCall('record_review', { id: t.id });
+    const { events } = await readEvents(t.id);
+    expect(events.map((e) => [e.step, e.state, e.source])).toEqual([['review', 'reached', 'review']]);
+  });
+});
+
 describe('archive_ticket', () => {
   it('archives an active ticket (happy path)', async () => {
     const id = await seed({ status: 'backlog' });
@@ -820,15 +830,17 @@ describe('archive_ticket', () => {
     expect((await fs.stat(file, { bigint: true })).mtimeNs).toBe(before.mtimeNs);
   });
 
-  it('records no pipeline milestone — archived is deliberately unmapped in STATUS_STEP', async () => {
+  it('records an archived milestone, never done — archiving is not completion (tkt-9e662d918959)', async () => {
     const id = await seed();
     await updateTicket(id, { status: 'in-progress' }); // emits the `started` milestone
-    const file = path.join(dirs.events, `${id}.jsonl`);
-    const before = await fs.readFile(file, 'utf8');
     await handleToolCall('archive_ticket', { id });
-    // STATUS_STEP is a Partial<Record<StatusId, StepId>>, so mapping `archived` is a one-line change
-    // away; without this assertion it would silently start counting abandoned work as reaching done.
-    expect(await fs.readFile(file, 'utf8')).toBe(before);
+    // An abandoned ticket must not read as having reached done, the concern this test pinned since #22.
+    expect((await readEvents(id)).events.map((e) => [e.step, e.state, e.detail])).toEqual([
+      ['started', 'reached', undefined],
+      ['archived', 'reached', 'from in-progress'],
+    ]);
+    await handleToolCall('archive_ticket', { id }); // no-op re-archive appends nothing
+    expect((await readEvents(id)).events).toHaveLength(2);
   });
 
   it('is the ONLY archive path — update_ticket rejects status archived at runtime (not just in the schema)', async () => {

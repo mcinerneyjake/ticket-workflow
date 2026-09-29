@@ -56,7 +56,7 @@ describe('step attribution', () => {
   });
 
   it('derives the service-written steps from the status mapping rather than a literal', () => {
-    expect([...SERVICE_WRITTEN_STEPS].sort()).toEqual(['done', 'qa', 'started']);
+    expect([...SERVICE_WRITTEN_STEPS].sort()).toEqual(['archived', 'done', 'qa', 'started']);
   });
 
   it('partitions every step exactly once, so a new step id cannot fall through unclassified', () => {

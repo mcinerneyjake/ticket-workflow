@@ -1,6 +1,6 @@
 {
   "name": "ticket-workflow",
-  "version": "0.29.3",
+  "version": "0.30.0",
   "description": "Local-first, per-repo ticket board + git/PR pipeline: an MCP server, guard/telemetry Bash hooks, and a pipeline CLI. Decoupled — each repo owns its own tickets/ + events/.",
   "license": "MIT",
   "author": "Jake McInerney",
@@ -25,6 +25,7 @@
       "default": "./dist/test-run/index.js"
     },
     "./hooks/guard-bash.mjs": "./hooks/guard-bash.mjs",
+    "./hooks/guard-board-writes.mjs": "./hooks/guard-board-writes.mjs",
     "./hooks/guard-review-target.mjs": "./hooks/guard-review-target.mjs",
     "./hooks/guard-subagent-gates.mjs": "./hooks/guard-subagent-gates.mjs",
     "./hooks/guard-ticket.mjs": "./hooks/guard-ticket.mjs",
@@ -41,6 +42,7 @@
     "hooks/lib/shell.mjs",
     "hooks/lib/worktree.mjs",
     "hooks/guard-bash.mjs",
+    "hooks/guard-board-writes.mjs",
     "hooks/guard-review-target.mjs",
     "hooks/guard-subagent-gates.mjs",
     "hooks/guard-ticket.mjs",

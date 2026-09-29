@@ -218,10 +218,21 @@ export function historyDir(id: string): string {
   return path.join(getTicketsDir(), '.history', id);
 }
 
-// Timestamp + random suffix: sequential same-millisecond writes under the per-id lock could
-// otherwise collide on the filename.
-function snapshotName(): string {
-  return `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}.md`;
+// history.ts sorts names lexically, so a stamp must sort after the newest one on disk (tkt-fb4cf9f6296d).
+// Still tie-prone: two processes, or restore's unlocked snapshotTicketState, in one millisecond.
+const SNAPSHOT_STAMP = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z-/;
+const MAX_ISO_MS = Date.parse('9999-12-31T23:59:59.999Z');
+async function snapshotName(dir: string): Promise<string> {
+  // Unreadable listing: keep the snapshot and give up strict ordering, rather than lose the undo.
+  const names = await fs.readdir(dir).catch((err: unknown) => {
+    log.warn(`[history] could not list ${dir}; snapshot order may tie:`, err instanceof Error ? err.message : err);
+    return [];
+  });
+  const newest = names.filter((n) => SNAPSHOT_STAMP.test(n)).reduce((a, b) => (b > a ? b : a), '');
+  const m = SNAPSHOT_STAMP.exec(newest);
+  const after = m ? Date.parse(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`) + 1 : NaN;
+  const ms = after <= MAX_ISO_MS && after > Date.now() ? after : Date.now();
+  return `${new Date(ms).toISOString().replace(/[:.]/g, '-')}-${randomUUID().slice(0, 8)}.md`;
 }
 
 // Backup-on-write undo (tkt-18d53c0c7cd8): before updateTicket overwrites a body,
@@ -237,7 +248,7 @@ async function snapshotHistory(id: string, contents: string | Buffer): Promise<v
   try {
     const dir = historyDir(id);
     await fs.mkdir(dir, { recursive: true });
-    await atomicWrite(path.join(dir, snapshotName()), contents);
+    await atomicWrite(path.join(dir, await snapshotName(dir)), contents);
   } catch (err) {
     log.error(`[history] failed to snapshot prior body for ${id} before overwrite:`, err);
   }
@@ -427,7 +438,7 @@ export async function snapshotTicketState(id: string): Promise<void> {
   try {
     const dir = historyDir(id);
     await fs.mkdir(dir, { recursive: true });
-    await atomicWrite(path.join(dir, snapshotName()), serialize(existing));
+    await atomicWrite(path.join(dir, await snapshotName(dir)), serialize(existing));
   } catch (err) {
     log.error(`[history] could not snapshot ${id} before a restore:`, err);
     throw new HttpError(500, `Refusing to restore ${id}: could not snapshot its current state first (${errnoCode(err) ?? 'unknown error'}). Nothing was written.`);
@@ -567,11 +578,11 @@ function collectDescendants(id: string, all: ParsedTicket[]): Set<string> {
 // Best-effort telemetry: a transition into a tracked milestone records a 'reached'
 // event. Single choke point for MCP + HTTP; a telemetry failure must never break
 // the write (swallowed).
-async function emitStatusStep(id: string, status: StatusId): Promise<void> {
+async function emitStatusStep(id: string, status: StatusId, detail?: string): Promise<void> {
   const step = STATUS_STEP[status];
   if (!step) return;
   try {
-    await appendEvent({ ticketId: id, step, state: 'reached' });
+    await appendEvent({ ticketId: id, step, state: 'reached', source: 'engine', detail });
   } catch (err) {
     log.error('[events] failed to record status step', err);
   }
@@ -738,7 +749,10 @@ async function updateTicketLocked(id: string, patch: TicketPatch, provenance?: P
   await writeTicket(merged);
   // Emit only on a real status change — body/priority/reorder patches must not record a milestone.
   // A repair emits nothing: the file's prior column is unknown, so no transition can be claimed.
-  if (merged.status !== existing.status) await emitStatusStep(id, merged.status);
+  if (merged.status !== existing.status) {
+    // archive_ticket accepts any status, so the prior one is what tells retired work from abandoned.
+    await emitStatusStep(id, merged.status, merged.status === 'archived' ? `from ${existing.status}` : undefined);
+  }
   return merged;
 }
 
@@ -765,6 +779,8 @@ export async function archiveStaleTickets(): Promise<number> {
     });
     if (!cur || cur.status !== 'done') return;
     await writeTicket({ ...cur, status: 'archived', updated: archived });
+    // Only a done ticket reaches this line, so the row doubles as evidence the ticket was done.
+    await emitStatusStep(cur.id, 'archived', 'from done');
     count += 1;
   })));
   log.info(`[archive] Archived ${count} stale ticket(s)`);
@@ -834,10 +850,10 @@ export async function summarizeBoard(project: string | null = null): Promise<Das
 // corrupt ticket impossible to remove. Bytes, not a string, so a file holding invalid UTF-8
 // round-trips through delete → undelete unchanged instead of being rewritten with U+FFFD.
 async function recordDeletion(id: string, raw: Buffer, edges: StrippedEdge[]): Promise<void> {
-  const snapshot = snapshotName();
   try {
     const dir = historyDir(id);
     await fs.mkdir(dir, { recursive: true });
+    const snapshot = await snapshotName(dir);
     await atomicWrite(path.join(dir, snapshot), raw);
     const record: DeleteRecord = { id, deletedAt: new Date().toISOString(), snapshot, edges };
     await atomicWrite(path.join(dir, DELETE_RECORD_FILE), `${JSON.stringify(record, null, 2)}\n`);

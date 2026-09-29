@@ -42,7 +42,30 @@ It ships three pieces:
   `events/` under the other repo's ticket id, where nothing joins to it;
   and an opt-in `PreToolUse` guard (`guard-ticket.mjs`) that blocks
   `create_ticket` so new tickets are authored by a metered local-LLM intake
-  agent instead of by the model driving the session; and a `SessionStart`
+  agent instead of by the model driving the session; and an opt-in `PreToolUse`
+  guard (`guard-board-writes.mjs`) that refuses an `Edit`/`Write`/`NotebookEdit`
+  aimed at a board's own ticket or event file, so board data is written through
+  `update_ticket` rather than edited as text. It blocks on either of two
+  independent tests — a `tkt-<12 hex>.md` directly inside a `tickets/` directory
+  (or a `tkt-<12 hex>.jsonl` inside `events/`), which needs no environment and so
+  catches an absolute write from a session rooted in another repo; or any path
+  inside the board dirs this package resolves
+  (`TICKETS_DIR_OVERRIDE`/`EVENTS_DIR_OVERRIDE`, else `BOARD_DIR_OVERRIDE` /
+  `CLAUDE_PROJECT_DIR` / cwd), which catches a non-ticket name — and the
+  `tickets/.history/` snapshots — sitting in a real board. Case is folded on both,
+  because a case-insensitive filesystem makes `Tickets/` the same file. The second
+  test fires only where the board is **declared** by an explicit override or
+  **evidenced** by the directory actually holding a `tkt-` file: keying it on the
+  bare `CLAUDE_PROJECT_DIR` fallback, which is set in every session, refused every
+  edit into any repo whose `tickets/` is ordinary documentation. Where a session
+  has called `start_ticket`, `guard-worktree` already refuses writes into a
+  repository's primary checkout, which covers a board that lives in one — not a
+  board reached by `BOARD_DIR_OVERRIDE` into a directory that is not a primary
+  checkout, and not a session that never claimed a ticket, which is what this
+  guard is for. It guards the **tool**: a shell write (`sed -i`, `>`, a heredoc)
+  reaches no `PreToolUse` Edit/Write hook and is not covered by this or any other
+  guard here, and a non-`tkt-`-named file in a board *other* than the one the
+  environment resolves is reachable by neither test; and a `SessionStart`
   **staleness warning**
   (`warn-stale-worktree.mjs`) that reports when the session opened in a git
   worktree whose `CLAUDE.md` / `AGENTS.md` / `.cursorrules` has since changed on
@@ -83,7 +106,8 @@ It ships three pieces:
   PRs are read, so an older merge reads as unmerged; the check runs before
   the command, so a compound command that writes a file and then restores it
   in one line is not protected; and sessions armed before this release keep
-  a single-ticket marker and never reach this state. Wire `guard-ticket` and
+  a single-ticket marker and never reach this state. Wire `guard-ticket`,
+  `guard-board-writes` and
   the `guard-worktree` pair only if you want those policies — the others suit
   any consumer.
 - **CLI viewer** (`ticket-workflow`) — `list` and `show <id>`, rendering a
@@ -91,6 +115,12 @@ It ships three pieces:
 
 The pipeline a ticket flows through:
 **Started · Branch · Typecheck · Lint · Tests · Review · Commit · PR · QA · Done.**
+
+Archiving logs an `archived` event, never `done`, since `archive_ticket` also retires abandoned
+work. The row's detail names the prior status (`from done`, `from todo`, …), which is how retired
+work is told from abandoned. `archiveStaleTickets` archives only `done` tickets, so its rows always
+read `from done`. `archived` is an end state rather than a stage, so it is absent from the rendered
+pipeline (`PIPELINE_STEPS`) and appears only in the event log.
 
 ## Board location
 
@@ -222,6 +252,31 @@ Once any later event lands it is no longer last, and it is counted from then on.
 > returns `{ events, skipped, unrecognized }`, and `TicketEventsResponse` gained both
 > counts as **required** fields — optional ones would let a consumer default them with
 > `?? 0` and report a damaged log as healthy.
+
+## Event sources
+
+Every event line names the writer that appended it in `source`:
+
+| `source` | writer | what its `state` rests on |
+|---|---|---|
+| `engine` | the service, on a status transition (`started`, `qa`, `done`, `archived`) | its own write |
+| `review` | the `record_review` tool | the caller's say-so |
+| `web` | a consumer's web UI, e.g. hardpack's review toggle (including its `cleared` un-review) | a human click |
+| `hook` | `track-steps`, from Bash command text — including the `review` it derives from a passing commit | the delivered hook event |
+| `gate` | `ticket-workflow gate` | the script's own exit code |
+
+A row with no `source` came from a writer that predates the field — not necessarily an old row: the
+`track-steps` hook is installed once per machine at its own pin, so a machine whose `~/.claude/tools`
+install was never bumped keeps writing sourceless rows. A reader passes a known value through and
+drops an unknown or non-string one **without** counting the line as `skipped` or `unrecognized`,
+because the milestone itself is still sound. `show` prints it as `via <source>` beside each step.
+
+`source` is a label the writer sets, not an authentication: anything that can append to `events/`
+can write any value. `verify`'s trust decision still keys on `outcomeFrom`.
+
+> **Breaking (`tkt-5350b624e3cc`):** `appendEvent()` requires `source` and answers 400 for a value outside
+> `EVENT_SOURCES`, writing nothing. A TypeScript caller that omits it no longer compiles; that is
+> deliberate, so no writer can go on appending unlabelled rows.
 
 ## Unassigned tickets
 
@@ -369,6 +424,7 @@ nothing to block and must not wedge the session — but note it exits **1, not 0
 |---|---|---|
 | `guard-bash` | `PreToolUse` | **closed** (exit 2) |
 | `guard-ticket` | `PreToolUse` | **closed** (exit 2) |
+| `guard-board-writes` | `PreToolUse` | **closed** (exit 2) |
 | `guard-review-target` | `UserPromptExpansion` | **closed** (exit 2) |
 | `guard-subagent-gates` | `PreToolUse` | **closed** (exit 2) |
 | `guard-worktree` | `PreToolUse` | **closed** (exit 2) |
@@ -394,7 +450,11 @@ Two honest limits on that table:
   returns true on any error, and an unreadable directory falls back to the *session* repo's branch,
   which can block a commit that was never going near a protected branch. Check the code.
   `guard-ticket` and `guard-review-target` do fail closed
-  internally. `guard-subagent-gates` is split: it fails **closed** when it knows the rule applies (a
+  internally. `guard-board-writes` is split, and in the same direction as the precheck it sits beside:
+  **closed** on a payload it cannot parse, but **allowing** a payload that parsed and named no path at
+  all, because that matcher covers every edit on the machine and an unattributable payload shape is
+  not worth wedging them over. That second case is a residual, not a guarantee.
+  `guard-subagent-gates` is split: it fails **closed** when it knows the rule applies (a
   subagent whose command it cannot read) and **exits 1** when it cannot even establish that (an
   unparseable payload) — blocking there would wedge every main-thread command over a case the rule
   never covers, so it is loud rather than silent.
@@ -599,6 +659,57 @@ reaches for `git add -A` and commits another session's in-flight work. The check
 ignore effect in a scratch repository holding only this repo's committed ignore files, so neither
 your global ignore file nor a directory already on disk can change the verdict.
 
+## `gate` — run the quality gate and record what it did
+
+```bash
+npx ticket-workflow gate
+```
+
+Runs the repo's `typecheck`, `lint` and `test` scripts in that order and appends one event per
+script to the ticket named by the current branch. Each event carries the `passed`/`failed` state read
+from the script's own exit code, plus `exitCode`, `durationMs` and, for `test`, the
+passed/failed/skipped counts from vitest's `Tests` summary line. That line is read only directly
+after vitest's `Test Files` line, and only when its parts add up to its own total. Otherwise the counts
+are left off, never zeroed. A script that exits 0 while its summary reports failures (`vitest run ||
+true`) is recorded `failed`. `show` prints the measurements beside each step, and `verify` trusts them
+as observed outcomes.
+
+**Every defined script runs even after one fails, and each writes a row.** Stopping early, or
+writing nothing, would leave a step's earlier `passed` row as its latest state and vouch for code
+that was never checked. So a script that could not be started is recorded `unattributed`, which
+`verify` reads as unknown.
+
+It exists because the `track-steps` hook infers gate results from Bash command text, so a gate run
+inside `git commit`'s pre-commit hook, behind a pipe, or after a `;` leaves no milestone. `gate` reads
+its own exit codes, so it works from a session and from a git hook alike. The scripts run with stdin
+closed, so a bare `vitest` script cannot drop into watch mode. They also run without git's
+repo-local variables (from `git rev-parse --local-env-vars`) and without any board variable,
+`CLAUDE_PROJECT_DIR` included. The gate returns when npm exits, even if a background process the
+script left behind still holds its output.
+
+**It writes only to a board that holds the ticket.** A shell or a git hook usually has no board
+variable set, and falling back to the cwd would put the events in the wrong board without any sign.
+So when `<tickets>/<id>.md` is not there, `gate` still runs the scripts, prints `NOT RECORDED` with
+the path it checked, and writes nothing. That skip is reserved for the case where no board was
+configured. A **configured** board that is wrong fails with exit 3 instead: no `tickets/` directory
+there, only one of `TICKETS_DIR_OVERRIDE` and `EVENTS_DIR_OVERRIDE` set, or `TICKET_WORKFLOW_BOARD_DIR`
+set alongside either of them. A typo would otherwise record nothing, forever, with no signal. The
+branch must name exactly one ticket id.
+
+To record into a central board from a shell or a hook, export **`TICKET_WORKFLOW_BOARD_DIR`** (the
+board's root) in the shell profile. Only `gate` reads it. Exporting `BOARD_DIR_OVERRIDE` globally
+instead would also aim every test run on the machine at the real board.
+
+| exit | meaning |
+|---|---|
+| `0` | every gate script that exists passed |
+| `1` | a gate failed |
+| `2` | something was not checked: arguments given, no readable `package.json`, none of the three scripts defined, or a script that could not be started |
+| `3` | a record could not be written, the board could not be checked, or a configured board is wrong. This wins over the others, since a lost record is otherwise invisible |
+
+A missing script is named and never counted as a pass. A branch with no ticket id (such as `main`) is
+not an error: the scripts run and the exit code is theirs.
+
 ## `verify` — checking a ticket's claims against the record
 
 Every ticket ends with an agent-authored `## Implementation summary` asserting `Tests: N added` and a
@@ -779,16 +890,31 @@ only on timeouts, since one clean timeout under the bound shows the bound did no
 whose failures are all mixed tests has shown nothing, so it gets no verdict (exit 2) and is not
 recorded as red. Any assertion failure beside those tests is reported too.
 
-Some exit causes land after the report is written, so a run with a timeout is withheld the same way
-when vitest logged `error during close` (a globalSetup teardown failed), when the run exited with any
-code but vitest's own 1, when its log cannot be read, when its config (root or any project) declares a
+Unless `dangerouslyIgnoreUnhandledErrors` is set, vitest exits 1 for an unhandled error just as for a
+timeout, and its JSON report drops the error. So a run with both a timeout and an unhandled error
+reads as contention from the report alone (`tkt-b1182a02fb14`). Each run therefore also loads a
+second reporter, `contentionReporter`, whose `onTestRunEnd` hook writes an evidence file beside the
+report. That hook needs vitest 3 or later. Any run with a timed-out test needs readable evidence,
+whatever its exit code. Without it the run is undetermined and the verdict is withheld. On vitest 2
+or earlier that is every run with a timeout, so the control can never be recorded red and the command
+never reaches a verdict. Nothing checks the version first. On newer vitest there is no evidence either
+when a globalSetup entry is not a string path, or when the `test` script does not end in the vitest
+command, so the appended `--reporter` flags never reach it. With evidence, a run with a timeout is
+withheld as above when it records any unhandled error, ignored ones included, or when coverage is
+`enabled` with `reportOnFailure` and a non-empty `thresholds` object, since a threshold checked after
+the failure also exits 1. Any key makes it non-empty, `perFile` or `autoUpdate` alone included.
+
+Other exit causes land after that evidence is written, so a run with a timeout is withheld the same
+way when vitest logged `error during close` (a globalSetup teardown failed), when the run exited with
+any code but vitest's own 1, when its config (root or any project) declares a
 globalSetup other than ticket-workflow's own, or when it held a slot without declaring
 `TEST_RUN_GLOBAL_SETUP` (the release then runs from an exit hook). A teardown can set the exit code
 silently, and nothing in the run can see that, so a repo with its own globalSetup gets no verdict on
 a run with a timeout. Not covered: other code that runs after the report and silently sets exit code
 1, such as a `vitest.onClose` callback or an exit listener the config registers.
 
-The verdict is also withheld when any run wrote no readable report, or when a run held no slot or
+The verdict is also withheld when any run wrote no readable report, when a run with a timeout left no
+readable log (a close error cannot then be ruled out), or when a run held no slot or
 K ≥ N. A repo whose vitest config does not await `holdTestRun` is unbounded. It is withheld as well
 when a vitest process outside this command's own process tree appeared during the runs. The process
 list is polled every 5 s.

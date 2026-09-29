@@ -766,6 +766,45 @@ describe('archiveStaleTickets', () => {
   });
 });
 
+// tkt-9e662d918959 — the sweep wrote the file directly, so an archived ticket's log stopped at done or earlier.
+describe('archiveStaleTickets event log', () => {
+  const steps = async (id: string) => (await readEvents(id)).events.map((e) => [e.step, e.detail]);
+
+  it('appends one archived row, detail "from done", per ticket it archives and none for those it skips', async () => {
+    await writeRaw('tkt-stale1', makeRaw('Stale 1', 1, { status: 'done', updated: STALE_DATE }));
+    await writeRaw('tkt-recent', makeRaw('Recent done', 2, { status: 'done', updated: freshDate() }));
+    await writeRaw('tkt-active', makeRaw('In progress', 3, { status: 'in-progress', updated: STALE_DATE }));
+    expect(await archiveStaleTickets()).toBe(1);
+    expect(await steps('tkt-stale1')).toEqual([['archived', 'from done']]);
+    expect(await steps('tkt-recent')).toEqual([]);
+    expect(await steps('tkt-active')).toEqual([]);
+  });
+
+  it('appends nothing on a second sweep over an already-archived ticket', async () => {
+    await writeRaw('tkt-stale1', makeRaw('Stale 1', 1, { status: 'done', updated: STALE_DATE }));
+    await archiveStaleTickets();
+    expect(await archiveStaleTickets()).toBe(0);
+    expect(await steps('tkt-stale1')).toHaveLength(1);
+  });
+
+  it('still archives, and logs the error, when the event cannot be written', async () => {
+    const captured = captureLog();
+    const saved = process.env.EVENTS_DIR_OVERRIDE;
+    // A regular file where the events dir should be: mkdir -p and append both fail.
+    const blocker = path.join(dirs.tickets, 'not-a-dir');
+    await fs.writeFile(blocker, '', 'utf8');
+    process.env.EVENTS_DIR_OVERRIDE = blocker;
+    try {
+      await writeRaw('tkt-stale1', makeRaw('Stale 1', 1, { status: 'done', updated: STALE_DATE }));
+      expect(await archiveStaleTickets()).toBe(1);
+      expect((await getTicket('tkt-stale1')).status).toBe('archived');
+      expect(captured.error.some((l) => l.includes('failed to record status step'))).toBe(true);
+    } finally {
+      process.env.EVENTS_DIR_OVERRIDE = saved;
+    }
+  });
+});
+
 
 describe('searchTickets', () => {
   it('returns tickets whose title matches (case-insensitive)', async () => {
@@ -987,7 +1026,7 @@ describe('updateTicket — status-milestone telemetry', () => {
     await updateTicket(t.id, { status: 'in-progress' });
     const { events } = await readEvents(t.id);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ step: 'started', state: 'reached' });
+    expect(events[0]).toMatchObject({ step: 'started', state: 'reached', source: 'engine' });
   });
 
   it('maps qa and done transitions to their steps', async () => {

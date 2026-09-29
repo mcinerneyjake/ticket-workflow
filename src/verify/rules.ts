@@ -59,7 +59,8 @@ export interface TicketFacts {
   readonly unreadableLog: boolean;
   /**
    * Per hook-written step, whether the event carrying its latest state was written by a writer that
-   * derived that state from the delivered hook event (`outcomeFrom: 'event'`).
+   * derived that state from an observed outcome (`outcomeFrom: 'event'`) — the delivered hook event,
+   * or the exit code `ticket-workflow gate` read itself. Both writers stamp the same marker.
    *
    * PER STEP, not per ticket, and that is the whole point: a ticket worked across the upgrade has
    * its gate recorded by the old writer and its commit/PR by the new one, so any ticket-wide
