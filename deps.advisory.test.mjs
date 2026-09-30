@@ -76,6 +76,9 @@ export function atLeast(version, floor) {
 const ADVISORIES = [
   { name: 'js-yaml', floor: '3.15.2', ghsa: 'GHSA-2883-xcg3-v3hh' },
   { name: 'hono', floor: '4.13.5', ghsa: 'GHSA-gqvv-2mrq-wpjv' },
+  // Dev-only (eslint → minimatch). Floored at the high advisories CI's `npm audit` blocks on (this one
+  // and GHSA-6j4f-fj2g-mc7p), not moderate GHSA-q2hr-2g5m-vwhr's 5.0.12, which must not block (tkt-2f890a52505e).
+  { name: 'brace-expansion', floor: '5.0.11', ghsa: 'GHSA-qhr7-859c-m2p7' },
 ];
 
 describe('security advisories answered in the lockfile', () => {
