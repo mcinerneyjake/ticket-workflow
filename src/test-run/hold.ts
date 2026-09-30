@@ -15,7 +15,7 @@ import {
   TestRunRefusal,
   testSlotsStateDir,
   type Probe,
-  type SlotRecord,
+  type ClaimRecord,
 } from './slots.js';
 import { prepareRunTmpDir, removeRunTmpDir } from './tmpdir.js';
 
@@ -253,7 +253,7 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
     // TMPDIR first: a run refused on tmpdir grounds must not be holding a slot.
     const prepared = prepareRunTmpDir({ tmpRoot, repo, pid, probe, now: now(), tmpTtlMs, log, keep: liveTmpDirs(env) });
     runDir = prepared.runDir;
-    const record: SlotRecord = { version: 1, pid, repo, cwd, startedAt: new Date(now()).toISOString(), tmpDir: runDir, token };
+    const record: ClaimRecord = { version: 1, pid, repo, cwd, startedAt: new Date(now()).toISOString(), tmpDir: runDir, token };
     const holders = (): string => listSlots(stateDir, { probe, now: now(), ttlMs }).map(formatSlot).join('\n  ');
 
     const start = now();

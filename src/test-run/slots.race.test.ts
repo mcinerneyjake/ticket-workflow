@@ -20,7 +20,7 @@ const SLOTS_URL = pathToFileURL(path.join(path.dirname(fileURLToPath(import.meta
 const CHILD = `
 const m = await import(process.argv[1]);
 const stateDir = process.argv[2];
-const record = { version: 1, pid: process.pid, repo: 'race', cwd: '/race', startedAt: new Date().toISOString(), tmpDir: '/race' };
+const record = { version: 1, pid: process.pid, repo: 'race', cwd: '/race', startedAt: new Date().toISOString(), tmpDir: '/race', token: 'race-' + process.pid };
 const claim = m.claimSlot({ stateDir, slots: 1, record, probe: m.pidLiveness, now: Date.now(), ttlMs: 900000, log: () => {} });
 process.stdout.write(JSON.stringify({ pid: process.pid, granted: claim !== null }) + '\\n');
 if (claim === null) process.exit(0);
