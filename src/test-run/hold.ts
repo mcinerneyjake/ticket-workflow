@@ -195,6 +195,9 @@ function releaseHeld(held: Held): void {
   // Also before anything that can throw: a slot file left behind by the release below must look like
   // an orphan to the next claim, or tkt-0ce4d4313ce7's self-reclaim never fires for it.
   heldTokens().delete(held.token);
+  // Before anything that can throw too: our pid stays live in a watcher, so the sibling sweep would
+  // spare a leaked run dir until the TTL (tkt-e1b4737f15f2).
+  removeHeldTmpDir(held);
   const unregister = held.unregisterExit;
   held.unregisterExit = undefined;
   try {
@@ -216,10 +219,17 @@ function releaseHeld(held: Held): void {
       `[test-run] WARNING: slot ${held.slot} was ${outcome === 'missing' ? 'removed' : 'reissued to another run'} mid-run; this run was unguarded for part of it`,
     );
   }
+}
+
+function removeHeldTmpDir(held: Held): void {
   try {
     removeRunTmpDir(held.tmpDir);
   } catch (err) {
-    held.log(`[test-run] WARNING: could not remove ${held.tmpDir}: ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      held.log(`[test-run] WARNING: could not remove ${held.tmpDir}: ${err instanceof Error ? err.message : String(err)}`);
+    } catch {
+      // A throwing consumer log must not cost the slot release that follows.
+    }
   }
 }
 
