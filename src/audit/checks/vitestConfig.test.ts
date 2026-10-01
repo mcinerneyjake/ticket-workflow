@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { resolveConfig } from 'vitest/node';
 import { resolveVitestConfig } from './vitestConfig.js';
 import { testRunHold } from './testRunHold.js';
 import { vitestCollection } from './vitestCollection.js';
@@ -256,5 +257,40 @@ describe('resolveVitestConfig — what is NOT a --config for vitest', () => {
 
   it('a plain vitest run still resolves the default', () => {
     expect(resolvedFile(withTest('vitest run', { 'vitest.config.ts': CONFORMING }))).toBe('vitest.config.ts');
+  });
+});
+
+describe('resolveVitestConfig — candidate order is the order vitest loads (tkt-86a3dc02c9cb)', () => {
+  it('reads vitest.config.mts over vitest.config.js, as vitest does', () => {
+    const ctx = withTest('vitest run', { 'vitest.config.js': CONFORMING, 'vitest.config.mts': BARE });
+    expect(resolvedFile(ctx)).toBe('vitest.config.mts');
+  });
+
+  it.each(['vitest.config.cts', 'vitest.config.cjs'])('finds %s when it is the only config', (name) => {
+    expect(resolvedFile(withTest('vitest run', { [name]: CONFORMING }))).toBe(name);
+  });
+
+  // Catches an upstream reorder, not an added extension: only these 12 names are ever written.
+  it('picks the same file as the installed vitest at every step, when every candidate has a test block', async () => {
+    const names = ['vitest.config', 'vite.config'].flatMap((n) => ['.ts', '.mts', '.cts', '.js', '.mjs', '.cjs'].map((e) => n + e));
+    const configs = Object.fromEntries(names.map((n) => [n, /\.c[jt]s$/.test(n) ? CONFORMING.replace('export default', 'module.exports =') : CONFORMING]));
+    const ctx = ctxWith({ 'package.json': JSON.stringify({ type: 'module', scripts: { test: 'vitest run' } }), ...configs });
+    const audit: string[] = [];
+    const vitest: string[] = [];
+    for (let i = 0; i < names.length; i++) {
+      const { viteConfig } = await resolveConfig({ root: ctx.repoDir });
+      const picked = path.basename(viteConfig.configFile ?? '<none>');
+      vitest.push(picked);
+      audit.push(resolvedFile(ctx));
+      rmSync(path.join(ctx.repoDir, picked));
+    }
+    expect(new Set(vitest).size).toBe(names.length);
+    expect(audit).toEqual(vitest);
+  });
+
+  // Known divergence: flips red once tkt-4df3344cd0f4 lands — delete this case then.
+  it.fails('reads a test-less vite.config.ts as the config, as vitest does (tkt-4df3344cd0f4)', () => {
+    const ctx = withTest('vitest run', { 'vite.config.ts': 'export default { server: {} };\n', 'vite.config.mjs': CONFORMING });
+    expect(resolvedFile(ctx)).not.toBe('vite.config.mjs');
   });
 });

@@ -1,8 +1,11 @@
 import { isRecord, type AuditContext } from '../types.js';
 import { maskSource, objectBodies } from './configSource.js';
 
-const DEDICATED = ['vitest.config.ts', 'vitest.config.js', 'vitest.config.mts', 'vitest.config.mjs'];
-const SHARED = ['vite.config.ts', 'vite.config.js', 'vite.config.mts', 'vite.config.mjs'];
+// vitest's CONFIG_EXTENSIONS order. vitest loads the first that exists; searchDir still skips a
+// test-less shared config vitest would load (tkt-4df3344cd0f4).
+const EXTENSIONS = ['.ts', '.mts', '.cts', '.js', '.mjs', '.cjs'];
+const DEDICATED = EXTENSIONS.map((ext) => `vitest.config${ext}`);
+const SHARED = EXTENSIONS.map((ext) => `vite.config${ext}`);
 
 export type VitestConfig =
   /**
