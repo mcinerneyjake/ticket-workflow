@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { guardrailTemplates } from '../templates.js';
 import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS, GITIGNORE_ENV_NOT_READY, LAUNCHER_ENV_NOT_READY, PIN_PARITY_FRESH_SHAPES } from './run.js';
 import { parseInitArgs, cmdInit } from '../cli/index.js';
+import { runOneCheck } from '../audit/run.js';
 import type { Exec } from '../audit/types.js';
 
 const tempDirs: string[] = [];
@@ -358,5 +359,38 @@ describe('init tolerates hook-launcher BLOCKED only when the environment is not 
     const dir = tempDir();
     const result = runInit(dir, {}, () => ({ kind: 'absent' }));
     expect(result.exitCode).toBe(0);
+  });
+});
+
+describe('vendored skills round trip: init → audit current → mutate → audit drift (tkt-e759d07ef1c5)', () => {
+  it('init installs the skills the audit then reads as current, and a mutated copy reads as drifted', () => {
+    const dir = tempDir();
+    const result = runInit(dir, { tier: 'core' });
+    const skills = guardrailTemplates(undefined, 'core').filter((t) => t.targetPath.startsWith('.claude/skills/'));
+    expect(skills.length).toBeGreaterThan(0);
+    for (const t of skills) {
+      expect(result.wrote).toContain(t.targetPath);
+      expect(readFileSync(path.join(dir, t.targetPath), 'utf8')).toBe(t.contents);
+    }
+    for (const id of ['skills-current', 'skill-line-cap']) {
+      expect(result.report.results.find((r) => r.id === id)?.status, id).toBe('pass');
+    }
+
+    const victim = path.join(dir, '.claude', 'skills', 'tdd', 'tests.md');
+    writeFileSync(victim, `${readFileSync(victim, 'utf8')}\nlocal edit\n`);
+    const drift = runOneCheck(dir, 'skills-current');
+    expect(drift?.status).toBe('fail');
+    expect(drift?.detail).toContain('drifted: .claude/skills/tdd/tests.md');
+
+    runInit(dir, { tier: 'core', force: true });
+    expect(runOneCheck(dir, 'skills-current')?.status).toBe('pass');
+  });
+
+  it('refuses to scaffold over a consumer skill already at a vendored path without --force', () => {
+    const dir = tempDir();
+    mkdirSync(path.join(dir, '.claude', 'skills', 'tdd'), { recursive: true });
+    writeFileSync(path.join(dir, '.claude', 'skills', 'tdd', 'SKILL.md'), 'mine\n');
+    expect(() => runInit(dir, { tier: 'core' })).toThrow(/\.claude\/skills\/tdd\/SKILL\.md/);
+    expect(readFileSync(path.join(dir, '.claude', 'skills', 'tdd', 'SKILL.md'), 'utf8')).toBe('mine\n');
   });
 });

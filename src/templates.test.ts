@@ -1,10 +1,11 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardrailTemplates, resolveManifest } from './templates.js';
+import { lineCount, SKILL_LINE_CAP } from './audit/checks/skills.js';
 
 const REAL_TEMPLATES_DIR = fileURLToPath(new URL('../templates/', import.meta.url));
 const PKG_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -141,6 +142,8 @@ describe('guardrailTemplates', () => {
     for (const t of templates) {
       expect(packed, `templates/${t.source} missing from npm pack`).toContain(`templates/${t.source}`);
     }
+    // Read at runtime but never a manifest source, so the loop above cannot see it.
+    expect(packed).toContain('templates/skills/UPSTREAM.json');
   });
 
   it('this repo executes its intended-identical guardrail files byte-for-byte from the templates', () => {
@@ -376,5 +379,109 @@ describe('shipped .gitignore files ignore node_modules as a symlink', () => {
     expect(ignores('node_modules/\n', 'symlink')).toBe(false);
     expect(ignores('node_modules/\n', 'directory')).toBe(true);
     expect(ignores('node_modules\n', 'symlink', 'README.md')).toBe(false);
+  });
+});
+
+describe('vendored skills (tkt-e759d07ef1c5)', () => {
+  const SKILLS_SRC = path.join(REAL_TEMPLATES_DIR, 'skills');
+  const upstream: { commit: string; skills: Record<string, { files: string[] }>; patches: { file: string; find: string }[] } = JSON.parse(
+    readFileSync(path.join(SKILLS_SRC, 'UPSTREAM.json'), 'utf8'),
+  );
+  const skillTemplates = (): ReturnType<typeof guardrailTemplates> => guardrailTemplates().filter((t) => t.targetPath.startsWith('.claude/skills/'));
+
+  it('pins ONE full commit SHA, never a branch or tag', () => {
+    expect(upstream.commit).toMatch(/^[0-9a-f]{40}$/);
+  });
+
+  it('installs exactly the five spec skills, each with its listed files and a LICENSE, at core tier', () => {
+    expect(Object.keys(upstream.skills).sort()).toEqual(['codebase-design', 'grilling', 'handoff', 'standards-and-spec-review', 'tdd']);
+    const expected = Object.entries(upstream.skills).flatMap(([name, s]) => [...s.files, 'LICENSE'].map((f) => `.claude/skills/${name}/${f}`));
+    const shipped = skillTemplates();
+    expect(shipped.map((t) => t.targetPath).sort()).toEqual(expected.sort());
+    expect(shipped.every((t) => t.tier === 'core' && !t.executable)).toBe(true);
+    expect(guardrailTemplates(undefined, 'core').filter((t) => t.targetPath.startsWith('.claude/skills/')).length).toBe(expected.length);
+  });
+
+  it('ships no stray file under templates/skills/ beyond the listed set', () => {
+    const onDisk = readdirSync(SKILLS_SRC, { recursive: true, withFileTypes: true })
+      .filter((d) => d.isFile())
+      .map((d) => path.relative(SKILLS_SRC, path.join(d.parentPath, d.name)))
+      .sort();
+    const listed = ['LICENSE', 'UPSTREAM.json', ...Object.entries(upstream.skills).flatMap(([name, s]) => s.files.map((f) => path.join(name, f)))].sort();
+    expect(onDisk).toEqual(listed);
+  });
+
+  it('every copy carries the full MIT copyright and permission notice', () => {
+    const licenses = skillTemplates().filter((t) => t.targetPath.endsWith('/LICENSE'));
+    expect(licenses.length).toBe(Object.keys(upstream.skills).length);
+    for (const l of licenses) {
+      expect(l.contents).toContain('Copyright (c) 2026 Matt Pocock');
+      expect(l.contents).toContain('Permission is hereby granted, free of charge');
+      expect(l.contents).toContain('The above copyright notice and this permission notice shall be included');
+      expect(l.contents).toContain('THE SOFTWARE IS PROVIDED "AS IS"');
+    }
+  });
+
+  it('vendors only files a SKILL.md references, and every reference resolves', () => {
+    const skills = Object.entries(upstream.skills);
+    expect(skills.length).toBe(5);
+    for (const [name, s] of skills) {
+      const skillMd = readFileSync(path.join(SKILLS_SRC, name, 'SKILL.md'), 'utf8');
+      const linked = [...skillMd.matchAll(/\]\(([^)#\s]+)\)/g)].map((m) => m[1]).filter((href) => !/^[a-z]+:/.test(href));
+      const extras = s.files.filter((f) => f !== 'SKILL.md');
+      expect(linked.sort(), name).toEqual(extras.sort());
+    }
+  });
+
+  it('stays tracker-agnostic: the recorded patches removed every pointer to the unvendored setup skill', () => {
+    const pointer = /setup-matt-pocock-skills|docs\/agents\//;
+    // Control: the pattern matches the upstream text the patches target, so a clean scan below is
+    // evidence of removal, not of a pattern that can never fire.
+    expect(upstream.patches.some((p) => pointer.test(p.find))).toBe(true);
+    const shipped = skillTemplates();
+    expect(shipped.length).toBeGreaterThan(0);
+    for (const t of shipped) expect(t.contents, t.targetPath).not.toMatch(pointer);
+  });
+
+  it('every vendored SKILL.md is within the 120-line cap', () => {
+    const skillMds = skillTemplates().filter((x) => x.targetPath.endsWith('/SKILL.md'));
+    expect(skillMds.length).toBe(5);
+    for (const t of skillMds) {
+      expect(lineCount(t.contents), t.targetPath).toBeLessThanOrEqual(SKILL_LINE_CAP);
+    }
+  });
+
+  it.each([
+    ['an unsafe file name', { commit: 'x', skills: { tdd: { files: ['../escape.md'] } } }, /unsafe file/],
+    ['an unsafe skill name', { commit: 'x', skills: { '../tdd': { files: ['SKILL.md'] } } }, /malformed/],
+    ['an empty file list', { commit: 'x', skills: { tdd: { files: [] } } }, /malformed/],
+    ['no skills object', { commit: 'x' }, /no non-empty "skills" object/],
+    ['an empty skills object', { commit: 'x', skills: {} }, /no non-empty "skills" object/],
+  ])('fails loud on UPSTREAM.json with %s', (_label, json, message) => {
+    const dir = tempCopyOfTemplates();
+    writeFileSync(path.join(dir, 'skills', 'UPSTREAM.json'), JSON.stringify(json));
+    expect(() => guardrailTemplates(dir)).toThrow(message);
+  });
+
+  it('fails loud when a listed skill file is missing from the install', () => {
+    const dir = tempCopyOfTemplates();
+    rmSync(path.join(dir, 'skills', 'tdd', 'mocking.md'));
+    expect(() => guardrailTemplates(dir)).toThrow(/skills\/tdd\/mocking\.md/);
+  });
+
+  it('fails loud, naming the file, on UPSTREAM.json that is not JSON', () => {
+    const dir = tempCopyOfTemplates();
+    writeFileSync(path.join(dir, 'skills', 'UPSTREAM.json'), '{ not json');
+    expect(() => guardrailTemplates(dir)).toThrow(/skills\/UPSTREAM\.json is unusable/);
+  });
+
+  it("each skill's frontmatter name matches its directory, and none shadows the built-in /code-review", () => {
+    const names = Object.keys(upstream.skills);
+    expect(names.length).toBe(5);
+    expect(names).not.toContain('code-review');
+    for (const name of names) {
+      const skillMd = readFileSync(path.join(SKILLS_SRC, name, 'SKILL.md'), 'utf8');
+      expect(skillMd.match(/^name: (.+)$/m)?.[1], name).toBe(name);
+    }
   });
 });
