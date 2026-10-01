@@ -848,14 +848,22 @@ so ownership falls to its `startedAt`: written before this process started it is
 and is reclaimed; written during it, only a pre-token copy in this process can have written it, so it
 is a live hold and is kept (`tkt-a51a84902cc9`). And every token is minted
 `<ownership domain>.<per-hold nonce>` with the domain per-isolate, so a token from a domain that is
-not ours is a stranger wearing our pid rather than our leak — which is what makes a `TEST_SLOTS_DIR`
-shared across a pid-namespace boundary safe (`tkt-f5dae96f0298`). Refusing there costs at most one
-TTL, because a dead or heartbeat-expired holder is still reclaimed whatever domain it names.
+not ours is a stranger wearing **our own pid** rather than our leak (`tkt-f5dae96f0298`). Refusing
+there costs at most one TTL: a refused record stops being heartbeated, so it expires and is reclaimed
+on the TTL path, which never consults the domain.
 
-What stays unguarded, each needing a colliding pid: a **foreign** pre-token holder, whose token-less
-record predating this process is indistinguishable from a recycled pid's leak; and two pre-nonce
-copies, which carry no domain to compare and so match on pid alone as before. A claimant pinned below
-the nonce is therefore unprotected too; the exposure shrinks as copies upgrade.
+**A shared `TEST_SLOTS_DIR` across a pid-namespace boundary is still not safe, and the domain does
+not make it so** — it settles only the slice where the stranger's pid collides with ours. Where it
+does not collide, that holder's pid simply does not exist on this side, `pidLiveness` reads `ESRCH`
+as `dead`, and a live slot is reclaimed on the liveness path before ownership is consulted at all. A
+record carries no host or namespace identity, so nothing on that path can tell the two apart. Give
+each namespace its own `TEST_SLOTS_DIR`.
+
+Also unguarded, each needing a colliding pid: a **foreign** pre-token holder, whose token-less record
+predating this process is indistinguishable from a recycled pid's leak; and two pre-nonce copies,
+which carry no domain to compare and so match on pid alone as before. And because the domain is
+per-isolate, a leak left by a pre-nonce copy — or by any isolate that has since exited — is a stranger
+to the surviving one, so it waits out a TTL instead of being reclaimed on sight.
 
 The claim is an atomic `link(2)` and the reclaim decides under a per-slot lock — measured on the race
 test, a reclaim that judged from an earlier read could rename a live winner's fresh record.

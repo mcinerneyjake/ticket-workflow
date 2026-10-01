@@ -535,10 +535,13 @@ describe('claimSlot — the holder dimension', () => {
     expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('sibling');
   });
 
-  it('treats two tokens minted in one domain as one domain — the mint/parse round trip', () => {
+  it('parses a MINTED token into the same domain as the literal shape — the writer/reader round trip', () => {
+    // Planted from mintToken, claimed with the literal `${OUR_NONCE}.claimant`: that pairing is what
+    // binds the two halves. Minting both sides instead left this green under a changed NONCE_SEP,
+    // because both then parsed to undefined and undefined === undefined passes the domain check.
     const dir = stateDir();
     plant(dir, 0, { ...record(process.pid, 'our-leak'), token: mintToken(OUR_NONCE, 'h1') }, TTL - 60_000);
-    const { result } = claim(dir, { ...record(process.pid), token: mintToken(OUR_NONCE, 'h2') }, { probe: fixedProbe(alive), heldTokens: new Set() });
+    const { result } = claim(dir, mine(), { probe: fixedProbe(alive), heldTokens: new Set() });
     expect(result?.slot).toBe(0);
   });
 
@@ -760,11 +763,18 @@ describe('listSlots and clearStaleSlots', () => {
 });
 
 describe('mintToken', () => {
-  it.each(['', 'has.separator', '.', 'a.b.c'])('refuses the ambiguous ownership domain %j', (nonce) => {
+  // '' is the empty branch; 'has.separator' parses back as a SHORTER domain and '.' as an empty one —
+  // two different consequences of the same clause. A third dotted case would add no branch.
+  it.each(['', 'has.separator', '.'])('refuses the ambiguous ownership domain %j', (nonce) => {
     expect(refusalOf(() => mintToken(nonce, 'hold')).code).toBe(EXIT.STATE_UNREADABLE);
   });
 
-  it('mints a token a reader can split back into the domain it was given', () => {
+  it('refuses an empty hold, which would parse back as no domain at all', () => {
+    expect(refusalOf(() => mintToken('domain', '')).code).toBe(EXIT.STATE_UNREADABLE);
+  });
+
+  it('mints the literal shape, and allows a separator inside the hold half', () => {
     expect(mintToken('domain', 'hold')).toBe('domain.hold');
+    expect(mintToken('domain', 'a.b')).toBe('domain.a.b');
   });
 });

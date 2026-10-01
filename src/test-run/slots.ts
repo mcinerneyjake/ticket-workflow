@@ -275,16 +275,20 @@ function acquireReclaimLock(lock: string, now: number): boolean {
 
 /**
  * A hold token is `<ownership domain>.<per-hold nonce>`. `.` is absent from `randomUUID()`, so the
- * split is unambiguous without escaping, and `mintToken`/`nonceOf` are the only two places that know
- * the shape (tkt-f5dae96f0298).
+ * split is unambiguous without escaping, and these two functions are the only production sites that
+ * know the shape (tkt-f5dae96f0298).
  */
 const NONCE_SEP = '.';
 
 export function mintToken(nonce: string, hold: string): string {
-  // Refused rather than escaped: a domain that is empty or carries the separator parses back as a
-  // DIFFERENT domain, or as none, silently restoring pid-only ownership for this whole process.
-  if (nonce === '' || nonce.includes(NONCE_SEP)) {
-    throw new TestRunRefusal(EXIT.STATE_UNREADABLE, `a slot token's ownership domain may not be empty or contain ${JSON.stringify(NONCE_SEP)}; refusing to mint an ambiguous token.`);
+  // Refused rather than escaped, on both halves: a token `nonceOf` cannot invert parses back as a
+  // DIFFERENT domain or as none, silently restoring pid-only ownership for this whole process. A
+  // separator inside `hold` is harmless — only the FIRST one is read — so it is not refused.
+  if (nonce === '' || hold === '' || nonce.includes(NONCE_SEP)) {
+    throw new TestRunRefusal(
+      EXIT.STATE_UNREADABLE,
+      `a slot token needs a non-empty ownership domain and hold, and no ${JSON.stringify(NONCE_SEP)} in the domain; refusing to mint an ambiguous token.`,
+    );
   }
   return `${nonce}${NONCE_SEP}${hold}`;
 }
@@ -320,7 +324,8 @@ interface SelfClaim {
  *
  * Two residuals the nonce cannot reach, each needing a colliding pid. A token-less record predating
  * this process is judged a recycled pid's leak, so a FOREIGN pre-token holder is still reclaimed; and
- * two pre-nonce copies carry no domain to compare, so they match on pid exactly as before.
+ * two pre-nonce copies carry no domain to compare, so they match on pid exactly as before. And the
+ * domain being per-isolate, a leak from an isolate that has since exited waits out the TTL.
  */
 function isSelfOrphan(record: SlotRecord, self: SelfClaim | null): boolean {
   if (self === null || record.pid !== self.pid) return false;
