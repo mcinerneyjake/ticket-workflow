@@ -619,6 +619,30 @@ describe('two live holds in one process', () => {
     await releaseTestRun(second.registry);
   });
 
+  it('writes a token carrying this process’s ownership domain, shared by every hold it takes', async () => {
+    // The seam between the token written here and the ownership test in slots.ts
+    // (tkt-f5dae96f0298). The two agree only on the token's shape, so a writer that stopped
+    // prefixing its domain would leave every slots.ts case green while the foreign-pid veto silently
+    // did nothing — measured: that mutation passed 172 tests before this case existed.
+    const first = harness({ slots: 2 });
+    const second = harness({ stateDir: first.stateDir, tmpRoot: first.tmpRoot, slots: 2 });
+    await holdTestRun(first.opts);
+    await holdTestRun(second.opts);
+
+    const tokens = readdirSync(first.stateDir)
+      .sort()
+      .map((n) => parseSlotRecord(readFileSync(path.join(first.stateDir, n), 'utf8'))?.token);
+    const domainOf = (t: string | undefined): string | undefined => /^([^.]+)\.[^.]+$/.exec(t ?? '')?.[1];
+
+    expect(tokens).toHaveLength(2);
+    expect(domainOf(tokens[0])).toBeDefined();
+    expect(domainOf(tokens[0])).toBe(domainOf(tokens[1]));
+    expect(tokens[0]).not.toBe(tokens[1]);
+
+    await releaseTestRun(first.registry);
+    await releaseTestRun(second.registry);
+  });
+
   it('reports rather than deletes when its own slot was reissued to another hold mid-run', async () => {
     // The release-side guard end to end, on the state a degraded veto would produce: two holds on ONE
     // slot file. Planted, because the veto correctly prevents reaching it through holdTestRun — but it

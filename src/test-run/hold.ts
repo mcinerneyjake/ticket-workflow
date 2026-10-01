@@ -10,6 +10,7 @@ import {
   formatSlot,
   heartbeat,
   listSlots,
+  mintToken,
   pidLiveness,
   releaseSlot,
   TestRunRefusal,
@@ -91,6 +92,7 @@ declare global {
   // shared between them (measured in copart-filter's testDbLock, the shape this mirrors).
   var __ticketWorkflowTestRun: Promise<RunState> | undefined;
   var __ticketWorkflowHeldTokens: Set<string> | undefined;
+  var __ticketWorkflowSelfNonce: string | undefined;
   var __ticketWorkflowTmpDirStacks: WeakMap<NodeJS.ProcessEnv, TmpDirStack> | undefined;
 }
 
@@ -109,6 +111,17 @@ export const globalRegistry: Registry = {
 function heldTokens(): Set<string> {
   globalThis.__ticketWorkflowHeldTokens ??= new Set();
   return globalThis.__ticketWorkflowHeldTokens;
+}
+
+/**
+ * This isolate's ownership domain, prefixed to every token it mints so a slot recording our pid can
+ * be told from a stranger's wearing it (tkt-f5dae96f0298). Deliberately on globalThis with EXACTLY
+ * heldTokens' scope and lifetime: the reclaim test is "our domain, and not in our held set", so a
+ * nonce scoped any wider or narrower than that set would make the two disagree about who "we" are.
+ */
+function selfNonce(): string {
+  globalThis.__ticketWorkflowSelfNonce ??= randomUUID();
+  return globalThis.__ticketWorkflowSelfNonce;
 }
 
 // A single saved TMPDIR per hold assumed LIFO release: out of order, the first release restored a
@@ -238,7 +251,7 @@ async function acquire(opts: HoldTestRunOptions): Promise<RunState> {
   const registerExit = opts.registerExit ?? defaultRegisterExit;
   const stateDir = opts.stateDir ?? testSlotsStateDir(env);
   const pid = process.pid;
-  const token = randomUUID();
+  const token = mintToken(selfNonce(), randomUUID());
   let runDir: string | null = null;
   let pushed: Held | null = null;
 

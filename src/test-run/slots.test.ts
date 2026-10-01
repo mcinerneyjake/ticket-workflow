@@ -9,6 +9,7 @@ import {
   envInt,
   EXIT,
   listSlots,
+  mintToken,
   parseSlotRecord,
   pidLiveness,
   RECLAIM_LOCK_STALE_MS,
@@ -495,6 +496,114 @@ describe('claimSlot — the holder dimension', () => {
     expect(log.some((l) => l.includes('no heartbeat within the TTL'))).toBe(true);
   });
 
+  // The foreign-nonce veto (tkt-f5dae96f0298). A token carries the ownership domain it was minted
+  // in, so a stranger wearing our pid — one pid namespace's 42 meeting another's across a shared
+  // TEST_SLOTS_DIR — mints its own: "absent from heldTokens" then says nothing about us. Each case
+  // pairs with the one after it, the only difference being the planted token's nonce domain.
+  const OUR_NONCE = '11111111-1111-4111-8111-111111111111';
+  const THEIR_NONCE = '22222222-2222-4222-8222-222222222222';
+  const ourToken = (hold: string): string => `${OUR_NONCE}.${hold}`;
+  const theirToken = (hold: string): string => `${THEIR_NONCE}.${hold}`;
+  const mine = (repo = 'me'): SlotRecord => ({ ...record(process.pid, repo), token: ourToken('claimant') });
+
+  it('does NOT reclaim our own pid when the token was minted in another process’s nonce domain', () => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'stranger'), token: theirToken('hold') }, TTL - 60_000);
+    const { result, log } = claim(dir, mine(), { probe: fixedProbe(alive), heldTokens: new Set() });
+    expect(result).toBeNull();
+    expect(log).toEqual([]);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('stranger');
+  });
+
+  it('DOES reclaim our own pid for a token from OUR nonce domain that we no longer hold', () => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'our-leak'), token: ourToken('gone') }, TTL - 60_000);
+    const { result, log } = claim(dir, mine(), { probe: fixedProbe(alive), heldTokens: new Set([ourToken('live')]) });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(true);
+  });
+
+  it('does NOT reclaim a token from OUR domain that we still hold — a live sibling, not a leak', () => {
+    // The heldTokens arm with a nonce-CARRYING claimant. Without this every veto case in this file
+    // runs the legacy self.nonce === undefined branch, and breaking the arm for real holds stays
+    // green here — measured: 97/97 green, caught only by hold.test.ts.
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'sibling'), token: ourToken('live') }, TTL - 60_000);
+    const { result, log } = claim(dir, mine(), { probe: fixedProbe(alive), heldTokens: new Set([ourToken('live')]) });
+    expect(result).toBeNull();
+    expect(log).toEqual([]);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('sibling');
+  });
+
+  it('parses a MINTED token into the same domain as the literal shape — the writer/reader round trip', () => {
+    // Planted from mintToken, claimed with the literal `${OUR_NONCE}.claimant`: that pairing is what
+    // binds the two halves. Minting both sides instead left this green under a changed NONCE_SEP,
+    // because both then parsed to undefined and undefined === undefined passes the domain check.
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'our-leak'), token: mintToken(OUR_NONCE, 'h1') }, TTL - 60_000);
+    const { result } = claim(dir, mine(), { probe: fixedProbe(alive), heldTokens: new Set() });
+    expect(result?.slot).toBe(0);
+  });
+
+  it('takes the next free slot rather than a stranger’s, so the pool is never over-granted', () => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'stranger'), token: theirToken('hold') }, TTL - 60_000);
+    const { result } = claim(dir, mine(), { slots: 2, probe: fixedProbe(alive), heldTokens: new Set() });
+    expect(result?.slot).toBe(1);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('stranger');
+  });
+
+  it('does not sweep a stranger’s LATER slot when it grants an earlier free one', () => {
+    // clearOwnOrphans runs after the grant, so the veto has to hold on that path too.
+    const dir = stateDir();
+    plant(dir, 1, { ...record(process.pid, 'stranger'), token: theirToken('hold') }, TTL - 60_000);
+    const { result, log } = claim(dir, mine(), { slots: 2, probe: fixedProbe(alive), heldTokens: new Set() });
+    expect(result?.slot).toBe(0);
+    expect(readdirSync(dir).sort()).toEqual(['slot-0', 'slot-1']);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(false);
+  });
+
+  // The veto removes only the SELF-ORPHAN reason to reclaim. Both backstops below must survive it,
+  // or a stranger's abandoned slot wedges the pool instead of costing at most one TTL.
+  it('still reclaims a stranger’s slot when its holder is gone, whatever the nonce says', () => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'stranger'), token: theirToken('hold') }, TTL - 60_000);
+    const { result, log } = claim(dir, mine(), { probe: fixedProbe('dead'), heldTokens: new Set() });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('gone'))).toBe(true);
+  });
+
+  it('still reclaims a stranger’s slot once its heartbeat is past the TTL', () => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'stranger'), token: theirToken('hold') }, TTL + 60_000);
+    const { result, log } = claim(dir, mine(), { probe: fixedProbe(alive), heldTokens: new Set() });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('no heartbeat within the TTL'))).toBe(true);
+  });
+
+  // A nonce we cannot read is not a nonce we may assume is ours. v0.29.2–v0.30.0 wrote a bare UUID,
+  // and a hand-edited file can carry any shape; each resolves to "not ours" and waits out the TTL,
+  // the same fail-closed trade tkt-a51a84902cc9 took for token-less records.
+  it.each(['tok-no-separator', '.empty-nonce', `${OUR_NONCE}.`])('does NOT reclaim our pid for the unreadable-nonce token %j', (token) => {
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'other-copy'), token }, TTL - 60_000);
+    const { result, log } = claim(dir, mine(), { probe: fixedProbe(alive), heldTokens: new Set() });
+    expect(result).toBeNull();
+    expect(log).toEqual([]);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('other-copy');
+  });
+
+  it('reclaims on heldTokens alone when NEITHER token carries a nonce — the residual for pre-nonce claimants', () => {
+    // Deliberately fail-OPEN, and pinned so it cannot be tightened into an availability regression:
+    // a claimant with no nonce of its own has nothing to compare, and refusing would strand its real
+    // leak for a full TTL. Two pre-nonce copies sharing a pid number remain undistinguished.
+    const dir = stateDir();
+    plant(dir, 0, { ...record(process.pid, 'legacy-leak'), token: 'tok-gone' }, TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive), heldTokens: new Set(['tok-live']) });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(true);
+  });
+
   it('refuses a corrupt record rather than treating it as our own orphan', () => {
     const dir = stateDir();
     plant(dir, 0, '{not json');
@@ -650,5 +759,22 @@ describe('listSlots and clearStaleSlots', () => {
     writeFileSync(file, 'x');
     const err = refusalOf(() => listSlots(file, { probe: pidLiveness, now: NOW, ttlMs: TTL }));
     expect(err.code).toBe(EXIT.STATE_UNREADABLE);
+  });
+});
+
+describe('mintToken', () => {
+  // '' is the empty branch; 'has.separator' parses back as a SHORTER domain and '.' as an empty one —
+  // two different consequences of the same clause. A third dotted case would add no branch.
+  it.each(['', 'has.separator', '.'])('refuses the ambiguous ownership domain %j', (nonce) => {
+    expect(refusalOf(() => mintToken(nonce, 'hold')).code).toBe(EXIT.STATE_UNREADABLE);
+  });
+
+  it('refuses an empty hold, which would parse back as no domain at all', () => {
+    expect(refusalOf(() => mintToken('domain', '')).code).toBe(EXIT.STATE_UNREADABLE);
+  });
+
+  it('mints the literal shape, and allows a separator inside the hold half', () => {
+    expect(mintToken('domain', 'hold')).toBe('domain.hold');
+    expect(mintToken('domain', 'a.b')).toBe('domain.a.b');
   });
 });
