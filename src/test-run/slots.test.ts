@@ -571,8 +571,78 @@ describe('listSlots and clearStaleSlots', () => {
     plant(dir, 1, record(process.pid, 'live'));
     plant(dir, 2, record(process.pid, 'expired'), TTL + 1000);
     const removed = clearStaleSlots(dir, { probe: pidLiveness, now: Date.now(), ttlMs: TTL });
-    expect(removed.map((v) => v.record.repo).sort()).toEqual(['dead', 'expired']);
+    expect(removed.map((v) => v.record?.repo).sort()).toEqual(['dead', 'expired']);
     expect(readdirSync(dir)).toEqual(['slot-1']);
+  });
+
+  // tkt-c3df050395d8: the refusal named clear-stale as the recovery, and clear-stale refused too.
+  it('clears an unparseable record once its mtime is past the TTL, reporting it with no record', () => {
+    const dir = stateDir();
+    plant(dir, 0, 'garbage', TTL + 1000);
+    plant(dir, 1, record(process.pid, 'live'));
+    const removed = clearStaleSlots(dir, { probe: pidLiveness, now: Date.now(), ttlMs: TTL });
+    expect(removed.map((v) => [v.slot, v.record])).toEqual([[0, null]]);
+    expect(readdirSync(dir)).toEqual(['slot-1']);
+  });
+
+  it('a fresh unparseable record still refuses the sweep, before anything is removed', () => {
+    const dir = stateDir();
+    plant(dir, 0, record(exitedPid(), 'dead'));
+    plant(dir, 1, '{"version":2,"pid":1}');
+    const err = refusalOf(() => clearStaleSlots(dir, { probe: pidLiveness, now: Date.now(), ttlMs: TTL }));
+    expect(err.code).toBe(EXIT.STATE_UNREADABLE);
+    expect(err.message).toMatch(/not a valid slot record/);
+    expect(err.message).not.toMatch(/run `ticket-workflow test-slots clear-stale` once/);
+    expect(readdirSync(dir).sort()).toEqual(['slot-0', 'slot-1']);
+  });
+
+  it('keeps an unparseable record whose mtime was refreshed between the scan and the lock', () => {
+    const dir = stateDir();
+    plant(dir, 0, record(exitedPid(), 'dead'));
+    const corrupt = plant(dir, 1, 'garbage', TTL + 1000);
+    let probes = 0;
+    // Probe call 1 is slot 0's scan; call 2 is its in-lock re-read, which runs before slot 1's reclaim.
+    const probe = (pid: number): Liveness => {
+      probes += 1;
+      if (probes === 2) utimesSync(corrupt, new Date(), new Date());
+      return pidLiveness(pid);
+    };
+    const removed = clearStaleSlots(dir, { probe, now: Date.now(), ttlMs: TTL });
+    expect(removed.map((v) => v.record?.repo)).toEqual(['dead']);
+    expect(readdirSync(dir)).toEqual(['slot-1']);
+  });
+
+  it('judges a record that turned unparseable under the lock by its mtime, never aborting the sweep', () => {
+    const dir = stateDir();
+    plant(dir, 0, record(exitedPid(), 'dead-a'));
+    const flipped = plant(dir, 1, record(exitedPid(), 'dead-b'));
+    let probes = 0;
+    // Calls 1-2 are the scan of slots 0 and 1; call 3 is slot 0's in-lock re-read, before slot 1's reclaim.
+    const probe = (pid: number): Liveness => {
+      probes += 1;
+      if (probes === 3) writeFileSync(flipped, 'garbage');
+      return pidLiveness(pid);
+    };
+    const removed = clearStaleSlots(dir, { probe, now: Date.now(), ttlMs: TTL });
+    expect(removed.map((v) => v.record?.repo)).toEqual(['dead-a']);
+    expect(readFileSync(flipped, 'utf8')).toBe('garbage');
+  });
+
+  it.skipIf(process.platform === 'win32')('refuses a FIFO slot without blocking on it', () => {
+    const dir = stateDir();
+    const r = spawnSync('mkfifo', [path.join(dir, 'slot-0')]);
+    if (r.status !== 0) throw new Error('mkfifo failed');
+    const err = refusalOf(() => clearStaleSlots(dir, { probe: pidLiveness, now: Date.now(), ttlMs: TTL }));
+    expect(err.code).toBe(EXIT.STATE_UNREADABLE);
+    expect(err.message).toMatch(/not a regular file/);
+  });
+
+  it('status (listSlots) still refuses an unparseable record, expired or not', () => {
+    const dir = stateDir();
+    plant(dir, 0, 'garbage', TTL + 1000);
+    const err = refusalOf(() => listSlots(dir, { probe: pidLiveness, now: Date.now(), ttlMs: TTL }));
+    expect(err.code).toBe(EXIT.STATE_UNREADABLE);
+    expect(readdirSync(dir)).toEqual(['slot-0']);
   });
 
   it('refuses an unreadable state path rather than reporting it empty', () => {

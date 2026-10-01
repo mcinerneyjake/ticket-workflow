@@ -1,10 +1,10 @@
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cmdTestSlots } from './index.js';
-import { EXIT, testSlotsStateDir } from '../test-run/slots.js';
+import { DEFAULT_TTL_MS, EXIT, testSlotsStateDir } from '../test-run/slots.js';
 
 const tempDirs: string[] = [];
 const savedExitCode = process.exitCode;
@@ -127,12 +127,27 @@ describe('test-slots — refusals', () => {
     expect(err[0]).toContain('Cannot read the test-slot state');
   });
 
-  it('a corrupt slot is a refusal for clear-stale too — it is never silently removed', () => {
+  it('a corrupt slot inside the TTL is a refusal for clear-stale too — it may be another version’s live hold', () => {
     const dir = stateDir();
     writeFileSync(path.join(dir, 'slot-0'), 'garbage');
-    capture();
+    const { err } = capture();
     cmdTestSlots(['clear-stale'], { TEST_SLOTS_DIR: dir });
     expect(process.exitCode).toBe(EXIT.STATE_UNREADABLE);
+    expect(err[0]).toMatch(/TTL/);
     expect(readdirSync(dir)).toEqual(['slot-0']);
+  });
+
+  it('a corrupt slot past the TTL is removed by clear-stale, and named as removed', () => {
+    const dir = stateDir();
+    const file = path.join(dir, 'slot-0');
+    writeFileSync(file, 'garbage');
+    const old = new Date(Date.now() - DEFAULT_TTL_MS - 60_000);
+    utimesSync(file, old, old);
+    const { out } = capture();
+    cmdTestSlots(['clear-stale'], { TEST_SLOTS_DIR: dir });
+    expect(process.exitCode).toBe(savedExitCode);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatch(/^removed slot 0: unparseable record \(last written \d+s ago\)$/);
+    expect(readdirSync(dir)).toEqual([]);
   });
 });
