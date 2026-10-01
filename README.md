@@ -843,11 +843,19 @@ released hold delete the record of the hold that had since taken the same slot (
 Releasing matches the token too, so a hold whose slot was reissued **reports** it rather than deleting
 the new owner's record.
 
-Two cases the token does **not** settle. A record written before tokens carries none and falls back to
-pid alone — kept so a record from an older pinned copy cannot wedge a slot, but wrong if two *versions*
-of this package are live in one process (`tkt-a51a84902cc9`). And a foreign process that happens to
-share our pid writes a token absent from our set, which reads the same as a leak, so a shared
-`TEST_SLOTS_DIR` across a pid-namespace boundary is still unguarded (`tkt-f5dae96f0298`).
+Two discriminators sit on top of the per-hold token. A record written **before** tokens carries none,
+so ownership falls to its `startedAt`: written before this process started it is a recycled pid's leak
+and is reclaimed; written during it, only a pre-token copy in this process can have written it, so it
+is a live hold and is kept (`tkt-a51a84902cc9`). And every token is minted
+`<ownership domain>.<per-hold nonce>` with the domain per-isolate, so a token from a domain that is
+not ours is a stranger wearing our pid rather than our leak — which is what makes a `TEST_SLOTS_DIR`
+shared across a pid-namespace boundary safe (`tkt-f5dae96f0298`). Refusing there costs at most one
+TTL, because a dead or heartbeat-expired holder is still reclaimed whatever domain it names.
+
+What stays unguarded, each needing a colliding pid: a **foreign** pre-token holder, whose token-less
+record predating this process is indistinguishable from a recycled pid's leak; and two pre-nonce
+copies, which carry no domain to compare and so match on pid alone as before. A claimant pinned below
+the nonce is therefore unprotected too; the exposure shrinks as copies upgrade.
 
 The claim is an atomic `link(2)` and the reclaim decides under a per-slot lock — measured on the race
 test, a reclaim that judged from an earlier read could rename a live winner's fresh record.

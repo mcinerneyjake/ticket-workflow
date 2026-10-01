@@ -273,12 +273,40 @@ function acquireReclaimLock(lock: string, now: number): boolean {
   return false;
 }
 
+/**
+ * A hold token is `<ownership domain>.<per-hold nonce>`. `.` is absent from `randomUUID()`, so the
+ * split is unambiguous without escaping, and `mintToken`/`nonceOf` are the only two places that know
+ * the shape (tkt-f5dae96f0298).
+ */
+const NONCE_SEP = '.';
+
+export function mintToken(nonce: string, hold: string): string {
+  // Refused rather than escaped: a domain that is empty or carries the separator parses back as a
+  // DIFFERENT domain, or as none, silently restoring pid-only ownership for this whole process.
+  if (nonce === '' || nonce.includes(NONCE_SEP)) {
+    throw new TestRunRefusal(EXIT.STATE_UNREADABLE, `a slot token's ownership domain may not be empty or contain ${JSON.stringify(NONCE_SEP)}; refusing to mint an ambiguous token.`);
+  }
+  return `${nonce}${NONCE_SEP}${hold}`;
+}
+
+/**
+ * The domain a token was minted in, or `undefined` when it carries none we can read: a pre-nonce
+ * copy's bare token, or a malformed one. Unreadable stays distinct from every real nonce rather than
+ * being coerced into one — a domain we cannot name is one we may not assume is ours.
+ */
+function nonceOf(token: string): string | undefined {
+  const i = token.indexOf(NONCE_SEP);
+  if (i <= 0 || i === token.length - 1) return undefined;
+  return token.slice(0, i);
+}
+
 // Process-wide, even read from a worker thread; floored to `startedAt`'s ms precision.
 const PROCESS_STARTED_AT = Math.floor(performance.timeOrigin);
 
-/** Who is claiming: the pid, plus the tokens of the slots this process still holds. */
+/** Who is claiming: the pid, our own token's nonce domain, and the tokens of the slots we still hold. */
 interface SelfClaim {
   readonly pid: number;
+  readonly nonce: string | undefined;
   readonly heldTokens: ReadonlySet<string>;
 }
 
@@ -289,11 +317,17 @@ interface SelfClaim {
  * reclaim's in-lock re-check go through here, so the two cannot disagree and half-apply the reclaim.
  *
  * Token-less and started during this process: an older package copy's live hold (tkt-a51a84902cc9).
- * Still undistinguished: a live foreign process wearing our pid (tkt-f5dae96f0298).
+ *
+ * Two residuals the nonce cannot reach, each needing a colliding pid. A token-less record predating
+ * this process is judged a recycled pid's leak, so a FOREIGN pre-token holder is still reclaimed; and
+ * two pre-nonce copies carry no domain to compare, so they match on pid exactly as before.
  */
 function isSelfOrphan(record: SlotRecord, self: SelfClaim | null): boolean {
   if (self === null || record.pid !== self.pid) return false;
   if (record.token === undefined) return Date.parse(record.startedAt) < PROCESS_STARTED_AT;
+  // Another domain is a stranger wearing our pid across a shared state dir, so its absence from
+  // heldTokens says nothing about us; dead and expired still reclaim, so refusing costs one TTL.
+  if (nonceOf(record.token) !== self.nonce) return false;
   return !self.heldTokens.has(record.token);
 }
 
@@ -391,7 +425,7 @@ function clearOwnOrphans(opts: ClaimOptions, self: SelfClaim, keepSlot: number):
  */
 export function claimSlot(opts: ClaimOptions): Claim | null {
   ensureStateDir(opts.stateDir);
-  const self: SelfClaim = { pid: opts.record.pid, heldTokens: opts.heldTokens ?? new Set() };
+  const self: SelfClaim = { pid: opts.record.pid, nonce: nonceOf(opts.record.token), heldTokens: opts.heldTokens ?? new Set() };
   const draft = path.join(opts.stateDir, `slot.draft-${opts.record.pid}-${Math.random().toString(36).slice(2, 8)}`);
   try {
     writeFileSync(draft, JSON.stringify(opts.record), { mode: 0o644 });
