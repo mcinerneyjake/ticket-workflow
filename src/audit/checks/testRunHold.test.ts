@@ -20,15 +20,16 @@ function run(files: Record<string, string | ReadResult>) {
 
 const HOLD = `await holdTestRun({ repo: 'x' });`;
 const RELEASE = 'globalSetup: [TEST_RUN_GLOBAL_SETUP]';
+const REPORTER = `reporters: ['default', new TestRunSlotReporter({ repo: 'x' })]`;
 
-function config(preamble: string, release: string = RELEASE): string {
+function config(preamble: string, release: string = RELEASE, reporter: string = REPORTER): string {
   return `import { defineConfig } from 'vitest/config';
-import { holdTestRun, TEST_RUN_GLOBAL_SETUP } from 'ticket-workflow/test-run';
+import { holdTestRun, TEST_RUN_GLOBAL_SETUP, TestRunSlotReporter } from 'ticket-workflow/test-run';
 
 ${preamble}
 
 export default defineConfig({
-  test: { ${release} },
+  test: { ${[reporter, release].filter((p) => p !== '').join(', ')} },
 });
 `;
 }
@@ -316,6 +317,165 @@ describe('test-run-hold — the release, which the hold alone does not prove', (
   });
 });
 
+/** A held, released config whose test block is `body`, for the reporter's shapes. */
+function withReporter(body: string, extra = ''): string {
+  return rawConfig(`{ test: { ${RELEASE}, ${body} } }`) + extra;
+}
+
+/** The third wiring line (tkt-8060fdaeb366). Inert under `vitest run`, so its absence costs only
+ *  watch mode — an idle watcher holds its slot for the whole session (tkt-43881f6840ad). */
+describe('test-run-hold — the watch-mode reporter, which hold + release do not prove', () => {
+  it('FAILS a held, released config with no reporter, naming the reporter rather than the hold or release', () => {
+    const res = run({ 'vitest.config.ts': config(HOLD, RELEASE, '') });
+    expect(res.status, res.detail).toBe('fail');
+    expect(res.detail).toContain('TestRunSlotReporter');
+    expect(res.detail).toContain('watch');
+    expect(res.detail).not.toContain('does not call holdTestRun');
+    expect(res.detail).not.toContain('nothing in test.globalSetup');
+  });
+
+  it('FAILS a reporters array that carries only other reporters', () => {
+    expect(run({ 'vitest.config.ts': config(HOLD, RELEASE, `reporters: ['default', 'junit']`) }).status).toBe('fail');
+  });
+
+  it('PASSES the array, bare-instance, namespaced, quoted-key, no-paren and alongside-others spellings', () => {
+    for (const reporter of [
+      REPORTER,
+      'reporters: new TestRunSlotReporter()',
+      'reporters: [new tw.TestRunSlotReporter()]',
+      `'reporters': ['default', new TestRunSlotReporter()]`,
+      'reporters: [new TestRunSlotReporter]',
+      `reporters: ['default', ['junit', { outputFile: 'j.xml' }], new TestRunSlotReporter({ repo: 'x' }), 'verbose']`,
+    ]) {
+      const res = run({ 'vitest.config.ts': config(HOLD, RELEASE, reporter) });
+      expect(res.status, `${reporter} -> ${res.detail}`).toBe('pass');
+    }
+  });
+
+  it('FAILS a reporter that is only commented out or quoted', () => {
+    for (const reporter of [
+      `reporters: ['default' /* , new TestRunSlotReporter() */]`,
+      `reporters: ['default', 'new TestRunSlotReporter()']`,
+    ]) {
+      expect(run({ 'vitest.config.ts': config(HOLD, RELEASE, reporter) }).status, reporter).toBe('fail');
+    }
+  });
+
+  /** vitest wants an instance; a class reference is a reporter object with no hooks, so nothing releases. */
+  it('FAILS the class passed without `new`', () => {
+    expect(run({ 'vitest.config.ts': config(HOLD, RELEASE, 'reporters: [TestRunSlotReporter]') }).status).toBe('fail');
+  });
+
+  it('FAILS a lookalike identifier or key', () => {
+    for (const reporter of [
+      'reporters: [new TestRunSlotReporterOld()]',
+      'reporters: [new MyTestRunSlotReporter()]',
+      'myReporters: [new TestRunSlotReporter()]',
+    ]) {
+      expect(run({ 'vitest.config.ts': config(HOLD, RELEASE, reporter) }).status, reporter).toBe('fail');
+    }
+  });
+
+  it('FAILS a reporter that is not a direct child of the test block', () => {
+    for (const body of [
+      `{ reporters: [new TestRunSlotReporter()], test: { ${RELEASE} } }`,
+      `{ test: { ${RELEASE}, coverage: { reporters: [new TestRunSlotReporter()] } } }`,
+    ]) {
+      expect(run({ 'vitest.config.ts': rawConfig(body) }).status, body).toBe('fail');
+    }
+    const dead = withReporter(`environment: 'node'`, `
+const unused = { reporters: [new TestRunSlotReporter()] };
+`);
+    expect(run({ 'vitest.config.ts': dead }).status).toBe('fail');
+  });
+
+  /** Reporters are root-only under a projects split; a project's own `reporters` is silently ignored. */
+  it('FAILS a reporter that exists only inside a test.projects entry', () => {
+    const res = run({
+      'vitest.config.ts': withReporter(`projects: [{ test: { name: 'unit', reporters: [new TestRunSlotReporter()] } }]`),
+    });
+    expect(res.status, res.detail).toBe('fail');
+  });
+
+  it('PASSES a root reporter beside a projects split', () => {
+    const res = run({ 'vitest.config.ts': withReporter(`${REPORTER}, projects: [{ test: { name: 'unit' } }]`) });
+    expect(res.status, res.detail).toBe('pass');
+  });
+
+  /** JS keeps the LAST duplicate key. */
+  it('reads the last reporters key, which is the one that runs', () => {
+    expect(run({ 'vitest.config.ts': withReporter(`${REPORTER}, reporters: ['default']`) }).status).toBe('fail');
+    expect(run({ 'vitest.config.ts': withReporter(`reporters: ['default'], ${REPORTER}`) }).status).toBe('pass');
+  });
+
+  /** vitest treats a singular `test.reporter` as an override and replaces `reporters` wholesale. */
+  it('FAILS a singular test.reporter beside the wired reporters, naming the override', () => {
+    for (const body of [`${REPORTER}, reporter: 'dot'`, `reporter: ['dot'], ${REPORTER}`, `${REPORTER}, 'reporter': 'dot'`]) {
+      const res = run({ 'vitest.config.ts': withReporter(body) });
+      expect(res.status, body).toBe('fail');
+      expect(res.detail, body).toContain('test.reporter');
+    }
+  });
+
+  it("does not mistake coverage's own `reporter` key for the override", () => {
+    const res = run({ 'vitest.config.ts': withReporter(`${REPORTER}, coverage: { reporter: ['text'] }`) });
+    expect(res.status, res.detail).toBe('pass');
+  });
+
+  it('BLOCKS when the reporters value cannot be delimited, rather than reading past it', () => {
+    const res = run({
+      'vitest.config.ts': withReporter(`reporters: mk(, coverage: { exclude: [new TestRunSlotReporter()] }`),
+    });
+    expect(res.status, res.detail).toBe('blocked');
+  });
+
+  /** Review findings: a `test:` body that is not the exported config's still read as the root. */
+  it('BLOCKS when more than one candidate root test block exists, rather than trusting any one', () => {
+    const hoisted = `${HOLD}\nconst unit = defineProject({ test: { name: 'unit', ${REPORTER} } });\nexport default defineConfig({ test: { ${RELEASE}, projects: [unit] } });`;
+    const dead = `${config(HOLD, RELEASE, '')}\nconst unused = { test: { ${REPORTER} } };\n`;
+    const branched = `${HOLD}\nexport default process.env.CI ? defineConfig({ test: { ${RELEASE}, ${REPORTER} } }) : defineConfig({ test: { ${RELEASE} } });`;
+    for (const src of [hoisted, dead, branched]) {
+      const res = run({ 'vitest.config.ts': src });
+      expect(res.status, `${src}\n-> ${res.detail}`).toBe('blocked');
+    }
+  });
+
+  it('BLOCKS an instance that is conditional, short-circuited or deferred', () => {
+    for (const reporter of [
+      `reporters: watch ? ['default'] : ['default', new TestRunSlotReporter()]`,
+      `reporters: ['default', false && new TestRunSlotReporter()]`,
+      `reporters: ['default', x || new TestRunSlotReporter()]`,
+      `reporters: ['default', () => new TestRunSlotReporter()]`,
+    ]) {
+      const res = run({ 'vitest.config.ts': config(HOLD, RELEASE, reporter) });
+      expect(res.status, `${reporter} -> ${res.detail}`).toBe('blocked');
+    }
+  });
+
+  it('BLOCKS a reporters array with a trailing member chain that may drop the instance', () => {
+    const res = run({ 'vitest.config.ts': config(HOLD, RELEASE, `reporters: ['default', new TestRunSlotReporter()].slice(0, 1)`) });
+    expect(res.status, res.detail).toBe('blocked');
+  });
+
+  it('FAILS a shorthand reporter key as the override, and BLOCKS a computed key it cannot name', () => {
+    const shorthand = run({ 'vitest.config.ts': withReporter(`reporter, ${REPORTER}`) });
+    expect(shorthand.status, shorthand.detail).toBe('fail');
+    expect(shorthand.detail).toContain('test.reporter');
+    const computed = run({ 'vitest.config.ts': withReporter(`['reporter']: 'dot', ${REPORTER}`) });
+    expect(computed.status, computed.detail).toBe('blocked');
+  });
+
+  it('PASSES the real shape of a config that wires the reporter beside other conditional keys', () => {
+    const res = run({ 'vitest.config.ts': withReporter(`${REPORTER}, maxWorkers: process.env.CI ? 2 : 1`) });
+    expect(res.status, res.detail).toBe('pass');
+  });
+
+  it('keeps the hold and release messages when either is the defect', () => {
+    expect(run({ 'vitest.config.ts': config('', RELEASE, '') }).detail).toContain('does not call holdTestRun');
+    expect(run({ 'vitest.config.ts': config(HOLD, '', '') }).detail).toContain('nothing in test.globalSetup');
+  });
+});
+
 describe('test-run-hold — advisory, and the scaffold starts wired', () => {
   it('a FAIL leaves auditExitCode at 0', () => {
     const res = run({ 'vitest.config.ts': config('') });
@@ -329,5 +489,6 @@ describe('test-run-hold — advisory, and the scaffold starts wired', () => {
     const template = readFileSync(new URL('../../../templates/node/vitest.config.ts', import.meta.url), 'utf8');
     expect(run({ 'vitest.config.ts': template }).status).toBe('pass');
     expect(template).toMatch(/globalSetup:\s*\[TEST_RUN_GLOBAL_SETUP\]/);
+    expect(template).toMatch(/new TestRunSlotReporter\(/);
   });
 });

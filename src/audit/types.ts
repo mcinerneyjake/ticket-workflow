@@ -27,8 +27,9 @@ export interface AuditResult {
    * the fleet is clean, and adding a fifth advisory check on THIS precedent needs the same argument
    * made explicitly rather than inherited.
    *
-   * test-run-hold is advisory on its own argument: consumers cannot pass it until they bump to the
-   * release shipping `holdTestRun` (tkt-103ad27180c3). Promotion is tkt-d345e96e6d5e.
+   * test-run-hold is advisory on its own argument: consumers cannot pass it until they bump to a
+   * release shipping both `holdTestRun` (tkt-103ad27180c3) and `TestRunSlotReporter`
+   * (tkt-8060fdaeb366). Promotion is tkt-d345e96e6d5e.
    *
    * pin-resolved IS a conformance fact, but the tag's commit is knowable only from the remote, so
    * gating would fail a required check on an unreachable network (tkt-2db61a124801).
