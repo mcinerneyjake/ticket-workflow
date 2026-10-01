@@ -89,6 +89,41 @@ const MANIFEST: ReadonlyArray<ManifestEntry> = [
 // src/ and dist/ both sit one level below the package root, so ../templates resolves from either.
 const DEFAULT_TEMPLATES_DIR = fileURLToPath(new URL('../templates/', import.meta.url));
 
+export const SKILLS_DIR = '.claude/skills';
+const SKILLS_UPSTREAM = 'skills/UPSTREAM.json';
+const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+// Vendored skills (tkt-e759d07ef1c5). Every skill dir gets its own MIT LICENSE: the notice travels
+// with each copy, and inlining it would push SKILL.md past the 120-line cap.
+function skillManifest(templatesDir: string): ManifestEntry[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readTemplate(templatesDir, SKILLS_UPSTREAM));
+  } catch (err) {
+    throw new Error(`guardrailTemplates: ${SKILLS_UPSTREAM} is unusable: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
+  }
+  const skills = typeof parsed === 'object' && parsed !== null && 'skills' in parsed ? parsed.skills : undefined;
+  // An empty set must throw: skills-current would otherwise certify every repo against nothing.
+  if (typeof skills !== 'object' || skills === null || Array.isArray(skills) || Object.keys(skills).length === 0) {
+    throw new Error(`guardrailTemplates: ${SKILLS_UPSTREAM} has no non-empty "skills" object`);
+  }
+  const entries: ManifestEntry[] = [];
+  for (const [name, skill] of Object.entries(skills)) {
+    const files: unknown = typeof skill === 'object' && skill !== null && 'files' in skill ? skill.files : undefined;
+    if (!SAFE_SEGMENT.test(name) || !Array.isArray(files) || files.length === 0) {
+      throw new Error(`guardrailTemplates: ${SKILLS_UPSTREAM} entry ${JSON.stringify(name)} is malformed`);
+    }
+    for (const file of [...files, 'LICENSE']) {
+      if (typeof file !== 'string' || !SAFE_SEGMENT.test(file)) {
+        throw new Error(`guardrailTemplates: ${SKILLS_UPSTREAM} entry ${JSON.stringify(name)} lists an unsafe file ${JSON.stringify(file)}`);
+      }
+      const source = file === 'LICENSE' ? 'skills/LICENSE' : `skills/${name}/${file}`;
+      entries.push({ source, targetPath: `${SKILLS_DIR}/${name}/${file}`, tier: 'core' });
+    }
+  }
+  return entries;
+}
+
 /** One place for tier subsumption, shared by audit's check set and init's scaffold set — two
  *  hand-copied predicates drift the moment a third tier appears. */
 export function tierIncludes(repoTier: GuardrailTier, itemTier: GuardrailTier): boolean {
@@ -121,7 +156,8 @@ function readTemplate(templatesDir: string, source: string): string {
 }
 
 export function guardrailTemplates(templatesDir: string = DEFAULT_TEMPLATES_DIR, tier?: GuardrailTier): GuardrailTemplate[] {
-  const selected = tier === undefined ? MANIFEST : MANIFEST.filter((m) => tierIncludes(tier, m.tier));
+  const manifest = [...MANIFEST, ...skillManifest(templatesDir)];
+  const selected = tier === undefined ? manifest : manifest.filter((m) => tierIncludes(tier, m.tier));
   const byTarget = resolveManifest(selected);
   const shadowed = selected.filter((m) => byTarget.get(m.targetPath) !== m);
   for (const { source } of shadowed) readTemplate(templatesDir, source);

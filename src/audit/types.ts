@@ -34,6 +34,10 @@ export interface AuditResult {
    * pin-resolved IS a conformance fact, but the tag's commit is knowable only from the remote, so
    * gating would fail a required check on an unreachable network (tkt-2db61a124801).
    *
+   * skills-current and skill-line-cap are conformance facts, advisory for blast radius as the
+   * tmpdir-cleanup argument made again: every consumer predates the vendored skills, so gating would
+   * redden every consumer's required gate the day the release lands (tkt-e759d07ef1c5).
+   *
    * Everything else that cannot be determined still fails the gate — "can't check" is not
    * conformance.
    */

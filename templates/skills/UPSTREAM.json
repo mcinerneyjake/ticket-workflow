@@ -1,0 +1,37 @@
+{
+  "repo": "mattpocock/skills",
+  "commit": "d81f3a183412e71a5b1e84ca21bc1a35eea03a60",
+  "skills": {
+    "grilling": { "path": "skills/productivity/grilling", "files": ["SKILL.md"] },
+    "tdd": { "path": "skills/engineering/tdd", "files": ["SKILL.md", "mocking.md", "tests.md"] },
+    "standards-and-spec-review": { "path": "skills/engineering/code-review", "files": ["SKILL.md"] },
+    "handoff": { "path": "skills/productivity/handoff", "files": ["SKILL.md"] },
+    "codebase-design": { "path": "skills/engineering/codebase-design", "files": ["SKILL.md", "DEEPENING.md", "DESIGN-IT-TWICE.md"] }
+  },
+  "patches": [
+    {
+      "file": "standards-and-spec-review/SKILL.md",
+      "why": "Renamed from upstream code-review: that name is Claude Code's built-in /code-review, which consumer review gates run.",
+      "find": "name: code-review\n",
+      "replace": "name: standards-and-spec-review\n"
+    },
+    {
+      "file": "standards-and-spec-review/SKILL.md",
+      "why": "Upstream points at /setup-matt-pocock-skills, which is not vendored; the set must stay tracker-agnostic (tkt-e759d07ef1c5).",
+      "find": "The issue tracker should have been provided to you. If `docs/agents/issue-tracker.md` is missing, tell the user to run `/setup-matt-pocock-skills`.\n\n",
+      "replace": ""
+    },
+    {
+      "file": "standards-and-spec-review/SKILL.md",
+      "why": "Same: docs/agents/issue-tracker.md is written by that unvendored setup skill.",
+      "find": ", fetched via the workflow in `docs/agents/issue-tracker.md`.",
+      "replace": ", fetched with whatever issue-tracker tools this session has."
+    },
+    {
+      "file": "tdd/SKILL.md",
+      "why": "Follows the rename above.",
+      "find": "(see the `code-review` skill)",
+      "replace": "(see the `standards-and-spec-review` skill)"
+    }
+  ]
+}
