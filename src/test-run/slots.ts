@@ -239,6 +239,9 @@ function acquireReclaimLock(lock: string, now: number): boolean {
   return false;
 }
 
+// Process-wide, even read from a worker thread; floored to `startedAt`'s ms precision.
+const PROCESS_STARTED_AT = Math.floor(performance.timeOrigin);
+
 /** Who is claiming: the pid, plus the tokens of the slots this process still holds. */
 interface SelfClaim {
   readonly pid: number;
@@ -251,14 +254,13 @@ interface SelfClaim {
  * a live record and over-grant `slots` (tkt-a99209bedbb9). Both the out-of-lock decision and
  * reclaim's in-lock re-check go through here, so the two cannot disagree and half-apply the reclaim.
  *
- * Two cases it does NOT distinguish, neither of them new and neither improved here:
- * a token-less record (the pre-token rule, pid alone — wrong if a second *version* of this package is
- * live in this process, tkt-a51a84902cc9), and a foreign process wearing our pid, whose token is
- * absent from our set for the same reason a leak's is (tkt-f5dae96f0298).
+ * Token-less and started during this process: an older package copy's live hold (tkt-a51a84902cc9).
+ * Still undistinguished: a live foreign process wearing our pid (tkt-f5dae96f0298).
  */
 function isSelfOrphan(record: SlotRecord, self: SelfClaim | null): boolean {
   if (self === null || record.pid !== self.pid) return false;
-  return record.token === undefined || !self.heldTokens.has(record.token);
+  if (record.token === undefined) return Date.parse(record.startedAt) < PROCESS_STARTED_AT;
+  return !self.heldTokens.has(record.token);
 }
 
 /**
@@ -292,10 +294,13 @@ function reclaim(view: SlotView, opts: ReadOptions, self: SelfClaim | null): boo
   }
 }
 
+/** Required token: isSelfOrphan treats a token-less own-pid record as another copy's (tkt-a51a84902cc9). */
+export type ClaimRecord = SlotRecord & { readonly token: string };
+
 export interface ClaimOptions extends ReadOptions {
   readonly stateDir: string;
   readonly slots: number;
-  readonly record: SlotRecord;
+  readonly record: ClaimRecord;
   readonly log: (line: string) => void;
   /** Tokens of slots this process still holds: live siblings, never leaks to reclaim. */
   readonly heldTokens?: ReadonlySet<string>;

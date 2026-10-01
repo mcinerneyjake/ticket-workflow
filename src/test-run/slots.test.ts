@@ -77,7 +77,7 @@ const TTL = 15 * 60_000;
 
 function claim(dir: string, rec: SlotRecord, extra: Partial<Parameters<typeof claimSlot>[0]> = {}) {
   const log: string[] = [];
-  const result = claimSlot({ stateDir: dir, slots: 1, record: rec, probe: pidLiveness, now: NOW, ttlMs: TTL, log: (l) => log.push(l), ...extra });
+  const result = claimSlot({ stateDir: dir, slots: 1, record: { token: 'tok-claimant', ...rec }, probe: pidLiveness, now: NOW, ttlMs: TTL, log: (l) => log.push(l), ...extra });
   return { result, log };
 }
 
@@ -155,7 +155,7 @@ describe('claimSlot — the slot dimension', () => {
     const dir = stateDir();
     const { result } = claim(dir, record(process.pid));
     expect(result).toEqual({ slot: 0, file: path.join(dir, 'slot-0') });
-    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))).toEqual(record(process.pid));
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))).toEqual({ ...record(process.pid), token: 'tok-claimant' });
     expect(readdirSync(dir)).toEqual(['slot-0']); // the draft is gone
   });
 
@@ -286,7 +286,7 @@ describe('claimSlot — the holder dimension', () => {
 
   it('reclaims a fresh, live slot recording OUR OWN pid — a leak from a failed release, not a peer', () => {
     const dir = stateDir();
-    plant(dir, 0, record(process.pid, 'ourself'), TTL - 60_000);
+    plant(dir, 0, { ...record(process.pid, 'ourself'), token: 'tok-leaked' }, TTL - 60_000);
     const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive) });
     expect(result?.slot).toBe(0);
     expect(log.some((l) => l.includes('own orphaned slot'))).toBe(true);
@@ -295,7 +295,7 @@ describe('claimSlot — the holder dimension', () => {
 
   it('reuses our own orphan rather than leaking a second slot beside it', () => {
     const dir = stateDir();
-    plant(dir, 0, record(process.pid, 'ourself'), TTL - 60_000);
+    plant(dir, 0, { ...record(process.pid, 'ourself'), token: 'tok-leaked' }, TTL - 60_000);
     const { result } = claim(dir, record(process.pid), { slots: 2, probe: fixedProbe(alive) });
     expect(result?.slot).toBe(0);
     expect(readdirSync(dir)).toEqual(['slot-0']); // not slot-0 AND slot-1
@@ -306,7 +306,7 @@ describe('claimSlot — the holder dimension', () => {
     // failed its release, then found slot 0 free would otherwise hold two slots and wedge the machine
     // for the full TTL — the very symptom this ticket removes (tkt-0ce4d4313ce7).
     const dir = stateDir();
-    plant(dir, 1, record(process.pid, 'orphan'), TTL - 60_000);
+    plant(dir, 1, { ...record(process.pid, 'orphan'), token: 'tok-leaked' }, TTL - 60_000);
     const { result, log } = claim(dir, record(process.pid, 'me'), { slots: 2, probe: fixedProbe(alive) });
     expect(result?.slot).toBe(0);
     expect(readdirSync(dir)).toEqual(['slot-0']);
@@ -425,6 +425,72 @@ describe('claimSlot — the holder dimension', () => {
     const dir = stateDir();
     plant(dir, 0, { ...record(process.pid, 'wedged-sibling'), token: 'tok-live' }, TTL + 60_000);
     const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive), heldTokens: new Set(['tok-live']) });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('no heartbeat within the TTL'))).toBe(true);
+  });
+
+  // Token-less own-pid records (tkt-a51a84902cc9): each "during this process" case pairs with a "before" one.
+  const processStart = Math.floor(performance.timeOrigin);
+  const tokenless = (repo: string, startedAtMs: number): SlotRecord => ({ ...record(process.pid, repo), startedAt: new Date(startedAtMs).toISOString() });
+
+  it('does NOT reclaim a token-less record our pid wrote during this process — another copy’s live hold', () => {
+    const dir = stateDir();
+    plant(dir, 0, tokenless('older-copy', Date.now()), TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive), heldTokens: new Set() });
+    expect(result).toBeNull();
+    expect(log).toEqual([]);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('older-copy');
+  });
+
+  it('DOES reclaim a token-less record our pid wrote before this process started — a recycled pid’s leak', () => {
+    const dir = stateDir();
+    plant(dir, 0, tokenless('previous-incarnation', processStart - 60_000), TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive), heldTokens: new Set() });
+    expect(result?.slot).toBe(0);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(true);
+  });
+
+  it('takes the next free slot rather than deleting another copy’s token-less hold', () => {
+    const dir = stateDir();
+    plant(dir, 0, tokenless('older-copy', Date.now()), TTL - 60_000);
+    const { result } = claim(dir, record(process.pid, 'me'), { slots: 2, probe: fixedProbe(alive) });
+    expect(result?.slot).toBe(1);
+    expect(parseSlotRecord(readFileSync(path.join(dir, 'slot-0'), 'utf8'))?.repo).toBe('older-copy');
+  });
+
+  it('does not sweep another copy’s token-less hold from a LATER slot when it grants an earlier free one', () => {
+    const dir = stateDir();
+    plant(dir, 1, tokenless('older-copy', Date.now()), TTL - 60_000);
+    const { result, log } = claim(dir, record(process.pid, 'me'), { slots: 2, probe: fixedProbe(alive) });
+    expect(result?.slot).toBe(0);
+    expect(readdirSync(dir).sort()).toEqual(['slot-0', 'slot-1']);
+    expect(log.some((l) => l.includes('own orphaned slot'))).toBe(false);
+  });
+
+  it('does sweep a recycled pid’s token-less leak from a LATER slot', () => {
+    const dir = stateDir();
+    plant(dir, 1, tokenless('previous-incarnation', processStart - 60_000), TTL - 60_000);
+    const { result } = claim(dir, record(process.pid, 'me'), { slots: 2, probe: fixedProbe(alive) });
+    expect(result?.slot).toBe(0);
+    expect(readdirSync(dir)).toEqual(['slot-0']);
+  });
+
+  it('treats startedAt exactly at process start as this process’s — the boundary fails closed', () => {
+    const dir = stateDir();
+    plant(dir, 0, tokenless('boundary', processStart), TTL - 60_000);
+    expect(claim(dir, record(process.pid), { probe: fixedProbe(alive) }).result).toBeNull();
+  });
+
+  it('treats startedAt one millisecond before process start as a previous incarnation', () => {
+    const dir = stateDir();
+    plant(dir, 0, tokenless('boundary', processStart - 1), TTL - 60_000);
+    expect(claim(dir, record(process.pid), { probe: fixedProbe(alive) }).result?.slot).toBe(0);
+  });
+
+  it('still reclaims another copy’s token-less hold once its heartbeat is past the TTL', () => {
+    const dir = stateDir();
+    plant(dir, 0, tokenless('wedged-older-copy', Date.now()), TTL + 60_000);
+    const { result, log } = claim(dir, record(process.pid), { probe: fixedProbe(alive) });
     expect(result?.slot).toBe(0);
     expect(log.some((l) => l.includes('no heartbeat within the TTL'))).toBe(true);
   });
