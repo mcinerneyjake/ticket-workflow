@@ -762,6 +762,60 @@ describe('listSlots and clearStaleSlots', () => {
   });
 });
 
+// Claimers link and releasers unlink without the reclaim lock, so the path can change hands between
+// the in-lock judgement and the rename (tkt-12ebbc36021a). The in-lock probe is the seam: it runs
+// after that read and before the rename, so a swap there is exactly the race.
+describe('reclaim — the slot changing hands under the lock', () => {
+  function swapTo(file: string, fresh: SlotRecord): void {
+    rmSync(file);
+    writeFileSync(file, JSON.stringify(fresh));
+  }
+
+  it('claim path: a live record linked after the in-lock judgement is kept, and the claimant is refused', () => {
+    const dir = stateDir();
+    const file = plant(dir, 0, record(FOREIGN_PID, 'wedged'), TTL + 60_000);
+    const fresh = { ...record(FOREIGN_PID, 'fresh'), token: 'tok-fresh' };
+    let probes = 0;
+    // Call 1 is the out-of-lock read; call 2 is the in-lock re-read, after which the holder releases
+    // and a peer claims.
+    const probe = (): Liveness => {
+      probes += 1;
+      if (probes === 2) swapTo(file, fresh);
+      return alive;
+    };
+    const { result, log } = claim(dir, record(process.pid), { probe });
+    expect(result).toBeNull();
+    expect(log).toEqual([]);
+    expect(readFileSync(file, 'utf8')).toBe(JSON.stringify(fresh));
+    expect(readdirSync(dir)).toEqual(['slot-0']);
+  });
+
+  it('sweep path: clear-stale keeps a live record that replaced the dead one it judged', () => {
+    const dir = stateDir();
+    const file = plant(dir, 0, record(exitedPid(), 'dead'));
+    const fresh = { ...record(FOREIGN_PID, 'fresh'), token: 'tok-fresh' };
+    let probes = 0;
+    // Call 1 is the scan; call 2 is the in-lock re-read.
+    const probe = (pid: number): Liveness => {
+      probes += 1;
+      if (probes === 2) swapTo(file, fresh);
+      return pidLiveness(pid);
+    };
+    const removed = clearStaleSlots(dir, { probe, now: Date.now(), ttlMs: TTL });
+    expect(removed).toEqual([]);
+    expect(readFileSync(file, 'utf8')).toBe(JSON.stringify(fresh));
+    expect(readdirSync(dir)).toEqual(['slot-0']);
+  });
+
+  it('still reclaims when nothing changed hands, leaving no stale-rename residue', () => {
+    const dir = stateDir();
+    plant(dir, 0, record(exitedPid(), 'dead'));
+    const removed = clearStaleSlots(dir, { probe: pidLiveness, now: Date.now(), ttlMs: TTL });
+    expect(removed.map((v) => v.record?.repo)).toEqual(['dead']);
+    expect(readdirSync(dir)).toEqual([]);
+  });
+});
+
 describe('mintToken', () => {
   // '' is the empty branch; 'has.separator' parses back as a SHORTER domain and '.' as an empty one —
   // two different consequences of the same clause. A third dotted case would add no branch.

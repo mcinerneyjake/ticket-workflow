@@ -13,6 +13,7 @@ import {
   unlinkSync,
   utimesSync,
   writeFileSync,
+  type BigIntStats,
 } from 'node:fs';
 import { constants as fsConstants } from 'node:fs';
 import { homedir } from 'node:os';
@@ -179,24 +180,39 @@ function unparseableRefusal(file: string): TestRunRefusal {
   );
 }
 
+/** `null` when no slot file exists. */
+function openSlot(file: string): number | null {
+  try {
+    return openSync(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK); // a FIFO must not block the read
+  } catch (err) {
+    if (errnoCode(err) === 'ENOENT') return null;
+    throw unreadable(file, err);
+  }
+}
+
 function inspectSlot(stateDir: string, slot: number, probe: Probe, now: number, ttlMs: number): SlotRead | null {
   const file = slotPath(stateDir, slot);
+  const fd = openSlot(file);
+  if (fd === null) return null;
+  try {
+    return judgeSlot(fd, file, slot, probe, now, ttlMs);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// One fd: a path stat then a path read can pair an old file's expired mtime with a new file's content.
+function judgeSlot(fd: number, file: string, slot: number, probe: Probe, now: number, ttlMs: number): SlotRead {
   let text: string;
   let mtimeMs: number;
-  let fd: number | undefined;
   try {
-    // One fd: a path stat then a path read can pair an old file's expired mtime with a new file's content.
-    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK); // a FIFO must not block the read
     const st = fstatSync(fd);
     if (!st.isFile()) throw unreadable(file, 'not a regular file');
     mtimeMs = st.mtimeMs;
     text = readFileSync(fd, 'utf8');
   } catch (err) {
     if (err instanceof TestRunRefusal) throw err;
-    if (errnoCode(err) === 'ENOENT') return null;
     throw unreadable(file, err);
-  } finally {
-    if (fd !== undefined) closeSync(fd);
   }
   const ageMs = Math.max(0, now - mtimeMs);
   const expired = ageMs > ttlMs;
@@ -348,6 +364,30 @@ function staleHold(self: SelfClaim | null): StaleTest {
 // An unparseable record may be another version's live hold: no heartbeat within the TTL is its only staleness (tkt-c3df050395d8).
 const staleForSweep: StaleTest = (current) => (current.record === null ? current.expired : current.liveness === 'dead' || current.expired);
 
+/** `null` when the identity cannot be told apart: a filesystem reporting ino 0 must not match everything. */
+function identity(st: BigIntStats): string | null {
+  return st.ino === 0n ? null : `${st.dev}:${st.ino}`;
+}
+
+/**
+ * Puts back a record a reclaim renamed away by mistake. `link` never replaces, so a slot re-granted in
+ * the rename-to-restore window refuses here, and the displaced record stays on disk as the evidence.
+ */
+function restore(stale: string, file: string): void {
+  try {
+    linkSync(stale, file);
+  } catch (err) {
+    if (errnoCode(err) === 'EEXIST') {
+      throw new TestRunRefusal(
+        EXIT.STATE_UNREADABLE,
+        `${file} changed hands twice during a reclaim; the live hold it displaced could not be put back and is kept at ${stale}. Two runs may share that slot until one finishes.`,
+      );
+    }
+    throw unreadable(`link ${stale} -> ${file}`, err);
+  }
+  rmSync(stale, { force: true });
+}
+
 /**
  * Removes a slot `isStale` judges stale, deciding INSIDE a per-slot lock: judging from an earlier
  * read then renaming let a reclaimer rename a live winner's fresh record (3 of 8 granted,
@@ -357,19 +397,43 @@ const staleForSweep: StaleTest = (current) => (current.record === null ? current
 function reclaim(view: SlotRead, opts: ReadOptions, isStale: StaleTest): boolean {
   const lock = `${view.file}.reclaim`;
   if (!acquireReclaimLock(lock, opts.now)) return false;
+  let fd: number | null = null;
   try {
-    const current = inspectSlot(path.dirname(view.file), view.slot, opts.probe, opts.now, opts.ttlMs);
-    if (current === null || !isStale(current)) return false;
-    const stale = `${view.file}.stale-${current.record === null ? 'unparseable' : current.record.pid}-${opts.now}`;
+    fd = openSlot(view.file);
+    if (fd === null) return false;
+    let judged: BigIntStats;
+    try {
+      judged = fstatSync(fd, { bigint: true });
+    } catch (err) {
+      throw unreadable(view.file, err);
+    }
+    const current = judgeSlot(fd, view.file, view.slot, opts.probe, opts.now, opts.ttlMs);
+    if (!isStale(current)) return false;
+    const owner = current.record === null ? 'unparseable' : current.record.pid;
+    const stale = `${view.file}.stale-${owner}-${opts.now}-${Math.random().toString(36).slice(2, 8)}`;
     try {
       renameSync(view.file, stale);
     } catch (err) {
       if (errnoCode(err) === 'ENOENT') return false;
       throw unreadable(`rename ${view.file}`, err);
     }
+    // Claimers, releasers and heartbeats skip this lock, so the rename can take a newer record or a
+    // re-touched one (tkt-12ebbc36021a). The open fd pins the judged inode against number reuse.
+    let unchanged = false;
+    try {
+      const moved = statSync(stale, { bigint: true });
+      unchanged = identity(judged) !== null && identity(moved) === identity(judged) && moved.mtimeNs === judged.mtimeNs;
+    } catch {
+      // Cannot tell what was moved: put it back rather than delete it.
+    }
+    if (!unchanged) {
+      restore(stale, view.file);
+      return false;
+    }
     rmSync(stale, { force: true });
     return true;
   } finally {
+    if (fd !== null) closeSync(fd);
     try {
       rmdirSync(lock);
     } catch {
@@ -418,8 +482,13 @@ function clearOwnOrphans(opts: ClaimOptions, self: SelfClaim, keepSlot: number):
       continue;
     }
     if (view === null || !isSelfOrphan(view.record, self)) continue;
-    if (reclaim(view, opts, staleHold(self))) {
-      opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — our own orphaned slot from a failed release`);
+    try {
+      if (reclaim(view, opts, staleHold(self))) {
+        opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — our own orphaned slot from a failed release`);
+      }
+    } catch (err) {
+      // We already hold a slot: refusing now would strand it until the TTL (tkt-12ebbc36021a).
+      opts.log(`[test-run] WARNING: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 }
@@ -441,12 +510,16 @@ export function claimSlot(opts: ClaimOptions): Claim | null {
     for (let slot = 0; slot < opts.slots; slot += 1) {
       const target = slotPath(opts.stateDir, slot);
       for (let attempt = 0; attempt < 2; attempt += 1) {
+        let granted = false;
         try {
           linkSync(draft, target); // AUTHORIZING: the only line that grants a slot
-          clearOwnOrphans(opts, self, slot);
-          return { slot, file: target };
+          granted = true;
         } catch (err) {
           if (errnoCode(err) !== 'EEXIST') throw unreadable(`link ${target}`, err);
+        }
+        if (granted) {
+          clearOwnOrphans(opts, self, slot);
+          return { slot, file: target };
         }
         const view = readSlot(opts.stateDir, slot, opts.probe, opts.now, opts.ttlMs);
         if (view === null) continue; // freed between the link and the read; retry the link
