@@ -1,6 +1,9 @@
 import {
+  closeSync,
+  fstatSync,
   linkSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
@@ -11,6 +14,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
+import { constants as fsConstants } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -158,30 +162,53 @@ function slotPath(stateDir: string, slot: number): string {
   return path.join(stateDir, `slot-${slot}`);
 }
 
-/** Reads one slot. `null` means free (no file). Corrupt or unreadable content refuses. */
-function readSlot(stateDir: string, slot: number, probe: Probe, now: number, ttlMs: number): SlotView | null {
+export interface UnparseableSlot {
+  readonly slot: number;
+  readonly file: string;
+  readonly record: null;
+  readonly ageMs: number;
+  readonly expired: boolean;
+}
+
+export type SlotRead = SlotView | UnparseableSlot;
+
+function unparseableRefusal(file: string): TestRunRefusal {
+  return new TestRunRefusal(
+    EXIT.STATE_UNREADABLE,
+    `${file} is not a valid slot record; refusing to run unguarded. It may be a live hold written by another version of this package, so \`ticket-workflow test-slots clear-stale\` removes it only once nothing has refreshed it within the TTL. Before then, remove it by hand only once you know whose it is.`,
+  );
+}
+
+function inspectSlot(stateDir: string, slot: number, probe: Probe, now: number, ttlMs: number): SlotRead | null {
   const file = slotPath(stateDir, slot);
   let text: string;
   let mtimeMs: number;
+  let fd: number | undefined;
   try {
-    const st = statSync(file);
+    // One fd: a path stat then a path read can pair an old file's expired mtime with a new file's content.
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK); // a FIFO must not block the read
+    const st = fstatSync(fd);
     if (!st.isFile()) throw unreadable(file, 'not a regular file');
     mtimeMs = st.mtimeMs;
-    text = readFileSync(file, 'utf8');
+    text = readFileSync(fd, 'utf8');
   } catch (err) {
     if (err instanceof TestRunRefusal) throw err;
     if (errnoCode(err) === 'ENOENT') return null;
     throw unreadable(file, err);
-  }
-  const record = parseSlotRecord(text);
-  if (record === null) {
-    throw new TestRunRefusal(
-      EXIT.STATE_UNREADABLE,
-      `${file} is not a valid slot record; refusing to run unguarded. Inspect it, then remove it by hand or run \`ticket-workflow test-slots clear-stale\` once you know whose it is.`,
-    );
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
   const ageMs = Math.max(0, now - mtimeMs);
-  return { slot, file, record, liveness: probe(record.pid), ageMs, expired: ageMs > ttlMs };
+  const expired = ageMs > ttlMs;
+  const record = parseSlotRecord(text);
+  if (record === null) return { slot, file, record: null, ageMs, expired };
+  return { slot, file, record, liveness: probe(record.pid), ageMs, expired };
+}
+
+function readSlot(stateDir: string, slot: number, probe: Probe, now: number, ttlMs: number): SlotView | null {
+  const read = inspectSlot(stateDir, slot, probe, now, ttlMs);
+  if (read !== null && read.record === null) throw unparseableRefusal(read.file);
+  return read;
 }
 
 export interface ReadOptions {
@@ -190,8 +217,7 @@ export interface ReadOptions {
   readonly ttlMs: number;
 }
 
-/** Every held slot, in slot order. A missing state dir is an empty board; an unreadable one refuses. */
-export function listSlots(stateDir: string, opts: ReadOptions): SlotView[] {
+function inspectSlots(stateDir: string, opts: ReadOptions): SlotRead[] {
   let names: string[];
   try {
     names = readdirSync(stateDir);
@@ -204,12 +230,20 @@ export function listSlots(stateDir: string, opts: ReadOptions): SlotView[] {
     .filter((m): m is RegExpExecArray => m !== null)
     .map((m) => Number(m[1]))
     .sort((a, b) => a - b);
-  const out: SlotView[] = [];
+  const out: SlotRead[] = [];
   for (const slot of slots) {
-    const view = readSlot(stateDir, slot, opts.probe, opts.now, opts.ttlMs);
-    if (view !== null) out.push(view);
+    const read = inspectSlot(stateDir, slot, opts.probe, opts.now, opts.ttlMs);
+    if (read !== null) out.push(read);
   }
   return out;
+}
+
+/** Every held slot, in slot order. A missing state dir is an empty board; an unreadable one refuses. */
+export function listSlots(stateDir: string, opts: ReadOptions): SlotView[] {
+  return inspectSlots(stateDir, opts).map((read) => {
+    if (read.record === null) throw unparseableRefusal(read.file);
+    return read;
+  });
 }
 
 /** A stale lock is broken by RENAMING it, so only one of several breakers can win before the mkdir. */
@@ -263,20 +297,31 @@ function isSelfOrphan(record: SlotRecord, self: SelfClaim | null): boolean {
   return !self.heldTokens.has(record.token);
 }
 
+type StaleTest = (current: SlotRead) => boolean;
+
+function staleHold(self: SelfClaim | null): StaleTest {
+  return (current) => {
+    if (current.record === null) throw unparseableRefusal(current.file);
+    return current.liveness === 'dead' || current.expired || isSelfOrphan(current.record, self);
+  };
+}
+
+// An unparseable record may be another version's live hold: no heartbeat within the TTL is its only staleness (tkt-c3df050395d8).
+const staleForSweep: StaleTest = (current) => (current.record === null ? current.expired : current.liveness === 'dead' || current.expired);
+
 /**
- * Removes a dead, expired or self-orphaned slot, deciding INSIDE a per-slot lock: judging from an
- * earlier read then renaming let a reclaimer rename a live winner's fresh record (3 of 8 granted,
- * tkt-14788b3fc356). `self` must match the caller's out-of-lock decision, or this re-check vetoes
+ * Removes a slot `isStale` judges stale, deciding INSIDE a per-slot lock: judging from an earlier
+ * read then renaming let a reclaimer rename a live winner's fresh record (3 of 8 granted,
+ * tkt-14788b3fc356). `isStale` must match the caller's out-of-lock decision, or this re-check vetoes
  * it and the reclaim silently never happens.
  */
-function reclaim(view: SlotView, opts: ReadOptions, self: SelfClaim | null): boolean {
+function reclaim(view: SlotRead, opts: ReadOptions, isStale: StaleTest): boolean {
   const lock = `${view.file}.reclaim`;
   if (!acquireReclaimLock(lock, opts.now)) return false;
   try {
-    const current = readSlot(path.dirname(view.file), view.slot, opts.probe, opts.now, opts.ttlMs);
-    if (current === null) return false;
-    if (current.liveness !== 'dead' && !current.expired && !isSelfOrphan(current.record, self)) return false;
-    const stale = `${view.file}.stale-${current.record.pid}-${opts.now}`;
+    const current = inspectSlot(path.dirname(view.file), view.slot, opts.probe, opts.now, opts.ttlMs);
+    if (current === null || !isStale(current)) return false;
+    const stale = `${view.file}.stale-${current.record === null ? 'unparseable' : current.record.pid}-${opts.now}`;
     try {
       renameSync(view.file, stale);
     } catch (err) {
@@ -311,8 +356,9 @@ export interface Claim {
   readonly file: string;
 }
 
-export function formatSlot(v: SlotView): string {
+export function formatSlot(v: SlotRead): string {
   const age = Math.round(v.ageMs / 1000);
+  if (v.record === null) return `slot ${v.slot}: unparseable record (last written ${age}s ago)`;
   return `slot ${v.slot}: pid ${v.record.pid} ${v.record.repo} ${v.record.cwd} (${v.liveness}, last heartbeat ${age}s ago)`;
 }
 
@@ -333,7 +379,7 @@ function clearOwnOrphans(opts: ClaimOptions, self: SelfClaim, keepSlot: number):
       continue;
     }
     if (view === null || !isSelfOrphan(view.record, self)) continue;
-    if (reclaim(view, opts, self)) {
+    if (reclaim(view, opts, staleHold(self))) {
       opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — our own orphaned slot from a failed release`);
     }
   }
@@ -366,11 +412,11 @@ export function claimSlot(opts: ClaimOptions): Claim | null {
         const view = readSlot(opts.stateDir, slot, opts.probe, opts.now, opts.ttlMs);
         if (view === null) continue; // freed between the link and the read; retry the link
         if (view.liveness === 'dead') {
-          if (reclaim(view, opts, null)) opts.log(`[test-run] reclaimed ${formatSlot(view)} — process is gone`);
+          if (reclaim(view, opts, staleHold(null))) opts.log(`[test-run] reclaimed ${formatSlot(view)} — process is gone`);
           continue;
         }
         if (view.expired) {
-          if (reclaim(view, opts, null)) opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — no heartbeat within the TTL`);
+          if (reclaim(view, opts, staleHold(null))) opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — no heartbeat within the TTL`);
           continue;
         }
         if (isSelfOrphan(view.record, self)) {
@@ -378,7 +424,7 @@ export function claimSlot(opts: ClaimOptions): Claim | null {
           // from a failed release — not a peer. Without this the run blocks on itself until the TTL
           // (tkt-0ce4d4313ce7). A token we DO still hold falls through to the break below and is
           // treated as the live holder it is (tkt-a99209bedbb9).
-          if (reclaim(view, opts, self)) {
+          if (reclaim(view, opts, staleHold(self))) {
             opts.log(`[test-run] WARNING: reclaimed ${formatSlot(view)} — our own orphaned slot from a failed release`);
           }
           continue;
@@ -426,12 +472,13 @@ export function releaseSlot(file: string, pid: number, token?: string): ReleaseO
 }
 
 /** Removes dead and expired slots; leaves live ones. Returns what it removed. */
-export function clearStaleSlots(stateDir: string, opts: ReadOptions): SlotView[] {
-  const removed: SlotView[] = [];
-  for (const view of listSlots(stateDir, opts)) {
-    if (view.liveness === 'dead' || view.expired) {
-      if (reclaim(view, opts, null)) removed.push(view);
-    }
+export function clearStaleSlots(stateDir: string, opts: ReadOptions): SlotRead[] {
+  const reads = inspectSlots(stateDir, opts);
+  const fresh = reads.find((read) => read.record === null && !read.expired);
+  if (fresh !== undefined) throw unparseableRefusal(fresh.file);
+  const removed: SlotRead[] = [];
+  for (const read of reads) {
+    if (staleForSweep(read) && reclaim(read, opts, staleForSweep)) removed.push(read);
   }
   return removed;
 }

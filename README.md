@@ -857,6 +857,11 @@ npx ticket-workflow test-slots            # who holds what, with liveness and ag
 npx ticket-workflow test-slots clear-stale
 ```
 
+A slot file this copy cannot parse refuses any run that reaches it, because it may be a live hold
+written by another version of the package. `clear-stale` judges it by mtime alone: it removes it once no
+heartbeat has refreshed it within the default TTL, and refuses the whole sweep before then
+(`tkt-c3df050395d8`). A holder configured with a TTL or heartbeat above the default can be removed early.
+
 ### `test-contention` — proving the bound works
 
 `test-contention` checks the bound (`tkt-98cdd3b87020`). It runs `npm test` N times concurrently,
