@@ -11,9 +11,6 @@ const GUARDED_BY = /(?:=>|&&|\|\||\?\?|[?:{,]|\belse|\bdo)\s*$/;
 const CONTROL_HEAD = /\b(?:if|while|for(?:\s+await)?|with)\s*$/;
 const WIRING = '`await holdTestRun()` unconditionally at the top level of the config, released by `globalSetup: [TEST_RUN_GLOBAL_SETUP]`';
 
-// Stops at the colon: a masked string is all spaces, so a trailing `\s*` would skip the very
-// literal the path spelling lives in and land on the property's terminator.
-const RELEASE_KEY = /\bglobalSetup\s*:/g;
 const RELEASE_ID = /\bTEST_RUN_GLOBAL_SETUP\b/;
 // This package's own config cannot import itself by name, so the path spelling is first-class, not
 // a fallback — an identifier-only test reported `fail` on the repo that ships the check.
@@ -21,6 +18,12 @@ const RELEASE_PATH = /(?:^|[/\\])test-run[/\\]globalSetup\.[cm]?[jt]s$/;
 // "add to", not "use": a repo with its own global setup must keep it, and this check deliberately
 // does not open the referenced file, so it cannot tell that one already releases the slot.
 const RELEASE_ADVICE = '`TEST_RUN_GLOBAL_SETUP` to the `test.globalSetup` array (keeping any entry already there)';
+
+// `new` is required: vitest wants an instance, and a bare class reference has no hooks to fire.
+const REPORTER_INSTANCE = /\bnew\s+(?:[A-Za-z_$][\w$]*\s*\.\s*)?TestRunSlotReporter\b/;
+// Any of these in the value means the instance may never reach vitest; an optional chain is not one.
+const CONDITIONAL = /\?(?!\.)|&&|\|\||=>/;
+const REPORTER_ADVICE = "`new TestRunSlotReporter()` to the root `test.reporters` array (keeping 'default' and any others)";
 
 type Placement = 'top-level' | 'unawaited' | 'nested' | 'absent';
 
@@ -41,7 +44,7 @@ function guarded(before: string): boolean {
   return true;
 }
 
-/** [start, end) of the `globalSetup` value whose colon ends at `after`, or null when its extent is
+/** [start, end) of the key's value whose colon ends at `after`, or null when its extent is
  *  undeterminable. Leading space is skipped in the SOURCE and the terminator found in the MASK:
  *  only the source still distinguishes a blanked literal from the whitespace around it. Widening an
  *  unbalanced value to end-of-file instead let `coverage.exclude`'s path — which this repo's own
@@ -66,6 +69,25 @@ function valueSpan(masked: string, src: string, after: number, limit: number): r
   return depth === 0 ? [from, limit] : null;
 }
 
+/** Where each direct-child `<name>:` key of the body [start, end) ends, bare or quoted. */
+function keyEnds(m: Masked, start: number, end: number, name: string): number[] {
+  const ends: number[] = [];
+  // Stops at the colon: a masked string is all spaces, so a trailing `\s*` would skip the very
+  // literal the path spelling lives in and land on the property's terminator.
+  for (const hit of m.masked.slice(start, end).matchAll(new RegExp(`\\b${name}\\s*:`, 'g'))) {
+    const at = start + hit.index;
+    if (atKeyPosition(m.masked, at) && depthBetween(m.masked, start, at) === 0) ends.push(at + hit[0].length);
+  }
+  // A quoted key is blanked in the mask, so `'globalSetup': […]` is only visible in the literals.
+  for (const lit of m.literals) {
+    if (lit.value !== name || lit.start < start || lit.end > end) continue;
+    if (!atKeyPosition(m.masked, lit.start) || depthBetween(m.masked, start, lit.start) !== 0) continue;
+    const colon = /^\s*:/.exec(m.masked.slice(lit.end));
+    if (colon !== null) ends.push(lit.end + colon[0].length);
+  }
+  return ends;
+}
+
 type Release = 'released' | 'unreleased' | 'undeterminable';
 
 /** Whether the config gives the slot back. The hold alone does not prove it: without this,
@@ -84,18 +106,7 @@ function releases(m: Masked, src: string): Release {
   if (scan.unbalanced) return 'undeterminable';
   let verdict: Release = 'unreleased';
   for (const [start, end] of scan.bodies) {
-    const starts: number[] = [];
-    for (const hit of m.masked.slice(start, end).matchAll(RELEASE_KEY)) {
-      const at = start + hit.index;
-      if (atKeyPosition(m.masked, at) && depthBetween(m.masked, start, at) === 0) starts.push(at + hit[0].length);
-    }
-    // A quoted key is blanked in the mask, so `'globalSetup': […]` is only visible in the literals.
-    for (const lit of m.literals) {
-      if (lit.value !== 'globalSetup' || lit.start < start || lit.end > end) continue;
-      if (!atKeyPosition(m.masked, lit.start) || depthBetween(m.masked, start, lit.start) !== 0) continue;
-      const colon = /^\s*:/.exec(m.masked.slice(lit.end));
-      if (colon !== null) starts.push(lit.end + colon[0].length);
-    }
+    const starts = keyEnds(m, start, end, 'globalSetup');
     if (starts.length === 0) continue;
     // JS keeps the LAST duplicate key, so that is the one that actually runs.
     const span = valueSpan(m.masked, src, Math.max(...starts), end);
@@ -107,6 +118,53 @@ function releases(m: Masked, src: string): Release {
     if (wired) verdict = 'released';
   }
   return verdict;
+}
+
+type Reporting = 'wired' | 'missing' | 'overridden' | 'undeterminable';
+
+/** Whether `name` appears as a shorthand property (`{ reporter }`) directly in the body. */
+function shorthand(m: Masked, start: number, end: number, name: string): boolean {
+  for (const hit of m.masked.slice(start, end).matchAll(new RegExp(`\\b${name}(?=\\s*(?:,|$))`, 'g'))) {
+    const at = start + hit.index;
+    if (atKeyPosition(m.masked, at) && depthBetween(m.masked, start, at) === 0) return true;
+  }
+  return false;
+}
+
+/** Whether the body has a computed key (`[k]: …`), which could name anything. */
+function computedKey(m: Masked, start: number, end: number): boolean {
+  for (let i = start; i < end; i += 1) {
+    if (m.masked.charAt(i) !== '[' || !atKeyPosition(m.masked, i) || depthBetween(m.masked, start, i) !== 0) continue;
+    const close = matchDelimiter(m.masked, i, '[', ']');
+    if (close === -1 || /^\s*:/.test(m.masked.slice(close + 1, end))) return true;
+  }
+  return false;
+}
+
+/** Whether watch mode gets the reporter (tkt-8060fdaeb366): vitest reads only the ROOT `test` block's
+ *  reporters, and a singular `test.reporter` replaces them. Anything else ambiguous is undeterminable. */
+function reports(m: Masked, src: string): Reporting {
+  const scan = objectBodies(m, 'test', { directChildOnly: true });
+  if (scan.unbalanced) return 'undeterminable';
+  // A projects entry's `test` sits inside the root's. A second root — a hoisted project, a dead
+  // object, a branch on CI — may be the one vitest receives, so it is never taken on trust.
+  const roots = scan.bodies.filter(([s, e]) => !scan.bodies.some(([os, oe]) => os < s && e <= oe));
+  const [root, ...others] = roots;
+  if (root === undefined) return 'missing';
+  if (others.length > 0) return 'undeterminable';
+  const [start, end] = root;
+  if (keyEnds(m, start, end, 'reporter').length > 0 || shorthand(m, start, end, 'reporter')) return 'overridden';
+  if (computedKey(m, start, end)) return 'undeterminable';
+  const starts = keyEnds(m, start, end, 'reporters');
+  if (starts.length === 0) return 'missing';
+  const span = valueSpan(m.masked, src, Math.max(...starts), end);
+  if (span === null) return 'undeterminable';
+  const value = m.masked.slice(span[0], span[1]);
+  if (!REPORTER_INSTANCE.test(value)) return 'missing';
+  // valueSpan stops at an array's `]`, so `[…].slice(0, 1)` would otherwise read as the whole value.
+  const rest = m.masked.slice(span[1], end).trimStart();
+  if (CONDITIONAL.test(value) || !(rest === '' || rest.startsWith(','))) return 'undeterminable';
+  return 'wired';
 }
 
 /** Read off MASKED source so a commented-out or quoted call never counts. Un-awaited, the hold
@@ -125,6 +183,31 @@ function placement({ masked }: Masked): Placement {
     }
   }
   return best;
+}
+
+function reporterResult(check: AuditCheck, where: string, reporting: Reporting): AuditResult {
+  switch (reporting) {
+    case 'undeterminable':
+      return makeResult(check, 'blocked', `${where} holds and releases the slot, but whether TestRunSlotReporter reaches vitest could not be determined (several candidate test blocks, a computed key, or a conditional or chained reporters value)`);
+    case 'overridden':
+      return makeResult(
+        check,
+        'fail',
+        `${where} sets test.reporter, which vitest uses in place of test.reporters whenever it is non-empty, so TestRunSlotReporter may never run and a \`vitest\` watcher would keep its slot while idle; move every reporter into test.reporters`,
+      );
+    case 'missing':
+      return makeResult(
+        check,
+        'fail',
+        `${where} holds and releases the slot, but test.reporters has no TestRunSlotReporter — the config resolves once, so a \`vitest\` watch session keeps its slot while idle; add ${REPORTER_ADVICE}`,
+      );
+    case 'wired':
+      return makeResult(
+        check,
+        'pass',
+        `${where} awaits holdTestRun at the top level, releases it in test.globalSetup, and registers TestRunSlotReporter in test.reporters`,
+      );
+  }
 }
 
 export const testRunHold: AuditCheck = {
@@ -152,7 +235,7 @@ export const testRunHold: AuditCheck = {
               `${where} awaits holdTestRun but nothing in test.globalSetup releases the slot — a run killed by a signal then holds it until its TTL; add ${RELEASE_ADVICE}`,
             );
           case 'released':
-            return makeResult(this, 'pass', `${where} awaits holdTestRun at the top level and releases it in test.globalSetup`);
+            return reporterResult(this, where, reports(masked, config.contents));
         }
         break;
       case 'unawaited':
