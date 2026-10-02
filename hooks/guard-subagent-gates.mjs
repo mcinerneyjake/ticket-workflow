@@ -29,6 +29,7 @@
 
 import { readFileSync } from 'node:fs';
 import { isMain } from './lib/is-main.mjs';
+import { bareWord, commandWordIndex } from './lib/shell.mjs';
 import { splitSegments, parseGit } from './guard-bash.mjs';
 
 // `gh <group> <verb>` pairs a subagent may not run. PR-open verbs (create/edit/ready), read verbs and
@@ -80,14 +81,16 @@ const GH_VALUE_FLAGS = new Set(['-R', '--repo', '--hostname']);
 // an unknown flag from hiding the group, rather than failing open on it.
 const VALUE_SHAPED = /[/:.=@]/;
 
-// Same shape as guard-bash's parseGit: the command WORD must be `gh` after stripping subshell
-// punctuation and `VAR=val` prefixes, so `echo "gh pr merge"` is data, not an invocation.
+// The command WORD must be `gh` after parseGit's leading run, so `echo "gh pr merge"` is data, not an
+// invocation. Whitespace tokens on purpose; quoted values are tkt-098db663af30. A path spelling
+// counts, since `/opt/homebrew/bin/gh` is gh (tkt-bcc4f31c5b0a).
 export function parseGh(segment) {
   const stripped = segment.trim().replace(/^[({\s]+/, '').replace(/[)}\s]+$/, '');
   const tokens = stripped.split(/\s+/);
-  let cmd = 0;
-  while (cmd < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[cmd])) cmd++;
-  if (tokens[cmd] !== 'gh') return null;
+  const cmd = commandWordIndex(tokens);
+  if (cmd >= tokens.length) return null;
+  const word = bareWord(tokens[cmd]);
+  if (word !== 'gh' && !word.endsWith('/gh')) return null;
   const flags = tokens.slice(cmd + 1);
   const rest = [];
   for (let i = 0; i < flags.length; i++) {

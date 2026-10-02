@@ -257,6 +257,88 @@ describe('the disguised shapes', () => {
   });
 });
 
+// parseGh read only `VAR=` prefixes before the command word, so a reserved word, a wrapper or a path
+// spelling put `gh` in a slot it never looked at — and merge is now this hook's only gate
+// (tkt-bcc4f31c5b0a). Same-line forms only: a newline already splits the segment.
+describe('the leading run before gh', () => {
+  it.each([
+    'true; then gh pr merge --squash; fi',
+    'for x in a; do gh pr merge 40; done',
+    'if false; then :; else gh pr merge 40; fi',
+    'if false; then :; elif true; then gh pr merge 40; fi',
+    'if gh pr merge 40; then :; fi',
+    'while gh pr merge 40; do break; done',
+    'until gh pr merge 40; do :; done',
+    '! gh pr merge 40',
+    'true; then ( gh pr merge 40 ); fi',
+    'true; then (gh pr merge 40); fi',
+    '{ gh pr merge 40; }',
+  ])('a reserved word does not hide the merge: %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  it.each([
+    'time gh pr merge 40',
+    'nohup gh pr merge 40',
+    'env gh pr merge 40',
+    'command gh pr merge 40',
+    'exec gh pr merge 40',
+    'sudo -E gh pr merge 40',
+    'time -p gh pr merge 40',
+    'then GH_HOST=x time gh pr merge 40',
+    'GH_TOKEN=x nohup env gh pr merge 40',
+  ])('a wrapper does not hide the merge: %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  it.each([
+    '/opt/homebrew/bin/gh pr merge 40',
+    '/usr/local/bin/gh pr merge 40 --squash',
+    './gh pr merge 40',
+    'time /opt/homebrew/bin/gh pr merge 40',
+  ])('a path spelling of gh does not hide the merge: %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  it.each([
+    'echo then gh pr merge 40',
+    'echo gh pr merge',
+    'echo time gh pr merge 40',
+    '/opt/homebrew/bin/ghx pr merge 40',
+    './not-gh pr merge 40',
+    'time gh pr view 40',
+    'then gh pr view 40',
+    '/opt/homebrew/bin/gh pr view 40',
+  ])('CONTROL: data, other binaries and reads stay allowed: %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(false);
+  });
+
+  it('parses the group and verb past the leading run', () => {
+    expect(parseGh('then GH_HOST=x time -p /opt/homebrew/bin/gh -R o/r pr merge 40'))
+      .toMatchObject({ group: 'pr', verb: 'merge' });
+  });
+
+  // KNOWN GAPS, pinned so this suite is not read as full coverage; each is a follow-up under epic
+  // tkt-d841316d04f7 (review of tkt-bcc4f31c5b0a). Flip to `true` as each lands.
+  it.each([
+    ['value-taking wrapper flag', 'sudo -u root gh pr merge 40'],
+    ['value-taking wrapper flag', 'nice -n 5 gh pr merge 40'],
+    ['path-spelled wrapper', '/usr/bin/env gh pr merge 40'],
+    ['wrapper outside the set', 'timeout 60 gh pr merge 40'],
+    ['quoted env value with a space', 'GH_TOKEN="a b" gh pr merge 40'],
+    ['escaped command word', '\\gh pr merge 40'],
+    ['quoted command word', '"gh" pr merge 40'],
+    ['leading redirection', '2>/dev/null gh pr merge 40'],
+    ['single & is not a split point', 'true & gh pr merge 40'],
+    ['coproc', 'coproc gh pr merge 40'],
+    ['keyword fused to (', 'true; then(gh pr merge 40); fi'],
+    ['case arm', 'case x in *) gh pr merge 40;; esac'],
+    ['path-spelled git push', '/usr/bin/git push origin main'],
+  ])('KNOWN GAP (%s): %s', (_label, command) => {
+    expect(decide(payload(command)).blocked).toBe(false);
+  });
+});
+
 describe('what happens when it cannot tell', () => {
   it('BLOCKS a subagent whose command it cannot read — the rule is known to apply', () => {
     for (const input of [{ tool_input: {} }, { tool_input: { command: 42 } }, {}]) {

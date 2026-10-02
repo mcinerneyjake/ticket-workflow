@@ -253,13 +253,12 @@ export function subshellParens(segment) {
 // must treat this as unresolvable rather than as no move.
 const DIR_BUILTINS = new Set(['cd', 'pushd', 'popd']);
 
-// Shell reserved words, which precede a command without being one. Shared by exactly TWO readers
-// today — guard-bash's parseGit and guard-worktree's analysePiece — which is the drift that let
-// `then git commit` through on main while guard-worktree caught it (tkt-e70ae972476e).
+// Shell reserved words, which precede a command without being one. Read by guard-worktree's
+// analysePiece and, through commandWordIndex below, by parseGit and parseGh — reader drift is what let
+// `then git commit` (tkt-e70ae972476e) and then `then gh pr merge` (tkt-bcc4f31c5b0a) through.
 //
-// NOT yet the single source for every parser, and do not read it as one: guard-subagent-gates'
-// parseGh and dirBuiltin below both still carry their own keyword-less leading run, so `then gh pr
-// merge` is still invisible to the subagent merge gate. Measured, filed separately.
+// NOT yet the single source for every parser: dirBuiltin below still carries its own keyword-less
+// leading run.
 //
 // Membership is not coverage. `case`/`esac` are members, but a case ARM is still unparsed: the
 // `*)` pattern token stops the run, so `case x in *) git commit …` reaches no rule. That needs a
@@ -268,10 +267,32 @@ export const SHELL_KEYWORDS = new Set(
   ['if', 'then', 'else', 'elif', 'fi', 'while', 'until', 'do', 'done', 'case', 'esac', '!', '{', '}'],
 );
 
-// Command prefixes that run the next word as the command, shared by the same two readers, which skip
+// Command prefixes that run the next word as the command, shared by the same readers, which skip
 // `-…` tokens after one. Not complete: value-taking flags (`sudo -u root git`), prefixes outside
-// the set (`timeout`) and path spellings still hide the command — pinned in guard-bash.test.mjs.
+// the set (`timeout`) and, for git only, path spellings still hide the command — pinned in
+// guard-bash.test.mjs.
 export const WRAPPERS = new Set(['env', 'sudo', 'nice', 'nohup', 'xargs', 'command', 'builtin', 'exec', 'stdbuf', 'time']);
+
+// Grouping punctuation is stripped PER TOKEN, not just at a segment's offset 0: after a keyword is
+// skipped a following `(` would otherwise sit in the command slot, so `then (git commit` hid the
+// invocation exactly as `then git commit` had (review, tkt-e70ae972476e).
+export const bareWord = (token) => token.replace(/^[({]+/, '');
+
+// Index of the command word: skips env prefixes, reserved words and wrappers (plus a wrapper's `-…`
+// flags), interleaved in any order. Only this LEADING run, so a keyword sitting in data
+// (`echo then git commit`) never promotes a deeper token into the command slot.
+export function commandWordIndex(tokens) {
+  let cmd = 0;
+  let sawWrapper = false;
+  while (cmd < tokens.length) {
+    const word = bareWord(tokens[cmd]);
+    if (word === '' || SHELL_KEYWORDS.has(word) || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) { cmd++; continue; }
+    if (WRAPPERS.has(word)) { sawWrapper = true; cmd++; continue; }
+    if (sawWrapper && word.startsWith('-')) { cmd++; continue; }
+    break;
+  }
+  return cmd;
+}
 
 // Deliberately NARROWER than SHELL_KEYWORDS, and not derived from it: widening this set changes
 // which hidden `cd`s hiddenDirTarget detects, which is a separate fail-open with its own adversary
