@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// PreToolUse(Bash) guardrail: a SUBAGENT may not cross a human-approval gate (tkt-8e291b058706).
+// PreToolUse(Bash) guardrail: a SUBAGENT may not merge (tkt-8e291b058706, narrowed by tkt-e8b257fc8cc4).
 //
 // On 2026-08-16 a subagent spawned by a `/code-review` run committed and pushed three files, opened a
 // PR and MERGED it to main — none of it approved, and none of it in the review's own report. The
@@ -7,8 +7,8 @@
 // merge, because every local check (HEAD, reflog, file hashes) was genuinely clean. It surfaced from
 // a CI run listed against `main`.
 //
-// THE RULE: commit / push / open-PR / merge are the workflow's three human gates. A subagent has no
-// channel to ask for that approval, so it may never cross one — whatever it was spawned to do.
+// THE RULE: merge is the one human gate left (docs/specs/workflow-rewrite.md), so commit and PR-open are
+// allowed. Push stays blocked until guard-bash can judge every push shape for main (tkt-e8b257fc8cc4).
 //
 // WHY NOT `agent_type` — the obvious design is "block writes when the agent is a review agent", and
 // it is the wrong one. The review agents' `agent_type` values are undocumented and observable only by
@@ -19,10 +19,6 @@
 // SCOPE, stated plainly: this covers the Bash half of the incident. A review subagent EDITING a file
 // under review is not covered, because blocking Edit/Write for every subagent would break coding
 // subagents, and separating the two genuinely does need the review `agent_type`.
-//
-// STILL ALLOWED, deliberately: everything a reviewer needs. Reading (`git log`, `git diff`,
-// `gh pr view`/`diff`/`list`), and REPORTING — `gh pr comment` and `gh issue comment` are how a
-// review returns its findings, so they are not gates and are not blocked.
 //
 // FAIL DIRECTION — closed on the decision, open on the harness:
 //   - `agent_id` present but unreadable/ambiguous → treated as a subagent (restrict).
@@ -35,32 +31,44 @@ import { readFileSync } from 'node:fs';
 import { isMain } from './lib/is-main.mjs';
 import { splitSegments, parseGit } from './guard-bash.mjs';
 
-// git subcommands that cross a gate. `merge` is absent on purpose: merging the default branch INTO a
-// feature branch is routine local work this project's own instructions prescribe, and it reaches
-// nothing outside the machine.
-const GATED_GIT = new Map([
-  ['commit', 'commit'],
-  ['push', 'push'],
-]);
-
-// `gh <group> <verb>` pairs that publish or land work. Read verbs (view/diff/list/checks/status) and
-// the REPORTING verbs (`pr comment`, `issue comment`) are absent on purpose — a review must still be
-// able to read its target and post its findings.
+// `gh <group> <verb>` pairs a subagent may not run. PR-open verbs (create/edit/ready), read verbs and
+// the REPORTING verbs (`pr comment`, `issue comment`) are absent on purpose. `alias`, `workflow run`,
+// `run rerun` and `extension install` are here because each can reach a merge indirectly.
 const GATED_GH = new Map([
-  ['pr create', 'open a pull request'],
   ['pr merge', 'merge a pull request'],
   ['pr close', 'close a pull request'],
   ['pr reopen', 'reopen a pull request'],
-  ['pr edit', 'edit a pull request'],
-  ['pr ready', 'mark a pull request ready'],
   ['pr review', 'submit a pull-request review'],
   ['release create', 'publish a release'],
+  ['release edit', 'edit a release'],
+  ['release upload', 'upload release assets'],
   ['release delete', 'delete a release'],
   ['repo delete', 'delete a repository'],
+  ['repo edit', 'edit repository settings'],
+  ['repo archive', 'archive a repository'],
+  ['repo rename', 'rename a repository'],
+  ['repo sync', 'sync a remote branch'],
+  ['issue delete', 'delete an issue'],
+  ['secret set', 'set a secret'],
+  ['secret delete', 'delete a secret'],
+  ['variable set', 'set a variable'],
+  ['variable delete', 'delete a variable'],
+  ['workflow run', 'dispatch a workflow'],
+  ['workflow enable', 'enable a workflow'],
+  ['workflow disable', 'disable a workflow'],
+  ['run rerun', 're-run a workflow'],
+  ['alias set', 'define a gh alias'],
+  ['alias import', 'import gh aliases'],
+  ['extension install', 'install a gh extension'],
 ]);
 
-// HTTP methods that make `gh api` a write. `gh api` with no -X is a GET, which is a read.
-const WRITE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+// gh's built-in command aliases (gh 2.95.0 `--help` → ALIASES), folded before the lookup.
+const GH_GROUP_ALIASES = new Map([['ext', 'extension'], ['extensions', 'extension']]);
+const GH_VERB_ALIASES = new Map([['release new', 'release create'], ['secret remove', 'secret delete'], ['variable remove', 'variable delete']]);
+
+// `gh api`'s value-taking short flags; `-i` is its only boolean one, so a cluster like `-iXPOST` or
+// `-if` reaches the value flag after skipping `i`s.
+const API_VALUE_SHORT = new Set(['X', 'f', 'F', 'H', 'p', 'q', 't']);
 
 // gh global flags that consume the NEXT token. Dropping only tokens starting with `-` is not enough:
 // `gh -R owner/repo pr merge` would then read `owner/repo` as the command group and the gate would
@@ -93,13 +101,38 @@ export function parseGh(segment) {
   return { group: rest[0], verb: rest[1] ?? null, flags };
 }
 
+// Any parameter makes it a write, even beside `-X GET`: tokens are whitespace-split, so a `-X GET`
+// inside a quoted value is indistinguishable from a real one (tkt-098db663af30).
+export function apiMethod(flags) {
+  let method = 'GET';
+  let sawParam = false;
+  for (let i = 0; i < flags.length; i++) {
+    const f = flags[i];
+    let letter = null;
+    let value = null;
+    if (f === '--method') [letter, value] = ['X', flags[i + 1] ?? ''];
+    else if (f.startsWith('--method=')) [letter, value] = ['X', f.slice('--method='.length)];
+    else if (/^--(raw-)?field(=|$)|^--input(=|$)/.test(f)) letter = 'f';
+    else if (/^-[A-Za-z]/.test(f)) {
+      const body = f.slice(1).replace(/^i+/, '');
+      if (API_VALUE_SHORT.has(body[0])) [letter, value] = [body[0], body.slice(1) || (flags[i + 1] ?? '')];
+    }
+    if (letter === 'f' || letter === 'F') sawParam = true;
+    if (letter === 'X' && value !== null && value.toUpperCase() !== 'GET') method = value.toUpperCase();
+  }
+  // A non-GET method we cannot name (empty, HEAD, a typo) is not proven a read, so it blocks too.
+  if (method !== 'GET') return method || 'UNKNOWN';
+  return sawParam ? 'POST' : 'GET';
+}
+
 function ghReason({ group, verb, flags }) {
   if (group === 'api') {
-    const i = flags.findIndex((f) => f === '-X' || f === '--method');
-    const method = (i >= 0 ? flags[i + 1] : flags.find((f) => f.startsWith('--method='))?.split('=')[1]) ?? 'GET';
-    return WRITE_METHODS.has(method.toUpperCase()) ? `call the GitHub API with ${method.toUpperCase()}` : null;
+    const method = apiMethod(flags);
+    return method === 'GET' ? null : `call the GitHub API with ${method}`;
   }
-  return verb ? (GATED_GH.get(`${group} ${verb}`) ?? null) : null;
+  if (!verb) return null;
+  const key = `${GH_GROUP_ALIASES.get(group) ?? group} ${verb}`;
+  return GATED_GH.get(GH_VERB_ALIASES.get(key) ?? key) ?? null;
 }
 
 /**
@@ -122,12 +155,10 @@ export function decide(payload) {
 
   for (const segment of splitSegments(command)) {
     const git = parseGit(segment);
-    // `sub` is null when an unterminated quote swallowed the subcommand, and GATED_GIT.get(null) is
-    // undefined — an allow. Same fail-closed reading as the unreadable-command branch above
-    // (tkt-8f2e1f9894e2).
     if (git?.truncated) return { blocked: true, reason: describe(payload, 'run a git command whose subcommand an unterminated quote swallowed') };
-    const gitGate = git && GATED_GIT.get(git.sub);
-    if (gitGate) return { blocked: true, reason: describe(payload, `git ${gitGate}`) };
+    // guard-bash misses --mirror/--all/wildcards/-c/--git-dir/other remotes (two review rounds), so a
+    // subagent push cannot yet be proven not to land on main.
+    if (git?.sub === 'push') return { blocked: true, reason: describe(payload, 'git push') };
 
     const gh = parseGh(segment);
     const ghGate = gh && ghReason(gh);
@@ -141,10 +172,10 @@ function describe(payload, action) {
   // agent's FILE edits) answerable from a real run instead of another investigation.
   const type = typeof payload?.agent_type === 'string' && payload.agent_type ? payload.agent_type : 'unknown';
   return (
-    `a subagent (agent_type: ${type}) tried to ${action}. Commit, push, open-PR and merge are human ` +
-    'approval gates; a subagent has no way to obtain that approval, so it may never cross one. ' +
-    'Return the change to the main thread and let it ask. Reading and posting findings ' +
-    '(git log/diff, gh pr view/diff/list, gh pr comment) are unaffected.'
+    `a subagent (agent_type: ${type}) tried to ${action}. Merge is a human approval gate, and ` +
+    'pushing, closing, releasing, deleting or writing through `gh api` could cross it; a subagent ' +
+    'has no way to obtain that approval. Return to the main thread and let it ask. Commit, ' +
+    'gh pr create/edit/ready, parameterless gh api reads, and gh pr comment are unaffected.'
   );
 }
 

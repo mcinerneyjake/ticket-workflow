@@ -18,13 +18,10 @@ function run(input) {
   return { code: r.status, stderr: r.stderr };
 }
 
-describe('the incident: a subagent crossing a human gate', () => {
-  // Each of these is a step the 2026-08-16 review subagent actually performed.
+describe('merge is the one human gate a subagent may not cross', () => {
   it.each([
-    ['git commit -m "wip"', 'git commit'],
-    ['git push -u origin fix/x', 'git push'],
-    ['gh pr create --base main --title x --body y', 'open a pull request'],
     ['gh pr merge 40 --squash --delete-branch', 'merge a pull request'],
+    ['gh pr merge --auto --squash', 'merge a pull request'],
   ])('blocks `%s`', (command, fragment) => {
     const d = decide(payload(command));
     expect(d.blocked).toBe(true);
@@ -34,22 +31,103 @@ describe('the incident: a subagent crossing a human gate', () => {
   it('names the agent_type in the message', () => {
     // Echoed, never matched on — it is how the follow-up (blocking a review agent's file edits)
     // becomes answerable from a real run rather than another investigation.
-    expect(decide(payload('git push')).reason).toContain('code-reviewer');
-    expect(decide(payload('git push', { agent_id: 'a' })).reason).toContain('unknown');
+    expect(decide(payload('gh pr merge 40')).reason).toContain('code-reviewer');
+    expect(decide(payload('gh pr merge 40', { agent_id: 'a' })).reason).toContain('unknown');
   });
 
   it('exits 2 end to end — only 2 blocks; an uncaught throw would exit 1 and ALLOW', () => {
     const r = run(JSON.stringify(payload('gh pr merge 40 --squash')));
     expect(r.code).toBe(2);
-    expect(r.stderr).toContain('may never cross one');
+    expect(r.stderr).toContain('Merge is a human approval gate');
   });
+});
+
+// The workflow rewrite (docs/specs/workflow-rewrite.md) lets the review/fix step commit and open the PR
+// as a subagent.
+describe('commit and PR-open are no longer gates', () => {
+  it.each([
+    'git commit -m "wip"',
+    'gh pr create --base main --title x --body y',
+    'gh pr edit 40 --body y',
+    'gh pr ready 40',
+    'npm test && git add hooks/x.mjs && git commit -m x',
+    'time git commit -m x',
+  ])('allows `%s` from a subagent', (command) => {
+    expect(decide(payload(command)).blocked).toBe(false);
+  });
+
+  it('exits 0 end to end for a subagent commit', () => {
+    expect(run(JSON.stringify(payload('git commit -m x'))).code).toBe(0);
+  });
+});
+
+// guard-bash cannot judge every push shape for main: two review rounds on tkt-e8b257fc8cc4 measured
+// --mirror, --all, wildcards, -c/GIT_CONFIG, --git-dir/GIT_DIR, other remotes and tags all passing it.
+// Push therefore stays gated in every shape, the plain one included.
+describe('a subagent push is refused in every shape', () => {
+  it.each([
+    'git push -u origin fix/x',
+    'git push origin HEAD',
+    'git push --mirror origin',
+    'git push --all origin',
+    'git -c remote.origin.push=HEAD:refs/heads/main push origin',
+    'GIT_DIR=../primary/.git git push origin HEAD',
+    'git --git-dir=/r/primary/.git push origin HEAD',
+    'git push upstream master',
+    'git push origin v0.30.0',
+    'git -C /other/repo push',
+    'time git push --all',
+    'npm test && git commit -m x && git push -u origin fix/x',
+  ])('blocks `%s`', (command) => {
+    const d = decide(payload(command));
+    expect(d.blocked).toBe(true);
+    expect(d.reason).toContain('git push');
+  });
+
+  it('still refuses a git subcommand an unterminated quote swallowed', () => {
+    expect(decide(payload('git -C "/a/b push origin x')).blocked).toBe(true);
+  });
+});
+
+describe('destructive gh verbs stay blocked', () => {
+  it.each([
+    'gh pr close 40',
+    'gh pr reopen 40',
+    'gh pr review 40 --approve',
+    'gh release create v1.0.0',
+    'gh release edit v1 --draft=false',
+    'gh release upload v1 a.tgz --clobber',
+    'gh release delete v1.0.0',
+    'gh repo delete o/r --yes',
+    'gh repo edit --visibility public --accept-visibility-change-consequences',
+    'gh repo edit --default-branch fix/x',
+    'gh repo archive o/r',
+    'gh issue delete 5',
+    'gh secret set TOKEN',
+    'gh workflow run merge.yml',
+    'gh run rerun 123',
+    'gh alias set pm "pr merge" && gh pm 40',
+    'gh extension install o/gh-x',
+    'gh repo sync o/fork --force',
+    'gh repo sync o/r --source o/other -b main',
+  ])('blocks `%s` from a subagent', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  // gh's built-in aliases (gh 2.95.0 `--help` → ALIASES) reach the same commands.
+  it.each(['gh ext install o/gh-x', 'gh extensions install o/gh-x', 'gh release new v1', 'gh secret remove FOO', 'gh variable remove FOO'])(
+    'blocks the built-in alias `%s`',
+    (command) => {
+      expect(decide(payload(command)).blocked).toBe(true);
+    },
+  );
 });
 
 // The control that makes every block above attributable to the SUBAGENT dimension rather than to the
 // command being dangerous. Without it, a hook that blocked `git push` unconditionally would pass the
 // whole suite above and wedge the main thread.
 describe('the main thread is untouched', () => {
-  it.each(['git commit -m x', 'git push', 'gh pr create --base main', 'gh pr merge 40 --squash'])(
+  it.each(['gh pr merge 40 --squash', 'git push -u origin fix/x', 'gh api -X PUT repos/o/r/pulls/40/merge', 'gh repo delete o/r'])(
     'allows `%s` when agent_id is absent',
     (command) => {
       expect(decide({ tool_name: 'Bash', tool_input: { command } }).blocked).toBe(false);
@@ -57,7 +135,7 @@ describe('the main thread is untouched', () => {
   );
 
   it('exits 0 end to end for the main thread', () => {
-    const r = run(JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'git push' } }));
+    const r = run(JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'gh pr merge 40' } }));
     expect(r.code).toBe(0);
   });
 });
@@ -86,15 +164,15 @@ describe('a reviewer can still read and report', () => {
 describe('the disguised shapes', () => {
   it('sees a gate in any position of a compound command', () => {
     for (const command of [
-      'npm test && git push',
-      'git add -p; git commit -m x',
+      'npm test && gh pr merge 40',
+      'git push; gh pr merge 40 --squash',
       'false || gh pr merge 40 --squash',
-      'cd /tmp\ngit push origin main',
+      'cd /tmp\ngh pr merge 40',
       // The exact shape the incident took: change directory into another repo, then merge there.
       // guard-bash's own main-branch rules are cwd-sensitive, so this is the shape most likely to be
       // mis-parsed (tkt-e508ad42a68a).
       'cd /Users/x/repos/some-repo && gh pr merge 40 --squash --delete-branch',
-      'cd ../other-repo; gh pr create --base main --title x --body y',
+      'cd ../other-repo; gh pr create --base main --title x --body y && gh pr merge --auto',
     ]) {
       expect(decide(payload(command)).blocked, command).toBe(true);
     }
@@ -108,11 +186,8 @@ describe('the disguised shapes', () => {
     }
   });
 
-  it('sees through an env prefix and `git -C <dir>`', () => {
-    expect(decide(payload('GIT_AUTHOR_NAME=x git commit -m y')).blocked).toBe(true);
-    expect(decide(payload('git -C /other/repo push')).blocked).toBe(true);
-    // The gh half of the same shape, and the one that matters most here: `GH_TOKEN=…` is how a
-    // different credential gets in front of a merge (tkt-e508ad42a68a).
+  it('sees through an env prefix', () => {
+    // `GH_TOKEN=…` is how a different credential gets in front of a merge (tkt-e508ad42a68a).
     expect(decide(payload('GH_TOKEN=ghp_x gh pr merge 40 --squash')).blocked).toBe(true);
   });
 
@@ -130,9 +205,55 @@ describe('the disguised shapes', () => {
 
   it('treats `gh api` as a write only when the method is one', () => {
     expect(decide(payload('gh api repos/o/r/issues')).blocked).toBe(false);
-    for (const flag of ['-X DELETE', '--method POST', '--method=PATCH']) {
+    for (const flag of ['-X DELETE', '--method POST', '--method=PATCH', '-XPUT', '-Xput']) {
       expect(decide(payload(`gh api ${flag} repos/o/r/issues/1`)).blocked, flag).toBe(true);
     }
+  });
+
+  // gh sends POST whenever a parameter is added (`gh api --help`), so "no -X" is not "GET". Reading it
+  // as GET let a GraphQL mergePullRequest mutation, or a REST merge, through as a read.
+  it.each([
+    "gh api graphql -f query='mutation { mergePullRequest(input: {pullRequestId: \"x\"}) { clientMutationId } }'",
+    'gh api repos/o/r/pulls/40/merge -f merge_method=squash',
+    'gh api repos/o/r/merges -F base=main -F head=fix/x',
+    'gh api repos/o/r/pulls/40/merge --raw-field merge_method=squash',
+    'gh api repos/o/r/pulls/40/merge --field=merge_method=squash',
+    'gh api repos/o/r/pulls/40/merge --input body.json',
+    'gh api repos/o/r/pulls/40/merge -fmerge_method=squash',
+  ])('blocks an implicit-POST write: %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  it('an explicit GET without parameters is a read', () => {
+    expect(decide(payload('gh api -X GET repos/o/r/pulls/40')).blocked).toBe(false);
+    expect(decide(payload('gh api --method=get repos/o/r/pulls -q .[].number')).blocked).toBe(false);
+  });
+
+  // Whitespace tokenizing cannot tell a real `-X GET` from one inside a quoted value, before OR after
+  // the parameter, so a stated GET never downgrades a parameterised call (review, tkt-e8b257fc8cc4).
+  it.each([
+    "gh api graphql -f query='mutation -X GET { mergePullRequest }'",
+    'gh api repos/o/r/pulls/40/merge -f a=b --method=GET',
+    "gh api -H 'x -X GET y' graphql -f query='mutation{mergePullRequest}'",
+    'gh api -X GET search/issues -f q=repo:o/r',
+  ])('a stated GET cannot downgrade a parameterised call: %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  // gh's flag parser expands a short cluster, so `-iXPOST` is `-i -X POST` and `-if` is `-i -f`.
+  it.each([
+    'gh api -iXPOST repos/o/r/pulls/40/merge',
+    "gh api graphql -if query='mutation{mergePullRequest}'",
+    'gh api graphql -iF query=@q.graphql',
+    'gh api -iX PUT repos/o/r/pulls/40/merge',
+    'gh api -X HEAD repos/o/r',
+    'gh api -X',
+  ])('reads a clustered or unrecognised method as a write: %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  it('CONTROL: `-i` alone is still a read', () => {
+    expect(decide(payload('gh api -i repos/o/r/pulls/40')).blocked).toBe(false);
   });
 });
 
@@ -148,7 +269,7 @@ describe('what happens when it cannot tell', () => {
   it('treats an empty-string agent_id as a subagent, not as the main thread', () => {
     // `''` is falsy; only `undefined`/`null` mean main thread. A truthiness check here would hand a
     // subagent the main thread's permissions.
-    expect(decide(payload('git push', { agent_id: '' })).blocked).toBe(true);
+    expect(decide(payload('gh pr merge 40', { agent_id: '' })).blocked).toBe(true);
   });
 
   it('exits 1 — visible but NOT blocking — on an unreadable payload', () => {
@@ -193,17 +314,3 @@ describe('parseGh', () => {
   });
 });
 
-// parseGit is shared, so a wrapper that hid a git invocation from guard-bash hid it from the subagent
-// gate too: `time git commit` crossed the commit gate from inside a subagent (tkt-3d016709216a).
-describe('a command wrapper does not hide a gated git invocation', () => {
-  it.each(['time git commit -m x', 'nohup git push -u origin fix/x', 'true; then env FOO=1 git commit -m x; fi'])(
-    'blocks `%s` in a subagent',
-    (command) => {
-      expect(decide(payload(command)).blocked).toBe(true);
-    },
-  );
-
-  it('CONTROL: a wrapped non-git command is still allowed', () => {
-    expect(decide(payload('time npm test')).blocked).toBe(false);
-  });
-});
