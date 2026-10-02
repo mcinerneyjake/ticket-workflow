@@ -229,8 +229,8 @@ describe('the disguised shapes', () => {
     expect(decide(payload('gh api --method=get repos/o/r/pulls -q .[].number')).blocked).toBe(false);
   });
 
-  // Whitespace tokenizing cannot tell a real `-X GET` from one inside a quoted value, before OR after
-  // the parameter, so a stated GET never downgrades a parameterised call (review, tkt-e8b257fc8cc4).
+  // A stated GET never downgrades a parameterised call (review, tkt-e8b257fc8cc4). Kept after
+  // tokens became quote-aware (tkt-098db663af30): re-admitting `-X GET -f` would loosen the guard.
   it.each([
     "gh api graphql -f query='mutation -X GET { mergePullRequest }'",
     'gh api repos/o/r/pulls/40/merge -f a=b --method=GET',
@@ -325,9 +325,6 @@ describe('the leading run before gh', () => {
     ['value-taking wrapper flag', 'nice -n 5 gh pr merge 40'],
     ['path-spelled wrapper', '/usr/bin/env gh pr merge 40'],
     ['wrapper outside the set', 'timeout 60 gh pr merge 40'],
-    ['quoted env value with a space', 'GH_TOKEN="a b" gh pr merge 40'],
-    ['escaped command word', '\\gh pr merge 40'],
-    ['quoted command word', '"gh" pr merge 40'],
     ['leading redirection', '2>/dev/null gh pr merge 40'],
     ['single & is not a split point', 'true & gh pr merge 40'],
     ['coproc', 'coproc gh pr merge 40'],
@@ -335,6 +332,76 @@ describe('the leading run before gh', () => {
     ['case arm', 'case x in *) gh pr merge 40;; esac'],
     ['path-spelled git push', '/usr/bin/git push origin main'],
   ])('KNOWN GAP (%s): %s', (_label, command) => {
+    expect(decide(payload(command)).blocked).toBe(false);
+  });
+});
+
+// A whitespace split put every token after a quoted span one slot off, and a quoted or escaped
+// command word was not `gh` at all — each allowed a subagent merge (tkt-098db663af30).
+describe('quoted and escaped spellings', () => {
+  it.each([
+    'GH_TOKEN="a b" gh pr merge 40',
+    "GH_HOST='a b' gh pr merge 40 --squash",
+    'gh -R "o/my repo" pr merge 40',
+    "gh --repo 'o/my repo' pr merge 40",
+    'gh --hostname "my host" pr merge 40',
+    'gh "pr" merge 40',
+    "gh 'pr' 'merge' 40",
+    'gh p"r" m"erge" 40',
+    '"gh" pr merge 40',
+    "'gh' pr merge 40",
+    '\\gh pr merge 40',
+    'g""h pr merge 40',
+    '"/opt/homebrew/bin/gh" pr merge 40',
+    '("gh" pr merge 40)',
+    'time "gh" pr merge 40',
+    'gh --future "x y" pr merge 40',
+    'gh "release" "delete" v1',
+    'gh api --method "PUT" repos/o/r/pulls/40/merge',
+  ])('blocks %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  it('parses the group and verb past a quoted flag value', () => {
+    expect(parseGh('GH_HOST="a b" gh -R "o/my repo" "pr" \'merge\' 40'))
+      .toMatchObject({ group: 'pr', verb: 'merge' });
+  });
+
+  // The regression a quote-aware tokenizer would open: the whitespace split still found `merge` here,
+  // so returning null for the fused tail would turn a refusal into an allow.
+  it.each(['gh -R "o/r pr merge 40', "gh --repo 'o/r pr merge 40", 'gh "pr merge 40'])(
+    'refuses a group or verb an unterminated quote swallowed: %s',
+    (command) => {
+      expect(decide(payload(command)).blocked).toBe(true);
+    },
+  );
+
+  // quotedTokens reads neither `\'` nor `$'…'`, so each of these opened a "quote" that swallowed the
+  // whole invocation into the env token. The whitespace split blocked all six (review, this ticket).
+  it.each([
+    "X=\\' gh pr merge 40",
+    'X=\\" gh pr merge 40',
+    'GH_TOKEN="a\\"b" gh pr merge 40',
+    "GH_X='it'\\''s' gh pr merge 40",
+    "X=$'\\'' gh pr merge 40",
+    'X="a gh pr merge 40',
+  ])('REGRESSION: a quote the tokenizer misreads does not hide the merge: %s', (command) => {
+    expect(decide(payload(command)).blocked).toBe(true);
+  });
+
+  it.each([
+    'echo "gh pr merge"',
+    "echo 'gh pr merge 40'",
+    'rg "gh pr merge" .',
+    'gh pr comment 40 --body "run gh pr merge later"',
+    "gh pr comment 40 --body 'a -R x pr merge'",
+    'gh pr create --title "pr merge" --body x',
+    'gh pr comment 40 --body "line one\ngh pr merge 40\nline three"',
+    "gh pr comment 40 --body \"$(cat <<'EOF'\ndon't merge yet\nEOF\n)\"",
+    'gh pr comment 40 --body $(cat <<EOF\ndon\'t merge yet\nEOF\n)',
+    '"gh" pr view 40',
+    '"ghx" pr merge 40',
+  ])('CONTROL: quoted data and reads stay allowed: %s', (command) => {
     expect(decide(payload(command)).blocked).toBe(false);
   });
 });

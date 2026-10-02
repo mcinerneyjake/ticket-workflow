@@ -29,7 +29,7 @@
 
 import { readFileSync } from 'node:fs';
 import { isMain } from './lib/is-main.mjs';
-import { bareWord, commandWordIndex } from './lib/shell.mjs';
+import { bareWord, commandWordIndex, dequote, endsInsideQuote, quotedTokens } from './lib/shell.mjs';
 import { splitSegments, parseGit } from './guard-bash.mjs';
 
 // `gh <group> <verb>` pairs a subagent may not run. PR-open verbs (create/edit/ready), read verbs and
@@ -79,19 +79,23 @@ const GH_VALUE_FLAGS = new Set(['-R', '--repo', '--hostname']);
 // Backstop for a value-taking flag not in the set above (a future gh release). A command group is a
 // bare word; a flag VALUE characteristically is not. Skipping value-shaped leading positionals keeps
 // an unknown flag from hiding the group, rather than failing open on it.
-const VALUE_SHAPED = /[/:.=@]/;
+const VALUE_SHAPED = /[/:.=@\s]/;
 
-// The command WORD must be `gh` after parseGit's leading run, so `echo "gh pr merge"` is data, not an
-// invocation. Whitespace tokens on purpose; quoted values are tkt-098db663af30. A path spelling
-// counts, since `/opt/homebrew/bin/gh` is gh (tkt-bcc4f31c5b0a).
-export function parseGh(segment) {
+// As guard-bash's argValue: an unterminated quote keeps the raw token, never matching a real value.
+const argValue = (token) => dequote(token) ?? token;
+
+// The command WORD must be `gh` after parseGit's leading run, so `echo "gh pr merge"` is data. Path,
+// quoted and `\`-escaped command words count; dropping every `\` over-matches `'g\h'`, which only blocks.
+// `split` is the pre-tkt-098db663af30 whitespace reading, kept for decide() as a floor (see there).
+export function parseGh(segment, { split = false } = {}) {
   const stripped = segment.trim().replace(/^[({\s]+/, '').replace(/[)}\s]+$/, '');
-  const tokens = stripped.split(/\s+/);
+  const tokens = split ? stripped.split(/\s+/) : quotedTokens(stripped);
+  const value = split ? (t) => t : argValue;
   const cmd = commandWordIndex(tokens);
   if (cmd >= tokens.length) return null;
-  const word = bareWord(tokens[cmd]);
+  const word = value(bareWord(tokens[cmd])).replace(/\\/g, '');
   if (word !== 'gh' && !word.endsWith('/gh')) return null;
-  const flags = tokens.slice(cmd + 1);
+  const flags = tokens.slice(cmd + 1).map(value);
   const rest = [];
   for (let i = 0; i < flags.length; i++) {
     const t = flags[i];
@@ -100,12 +104,17 @@ export function parseGh(segment) {
     if (rest.length === 0 && VALUE_SHAPED.test(t)) continue; // stray flag value, not the group
     rest.push(t);
   }
+  // A fused unterminated tail would otherwise allow `gh -R "o/r pr merge`. Only a swallowed group/verb
+  // refuses: an unquoted heredoc's `don't` also reads as unterminated (tkt-098db663af30).
+  if (!split && endsInsideQuote(stripped) && (rest.length < 2 || rest.slice(0, 2).some((t) => /["']/.test(t)))) {
+    return { group: null, verb: null, flags, truncated: true };
+  }
   if (rest.length === 0) return null;
-  return { group: rest[0], verb: rest[1] ?? null, flags };
+  return { group: rest[0], verb: rest[1] ?? null, flags, truncated: false };
 }
 
-// Any parameter makes it a write, even beside `-X GET`: tokens are whitespace-split, so a `-X GET`
-// inside a quoted value is indistinguishable from a real one (tkt-098db663af30).
+// Any parameter makes it a write, even beside `-X GET` (tkt-e8b257fc8cc4). Kept now that tokens are
+// quote-aware (tkt-098db663af30): re-admitting an explicit GET with parameters would loosen the guard.
 export function apiMethod(flags) {
   let method = 'GET';
   let sawParam = false;
@@ -164,8 +173,13 @@ export function decide(payload) {
     if (git?.sub === 'push') return { blocked: true, reason: describe(payload, 'git push') };
 
     const gh = parseGh(segment);
-    const ghGate = gh && ghReason(gh);
-    if (ghGate) return { blocked: true, reason: describe(payload, ghGate) };
+    if (gh?.truncated) return { blocked: true, reason: describe(payload, 'run a gh command whose group or verb an unterminated quote swallowed') };
+    // Either reading's gate blocks. quotedTokens misreads `\'` and `$'…'` (tkt-5ad1c320bc0a), fusing
+    // `X=\' gh pr merge` into one token; the whitespace reading still sees that merge.
+    for (const parsed of [gh, parseGh(segment, { split: true })]) {
+      const ghGate = parsed && ghReason(parsed);
+      if (ghGate) return { blocked: true, reason: describe(payload, ghGate) };
+    }
   }
   return { blocked: false };
 }
