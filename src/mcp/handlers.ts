@@ -5,7 +5,7 @@ import {
 } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import {
-  STATUS_IDS, TYPES, PRIORITIES,
+  STATUS_IDS, TYPES, PRIORITIES, AUTONOMY, SPEC_REF_HINT,
   type Ticket, type StatusId, type Provenance,
 } from '../shared/constants.js';
 import {
@@ -147,6 +147,9 @@ function applyListFilters(tickets: Ticket[], f: ListFilters): Ticket[] {
 // Tool definitions
 // ---------------------------------------------------------------------------
 
+const AUTONOMY_DESCRIPTION = 'hitl (a human drives it; the default) or afk (eligible for unattended runs). A missing value reads as hitl.';
+const SPEC_DESCRIPTION = `Marks this as a spec ticket by linking its spec file (${SPEC_REF_HINT}).`;
+
 export const TOOLS: Tool[] = [
   {
     name: 'list_tickets',
@@ -189,6 +192,8 @@ export const TOOLS: Tool[] = [
         parent: { type: ['string', 'null'], description: 'Parent ticket ID, or null to clear' },
         dueDate: { type: ['string', 'null'], description: 'Due date YYYY-MM-DD, or null to clear' },
         assignee: { type: ['string', 'null'], description: 'Assignee name, or null to clear' },
+        autonomy: { type: 'string', enum: [...AUTONOMY], description: AUTONOMY_DESCRIPTION },
+        spec: { type: ['string', 'null'], description: `${SPEC_DESCRIPTION} Null clears it.` },
       },
       required: ['id'],
     },
@@ -221,6 +226,8 @@ export const TOOLS: Tool[] = [
         parent: { type: 'string', description: 'Parent ticket ID' },
         dueDate: { type: 'string', description: 'Due date YYYY-MM-DD' },
         assignee: { type: 'string', description: 'Assignee name' },
+        autonomy: { type: 'string', enum: [...AUTONOMY], description: AUTONOMY_DESCRIPTION },
+        spec: { type: 'string', description: SPEC_DESCRIPTION },
       },
       required: ['title'],
     },

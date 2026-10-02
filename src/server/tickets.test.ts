@@ -919,6 +919,7 @@ describe('summarize (pure aggregation)', () => {
     priority: over.priority ?? 'medium', status: over.status ?? 'backlog', order: over.order ?? 0,
     created: over.created ?? '2026-01-01T00:00:00.000Z', updated: over.updated ?? '2026-01-01T00:00:00.000Z',
     body: '', project: over.project ?? null, blockers: [], parent: null, dueDate: null, assignee: null,
+    autonomy: 'hitl', spec: null,
   });
 
   const find = <T extends Record<string, unknown>>(rows: T[], key: keyof T, val: unknown) =>
@@ -1644,5 +1645,109 @@ describe('lastCheckpoint', () => {
 
   it('handles CRLF line endings', () => {
     expect(lastCheckpoint('## Checkpoint\r\nstate\r\n## Next\r\n')).toBe('## Checkpoint\nstate');
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('autonomy + spec fields (tkt-9559b1f8dbab)', () => {
+  const SPEC = 'o/r:docs/specs/x.md';
+
+  it('defaults a new ticket to hitl with no spec', async () => {
+    const t = await createTicket({ title: 'A' });
+    expect(t.autonomy).toBe('hitl');
+    expect(t.spec).toBeNull();
+  });
+
+  it('persists afk and a spec ref on create and reads them back', async () => {
+    const t = await createTicket({ title: 'A', autonomy: 'afk', spec: SPEC });
+    const read = await getTicket(t.id);
+    expect(read.autonomy).toBe('afk');
+    expect(read.spec).toBe(SPEC);
+    const raw = await fs.readFile(path.join(dirs.tickets, `${t.id}.md`), 'utf8');
+    expect(raw).toContain('autonomy: afk');
+    expect(raw).toContain(`spec: '${SPEC}'`);
+  });
+
+  it('updates both fields, and spec: null clears the link', async () => {
+    const t = await createTicket({ title: 'A' });
+    const set = await updateTicket(t.id, { autonomy: 'afk', spec: SPEC });
+    expect(set.autonomy).toBe('afk');
+    expect(set.spec).toBe(SPEC);
+    const cleared = await updateTicket(t.id, { autonomy: 'hitl', spec: null });
+    expect(cleared.autonomy).toBe('hitl');
+    expect(cleared.spec).toBeNull();
+  });
+
+  it('rejects an invalid autonomy on create and update, leaving the file unchanged', async () => {
+    // @ts-expect-error — testing runtime rejection of an invalid enum value
+    expect((await httpError(createTicket({ title: 'A', autonomy: 'AFK' }))).status).toBe(400);
+    // @ts-expect-error — testing runtime rejection of an invalid enum value
+    expect((await httpError(createTicket({ title: 'A', autonomy: '' }))).status).toBe(400);
+    const t = await createTicket({ title: 'A', autonomy: 'afk' });
+    const file = path.join(dirs.tickets, `${t.id}.md`);
+    const before = await fs.readFile(file, 'utf8');
+    // @ts-expect-error — testing runtime rejection of an invalid enum value
+    expect((await httpError(updateTicket(t.id, { autonomy: 'auto' }))).status).toBe(400);
+    // @ts-expect-error — null does not reset to hitl; only the literal does
+    expect((await httpError(updateTicket(t.id, { autonomy: null }))).status).toBe(400);
+    expect(await fs.readFile(file, 'utf8')).toBe(before);
+  });
+
+  it('rejects a malformed spec on create and update', async () => {
+    for (const bad of ['docs/x.md', 'o/r:../x.md', 'o/r:x.txt', 'https://github.com/o/r/blob/main/x.md', '']) {
+      expect((await httpError(createTicket({ title: 'A', spec: bad }))).status).toBe(400);
+    }
+    const t = await createTicket({ title: 'A' });
+    expect((await httpError(updateTicket(t.id, { spec: 'o/r:docs/x.md\n' }))).status).toBe(400);
+  });
+
+  it('refuses afk on an agent-authored create or update, and still allows hitl', async () => {
+    const agent = { source: 'agent' as const, runId: 'run-1' };
+    expect((await httpError(createTicket({ title: 'A', autonomy: 'afk' }, agent))).status).toBe(403);
+    expect((await createTicket({ title: 'B', autonomy: 'hitl' }, agent)).autonomy).toBe('hitl');
+    const t = await createTicket({ title: 'C' });
+    expect((await httpError(updateTicket(t.id, { autonomy: 'afk' }, agent))).status).toBe(403);
+    expect((await getTicket(t.id)).autonomy).toBe('hitl');
+    expect((await updateTicket(t.id, { autonomy: 'afk' })).autonomy).toBe('afk');
+  });
+
+  it('reads a file with no autonomy key, or a garbage one, as hitl', async () => {
+    await writeRaw('tkt-noauto', makeRaw('No autonomy', 1));
+    await writeRaw('tkt-badauto', makeRaw('Bad autonomy', 2, { autonomy: 'AFK' }));
+    await writeRaw('tkt-boolauto', makeRaw('Bool autonomy', 3, { autonomy: 'true' }));
+    await writeRaw('tkt-afk', makeRaw('Afk', 4, { autonomy: 'afk' }));
+    await writeRaw('tkt-listauto', makeRaw('List autonomy', 5, { autonomy: '[afk]' }));
+    await writeRaw('tkt-objauto', makeRaw('Object autonomy', 6, { autonomy: '{ afk: true }' }));
+    expect((await getTicket('tkt-listauto')).autonomy).toBe('hitl');
+    expect((await getTicket('tkt-objauto')).autonomy).toBe('hitl');
+    expect((await getTicket('tkt-noauto')).autonomy).toBe('hitl');
+    expect((await getTicket('tkt-badauto')).autonomy).toBe('hitl');
+    expect((await getTicket('tkt-boolauto')).autonomy).toBe('hitl');
+    expect((await getTicket('tkt-afk')).autonomy).toBe('afk');
+  });
+
+  it('reads a malformed spec as null, never as a spec ticket', async () => {
+    await writeRaw('tkt-badspec', makeRaw('Bad spec', 1, { spec: "'docs/x.md'" }));
+    await writeRaw('tkt-numspec', makeRaw('Num spec', 2, { spec: '42' }));
+    await writeRaw('tkt-listspec', makeRaw('List spec', 4, { spec: "['o/r:x.md']" }));
+    expect((await getTicket('tkt-listspec')).spec).toBeNull();
+    await writeRaw('tkt-goodspec', makeRaw('Good spec', 3, { spec: `'${SPEC}'` }));
+    expect((await getTicket('tkt-badspec')).spec).toBeNull();
+    expect((await getTicket('tkt-numspec')).spec).toBeNull();
+    expect((await getTicket('tkt-goodspec')).spec).toBe(SPEC);
+  });
+
+  it('writes no autonomy or spec key for a hitl ticket with no spec, so existing files do not churn', async () => {
+    const t = await createTicket({ title: 'A', autonomy: 'hitl' });
+    const raw = await fs.readFile(path.join(dirs.tickets, `${t.id}.md`), 'utf8');
+    expect(raw).not.toMatch(/^autonomy:/m);
+    expect(raw).not.toMatch(/^spec:/m);
+  });
+
+  it('treats setting autonomy hitl on an implicit-hitl ticket as a no-op write', async () => {
+    const t = await createTicket({ title: 'A' });
+    const again = await updateTicket(t.id, { autonomy: 'hitl' });
+    expect(again.updated).toBe(t.updated);
   });
 });

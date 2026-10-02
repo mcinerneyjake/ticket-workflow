@@ -509,7 +509,7 @@ describe('cmdWorktree', () => {
   const ticket: Ticket = {
     id: 'tkt-1', title: 'Fix the broken thing now', type: 'bug', priority: 'high', status: 'todo',
     order: 1, created: '2026-01-01T00:00:00.000Z', updated: '2026-01-01T00:00:00.000Z', body: '',
-    project: null, blockers: [], parent: null, dueDate: null, assignee: null,
+    project: null, blockers: [], parent: null, dueDate: null, assignee: null, autonomy: 'hitl', spec: null,
   };
   const created = { kind: 'created' as const, path: '.claude/worktrees/tkt-1-fix', branch: 'fix/tkt-1-fix', base: 'origin/main' };
   const nothingDeclared = () => ({ kind: 'provisioned' as const, declared: false, entries: [] });

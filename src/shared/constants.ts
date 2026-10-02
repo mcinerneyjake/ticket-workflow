@@ -27,6 +27,9 @@ export const TYPES = ['bug', 'feature', 'task', 'chore'] as const;
 
 export const PRIORITIES = ['low', 'medium', 'high', 'urgent'] as const;
 
+// Who may drive a slice: hitl needs a human in the loop, afk admits unattended work (night run).
+export const AUTONOMY = ['hitl', 'afk'] as const;
+
 // Provenance authorship: agent = autonomous CLI write; assisted = human-reviewed
 // agent draft. Human/MCP/HTTP write leaves source null. Distinct from
 // Document.source (a retrieval connector); this names the WRITER.
@@ -40,6 +43,7 @@ export type StatusId = (typeof STATUSES)[number]['id']
 export type TicketType = (typeof TYPES)[number]
 export type Priority = (typeof PRIORITIES)[number]
 export type TicketSource = (typeof SOURCES)[number]
+export type Autonomy = (typeof AUTONOMY)[number]
 
 // Type predicates — find() narrows to the literal union without a cast.
 export function isStatusId(val: string): val is StatusId {
@@ -53,6 +57,25 @@ export function isPriority(val: string): val is Priority {
 }
 export function isSource(val: string): val is TicketSource {
   return SOURCES.find((s) => s === val) !== undefined;
+}
+export function isAutonomy(val: string): val is Autonomy {
+  return AUTONOMY.find((a) => a === val) !== undefined;
+}
+
+// Fail-closed: anything that is not exactly an AUTONOMY member reads as hitl, since afk admits unattended work.
+export function readAutonomy(val: unknown): Autonomy {
+  return typeof val === 'string' && isAutonomy(val) ? val : 'hitl';
+}
+
+// `owner/repo:path/to/spec.md` — resolvable on the owning repo's main with no machine-local map.
+// Every segment starts alphanumeric or `_`: no `.`/`..` traversal, and no `-` a git/gh argv would read as a flag.
+const SPEC_SEGMENT = '[A-Za-z0-9_][A-Za-z0-9._-]*';
+const SPEC_REF_RE = new RegExp(`^[A-Za-z0-9][A-Za-z0-9-]*/${SPEC_SEGMENT}:(?:${SPEC_SEGMENT}/)*${SPEC_SEGMENT}\\.md$`);
+
+export const SPEC_REF_HINT = 'expected owner/repo:path/to/spec.md; each segment starts with a letter, digit or _, then letters, digits, . _ or -';
+
+export function isSpecRef(val: string): boolean {
+  return SPEC_REF_RE.test(val);
 }
 
 export type Ticket = {
@@ -70,6 +93,9 @@ export type Ticket = {
   parent: string | null
   dueDate: string | null
   assignee: string | null
+  autonomy: Autonomy
+  // Non-null marks a spec ticket; slices are its children.
+  spec: string | null
   // Provenance — non-null only for agent-authored tickets. Optional so test
   // literals can omit it; normalize() always emits an explicit value. runId links
   // to the run log for per-ticket usage lookup.
