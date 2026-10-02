@@ -1454,6 +1454,12 @@ describe('decide — a command wrapper must not hide a git invocation (tkt-3d016
     expect(parseGit('/usr/bin/time git commit -m x')).toBe(null);
   });
 
+  // parseGh accepts a `*/gh` path spelling; parseGit does not yet accept `*/git` (tkt-bcc4f31c5b0a review).
+  it('KNOWN GAP: a path spelling of git is not git', () => {
+    expect(parseGit('/usr/bin/git commit -m x')).toBe(null);
+    expect(parseGit('/usr/bin/git push origin main')).toBe(null);
+  });
+
   // Parsed, but judged against the CURRENT directory although git runs in /repo. Was null before.
   it('KNOWN GAP: a fused directory-changing flag is skipped, not followed', () => {
     expect(parseGit('env --chdir=/repo git commit -m x')).toMatchObject({ sub: 'commit', repoDir: null });
