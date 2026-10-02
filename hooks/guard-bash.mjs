@@ -12,11 +12,17 @@
 //   3. git commit  while effectively on main → never commit directly to main.
 //   4. git push    that targets main, or a bare push while on main → never
 //      push to main (explicit non-main targets, deletes, and --tags are fine).
+//      A `git push` naming anything it cannot resolve — another remote, a glob, an
+//      unknown flag, -c, --git-dir, a GIT_* prefix on that same command — is
+//      refused (tkt-578863b616d2). NOT covered: a destination taken from persisted
+//      config, an earlier `export GIT_*`, HOME/XDG_CONFIG_HOME, send-pack/subtree.
+//   5. A -c / --config-env alias.* → refused for every verb, since the verb is
+//      unknowable. An alias set through GIT_CONFIG_* or include.path is not.
 //
 // SCOPE: this is a best-effort guard against the assistant's own predictable
-// commands, NOT an adversarial sandbox. It does NOT defend against deliberately
-// obscure forms — e.g. `git --git-dir <path> ...` global-option spoofing, env
-// prefixes other than simple VAR=val, or hiding a branch change behind a plain
+// commands, NOT an adversarial sandbox. Outside push, it does NOT defend against
+// deliberately obscure forms — e.g. `git --git-dir <path> commit` global-option
+// spoofing, a GIT_DIR prefix, or hiding a branch change behind a plain
 // `git checkout <branch>` (only `switch` / `checkout -b` are tracked). Defending
 // those would mean reimplementing a shell parser; GitHub branch protection is the
 // real backstop. An unknown `cd` target is NO LONGER on that list: it used to
@@ -85,12 +91,14 @@ export function parseGit(segment) {
   const tokens = quotedTokens(stripped);
   const cmd = commandWordIndex(tokens);
   if (cmd >= tokens.length || bareWord(tokens[cmd]) !== 'git') return null;
+  const env = tokens.slice(0, cmd).map((t) => /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(bareWord(t))?.[1]).filter(Boolean);
   let i = cmd + 1;
   let repoDir = null;
+  const globals = [];
   while (i < tokens.length && tokens[i].startsWith('-')) {
     if (tokens[i] === '-C') { repoDir = tokens[i + 1] ?? null; i += 2; }
-    else if (tokens[i] === '-c') { i += 2; } // -c takes a value we don't care about
-    else i += 1;
+    else if (GLOBAL_VALUE_OPTIONS.has(tokens[i])) { globals.push(...tokens.slice(i, i + 2).map(argValue)); i += 2; }
+    else { globals.push(argValue(tokens[i])); i += 1; }
   }
   // No token left where the subcommand belongs. When an unterminated quote is why — it fuses the
   // rest of the line into one token, and `git -C "/a/b commit -m x` leaves nothing after `-C` —
@@ -99,9 +107,13 @@ export function parseGit(segment) {
   // everywhere else (resolveDir, UNRESOLVABLE_MOVE). Report it and let the caller refuse: such a
   // command is a shell syntax error, so nothing legitimate is wedged (tkt-8f2e1f9894e2).
   if (i >= tokens.length)
-    return endsInsideQuote(stripped) ? { sub: null, args: [], repoDir, truncated: true } : null;
-  return { sub: argValue(tokens[i]), args: tokens.slice(i + 1).map(argValue), repoDir, truncated: false };
+    return endsInsideQuote(stripped) ? { sub: null, args: [], repoDir, globals, env, truncated: true } : null;
+  return { sub: argValue(tokens[i]), args: tokens.slice(i + 1).map(argValue), repoDir, globals, env, truncated: false };
 }
+
+// Global options whose value may be the NEXT token. Missing one here makes its value parse as the
+// subcommand: `git --git-dir /x push` read as the verb `/x`, hiding the push from every rule.
+const GLOBAL_VALUE_OPTIONS = new Set(['-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix', '--attr-source']);
 
 
 // resolveDir/cdTarget/splitSegments live in lib/shell.mjs — track-steps needs the same parsing to
@@ -156,9 +168,10 @@ function commitStagesAll(args) {
 // True when a push would land on main: an explicit main refspec/target, or a
 // bare push while on main (no explicit non-main target and not a delete/tags op).
 function pushesMain(args, branch, protectedBranches) {
+  const read = readPushArgs(args);
   // Strip a leading `+` (force-refspec syntax) so `+main` is still seen as main.
-  const positionals = args.filter((a) => !a.startsWith('-')).map((a) => a.replace(/^\+/, ''));
-  const flags = args.filter((a) => a.startsWith('-'));
+  const positionals = read.positionals.map((a) => a.replace(/^\+/, ''));
+  const { flags } = read;
   const onProtected = protectedBranches.includes(branch);
   const targetsMain = positionals.some((a) =>
     protectedBranches.some((p) => a === p || a.endsWith(`:${p}`) || a.endsWith(`/${p}`)),
@@ -175,6 +188,101 @@ function pushesMain(args, branch, protectedBranches) {
   const safeFlag = flags.some((f) => ['--delete', '-d', '--tags', '--prune'].includes(f));
   const explicitTarget = positionals.length >= 2; // remote + refspec → not the current branch implicitly
   return onProtected && !safeFlag && !explicitTarget;
+}
+
+// Exact spellings only: git accepts any unambiguous prefix of a long option, so `--mirr` IS
+// `--mirror`, and a denylist can never enumerate those. Force flags are absent because
+// destructiveGitReason has already refused them.
+const PUSH_FLAGS = new Set([
+  '--dry-run', '--porcelain', '--delete', '--tags', '--follow-tags', '--no-follow-tags', '--signed',
+  '--no-signed', '--atomic', '--no-atomic', '--set-upstream', '--thin', '--no-thin', '--quiet',
+  '--verbose', '--progress', '--no-progress', '--verify', '--no-verify', '--ipv4', '--ipv6', '--prune',
+  '--no-prune', '--no-recurse-submodules',
+]);
+const PUSH_SHORT = 'udnqv46';
+const PUSH_VALUE_FLAGS = ['--push-option', '--signed'];
+// Any other value would push the submodules' own branches, in repos this guard never judged.
+const PUSH_SUBMODULES_OK = ['--recurse-submodules=check', '--recurse-submodules=no'];
+// Inert global options; everything else (-c, --config-env, --git-dir, --work-tree, …) can move
+// where a push lands, so it refuses.
+const INERT_GLOBALS = new Set([
+  '--no-pager', '-P', '-p', '--paginate', '--no-optional-locks', '--no-replace-objects',
+  '--literal-pathspecs', '--glob-pathspecs', '--noglob-pathspecs', '--icase-pathspecs', '--no-advice',
+]);
+
+// The ONE reading of a push's args both push rules use. A second parser counted the -o VALUE as a
+// refspec, so `git push -o x origin` on main read as an explicit target and walked through.
+function readPushArgs(args) {
+  const positionals = [];
+  const flags = [];
+  let unknownFlag = null;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('-')) { positionals.push(a); continue; }
+    flags.push(a);
+    if (a.startsWith('--')) {
+      if (a === '--push-option') { i++; continue; }
+      const ok = PUSH_FLAGS.has(a) || PUSH_SUBMODULES_OK.includes(a) || PUSH_VALUE_FLAGS.some((f) => a.startsWith(`${f}=`));
+      if (!ok) unknownFlag ??= a;
+      continue;
+    }
+    for (let j = 1; j < a.length; j++) {
+      if (a[j] === 'o') { if (j === a.length - 1) i++; break; }
+      if (!PUSH_SHORT.includes(a[j])) { unknownFlag ??= `the short flag -${a[j]}`; break; }
+    }
+  }
+  return { positionals, flags, unknownFlag };
+}
+
+// Config keys a command line sets: `-c k=v`, `--config-env k=V`, `--config-env=k=V`.
+function configKeys(globals) {
+  const keys = [];
+  for (let i = 0; i < globals.length; i++) {
+    const g = globals[i];
+    if (g === '-c' || g === '--config-env') keys.push(globals[++i] ?? '');
+    else if (g.startsWith('--config-env=')) keys.push(g.slice('--config-env='.length));
+  }
+  return keys.map((k) => k.split('=')[0].toLowerCase());
+}
+
+// A reason when this push names anything it cannot resolve to `origin` plus literal, unprotected
+// branches or tags — fail closed (tkt-578863b616d2). A push with NO refspec stays with pushesMain:
+// its destination comes from persisted config (push.default, remote.*.push), tkt-28b9514f0418.
+function unresolvedPushReason(args, { globals, env }, branch, protectedBranches) {
+  const refuse = (what) => `This push ${what}, so where it lands cannot be checked against the never-push-to-${protectedBranches.join('/')} rule. Refusing rather than guessing — push one named branch to origin: git push -u origin <branch>. See CLAUDE.md → Branch, commit & PR workflow.`;
+
+  const gitEnv = env.find((name) => name.startsWith('GIT_'));
+  if (gitEnv) return refuse(`runs under ${gitEnv}, which can point git at another repository or config`);
+  const global = globals.find((g) => !INERT_GLOBALS.has(g));
+  if (global) return refuse(`passes the global option ${global}, which can redirect or reconfigure git`);
+
+  const { positionals, unknownFlag } = readPushArgs(args);
+  if (unknownFlag) return refuse(`uses ${unknownFlag}, which is not a flag this guard knows to be destination-neutral`);
+
+  if (positionals.length === 0) return null;
+  const [remote, ...refspecs] = positionals;
+  if (remote !== 'origin') return refuse(`targets ${remote}, and the protected branch is only known for origin`);
+
+  for (let k = 0; k < refspecs.length; k++) {
+    if (refspecs[k] === 'tag') {
+      // git expands `tag X` to `refs/tags/X` verbatim, so a `:`, glob or `@{` in X is a destination.
+      const name = refspecs[++k] ?? '';
+      if (!name || /[:*^]|@\{/.test(name)) return refuse(`names tag ${name || '(nothing)'}, which is not one literal tag`);
+      continue;
+    }
+    const spec = refspecs[k].replace(/^\+/, '');
+    if (/[*^]|@\{/.test(spec)) return refuse(`names ${spec}, which is a pattern or relative ref rather than one branch`);
+    const colon = spec.indexOf(':');
+    let dst = colon < 0 ? spec : spec.slice(colon + 1);
+    if (colon < 0 && (dst === 'HEAD' || dst === '@')) dst = branch ?? '';
+    if (dst === 'HEAD' || dst === '@') return refuse(`names ${spec}, which updates whatever the remote HEAD points at`);
+    if (dst.startsWith('refs/tags/')) continue;
+    if (dst.startsWith('refs/heads/')) dst = dst.slice('refs/heads/'.length);
+    else if (dst.startsWith('refs/')) return refuse(`names ${spec}, which is not a branch or tag`);
+    // Empty covers a matching push (`:`, `src:`) and HEAD on an unresolved branch alike.
+    if (dst === '' || protectedBranches.includes(dst)) return refuse(`names ${spec}, which resolves to a protected branch or to none`);
+  }
+  return null;
 }
 
 // The branch a `switch`/`checkout -b` moves to, so a chain that creates the
@@ -301,14 +409,14 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
       const git = parseGit(segment);
       if (git) {
         if (git.truncated) return { blocked: true, reason: TRUNCATED_QUOTE };
-        const { sub, args, repoDir } = git;
+        const { sub, args, repoDir, globals, env } = git;
         const gitDir = repoDir ? resolveDir(dir, repoDir) : dir; // -C acts on that repo, whatever the cwd
         // Scoped to commit/push and checked before the rules, like the branch===null refusal they
         // share a reason with: an unknown directory must not wedge `git status`, but it must never
         // buy a commit an exemption. An absolute `-C` still names its repo, so it is unaffected.
         if (unknownDir && gitDir === null && (sub === 'commit' || sub === 'push'))
           return { blocked: true, reason: UNRESOLVABLE_MOVE };
-        const verdict = ruleFor(sub, args, branchFor(gitDir), () => repoFor(gitDir));
+        const verdict = ruleFor(sub, args, branchFor(gitDir), () => repoFor(gitDir), { globals, env });
         if (verdict) return { blocked: true, reason: verdict };
         // Only switch/checkout needs the repo shape here; computing it for every segment would put
         // the git subprocesses back on `git status`/`log`/`diff`, which is what the thunk avoids.
@@ -340,7 +448,12 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
 // `branch` is the branch of the repo THIS command acts on, not the hook's.
 // `getRepo()` is a THUNK returning { hasRemote, protectedBranches } — called only by the rules that
 // need it, so `git status`/`log`/`diff` never pay for the git subprocesses it costs.
-function ruleFor(sub, args, branch, getRepo) {
+function ruleFor(sub, args, branch, getRepo, preamble = { globals: [], env: [] }) {
+  // Checked before anything reads `sub`: under a command-line alias the verb is a name this guard
+  // has never seen, so no rule below would fire for it, whatever it expands to.
+  if (configKeys(preamble.globals).some((k) => k.startsWith('alias.')))
+    return 'This command defines a git alias inline (-c alias.* / --config-env alias.*), so the verb it runs cannot be checked by any rule. Run the git command it expands to directly.';
+
   const destructive = destructiveGitReason(sub, args);
   if (destructive) return destructive;
 
@@ -374,6 +487,11 @@ function ruleFor(sub, args, branch, getRepo) {
 
   if (protectedBranches !== null && sub === 'push' && pushesMain(args, branch, protectedBranches))
     return `Direct pushes to ${protectedBranches.join('/')} are not allowed — push your ticket branch and open a PR. See CLAUDE.md → Branch, commit & PR workflow.`;
+
+  if (protectedBranches !== null && sub === 'push') {
+    const unresolved = unresolvedPushReason(args, preamble, branch, protectedBranches);
+    if (unresolved) return unresolved;
+  }
 
   // An unresolved branch is NOT a safe branch. Every failure that breaks `git rev-parse` — a bogus
   // GIT_CONFIG_PARAMETERS, GIT_CEILING_DIRECTORIES over the repo, a safe.directory refusal, git off

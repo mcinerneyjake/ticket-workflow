@@ -30,18 +30,18 @@ const twoRepos = byDir({ [KANBAN]: 'main', [OTHER]: 'feat/x' });
 
 describe('parseGit', () => {
   it('extracts the subcommand and args', () => {
-    expect(parseGit('git add -A')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, truncated: false });
+    expect(parseGit('git add -A')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, globals: [], env: [], truncated: false });
     expect(parseGit('git commit -m "x"'))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: null, globals: [], env: [], truncated: false });
   });
 
-  it('captures -C as repoDir, skips -c, skips env prefixes', () => {
+  it('captures -C as repoDir, collects -c and env prefixes without taking them as the subcommand', () => {
     expect(parseGit('git -C /repo add foo'))
-      .toEqual({ sub: 'add', args: ['foo'], repoDir: '/repo', truncated: false });
+      .toEqual({ sub: 'add', args: ['foo'], repoDir: '/repo', globals: [], env: [], truncated: false });
     expect(parseGit('git -c user.name=x commit'))
-      .toEqual({ sub: 'commit', args: [], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: [], repoDir: null, globals: ['-c', 'user.name=x'], env: [], truncated: false });
     expect(parseGit('FOO=bar git add foo'))
-      .toEqual({ sub: 'add', args: ['foo'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'add', args: ['foo'], repoDir: null, globals: [], env: ['FOO'], truncated: false });
   });
 
   it('requires the command word to be git (not just a mention)', () => {
@@ -51,28 +51,28 @@ describe('parseGit', () => {
   });
 
   it('sees through subshell/group punctuation', () => {
-    expect(parseGit('(git add -A)')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, truncated: false });
+    expect(parseGit('(git add -A)')).toEqual({ sub: 'add', args: ['-A'], repoDir: null, globals: [], env: [], truncated: false });
   });
 
   // A quoted span is ONE token. repoDir keeps its quoting — resolveDir owns removal there, and
   // hiddenDirTarget needs the raw text (tkt-8f2e1f9894e2) — while sub/args come back dequoted (tkt-6d1ae448e3b3).
   it('keeps a quoted span carrying a space in one token', () => {
     expect(parseGit('git -C "/repos/my repo" commit -m x'))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: '"/repos/my repo"', truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: '"/repos/my repo"', globals: [], env: [], truncated: false });
     expect(parseGit("git -C '/repos/my repo' commit -m x"))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: "'/repos/my repo'", truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: "'/repos/my repo'", globals: [], env: [], truncated: false });
     expect(parseGit('git commit -m "fix -a bug"'))
-      .toEqual({ sub: 'commit', args: ['-m', 'fix -a bug'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'fix -a bug'], repoDir: null, globals: [], env: [], truncated: false });
   });
 
   it('skips an env prefix whose quoted value contains a space', () => {
     expect(parseGit('EDITOR="code -w" git commit -m x'))
-      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: null, truncated: false });
+      .toEqual({ sub: 'commit', args: ['-m', 'x'], repoDir: null, globals: [], env: ['EDITOR'], truncated: false });
   });
 
   it('reports a subcommand swallowed by an unterminated quote, rather than returning null', () => {
     expect(parseGit('git -C "/a/b commit -m x'))
-      .toEqual({ sub: null, args: [], repoDir: '"/a/b commit -m x', truncated: true });
+      .toEqual({ sub: null, args: [], repoDir: '"/a/b commit -m x', globals: [], env: [], truncated: true });
     // Still null when there is simply no subcommand — no quote is involved, so nothing was hidden.
     expect(parseGit('git -C /repo')).toBeNull();
   });
@@ -1468,5 +1468,118 @@ describe('decide — a command wrapper must not hide a git invocation (tkt-3d016
   it('KNOWN GAP: a wrapper-led cd is not tracked as a move', () => {
     const br = (d) => (d === '/primary' ? 'main' : 'feat/x');
     expect(decide('builtin cd /primary && git commit -m x', br, '/wt').blocked).toBe(false);
+  });
+});
+
+describe('decide — a push it cannot resolve fails closed (tkt-578863b616d2)', () => {
+  const onFeat = (cmd) => blocked(cmd, 'feat/x');
+
+  it('blocks every shape the ticket measured walking through on a feature branch', () => {
+    expect(onFeat('git push --mirror origin')).toBe(true);
+    expect(onFeat('git push --all origin')).toBe(true);
+    expect(onFeat('git -c remote.origin.push=HEAD:refs/heads/main push origin')).toBe(true);
+    expect(onFeat("git push origin 'refs/heads/*:refs/heads/*'")).toBe(true);
+    expect(onFeat('GIT_DIR=../primary/.git git push origin HEAD')).toBe(true);
+    expect(onFeat('git --git-dir=/a/primary/.git push origin HEAD')).toBe(true);
+    expect(onFeat('git push upstream master')).toBe(true);
+    expect(onFeat("git -c alias.x='push --mirror' x origin")).toBe(true);
+  });
+
+  it('allowlists flags by exact spelling, because git accepts an abbreviated long option', () => {
+    expect(onFeat('git push --mirr origin')).toBe(true);
+    expect(onFeat('git push --branches origin')).toBe(true);
+    expect(onFeat('git push --repo=upstream')).toBe(true);
+    expect(onFeat('git push --frobnicate origin feat/x')).toBe(true);
+    expect(onFeat('git push -x origin feat/x')).toBe(true);
+    expect(onFeat('git push --receive-pack=x origin feat/x')).toBe(true);
+    expect(onFeat('git push --recurse-submodules=on-demand origin feat/x')).toBe(true);
+    expect(onFeat('git push --recurse-submodules=check origin feat/x')).toBe(false); // control
+  });
+
+  it('refuses a refspec whose destination is not one literal branch or tag', () => {
+    expect(onFeat('git push origin :')).toBe(true); // matching: every same-named branch
+    expect(onFeat('git push origin feat/x:')).toBe(true);
+    expect(onFeat('git push origin ^refs/heads/x')).toBe(true);
+    expect(onFeat('git push origin @{u}')).toBe(true);
+    expect(onFeat('git push origin feat/x:HEAD')).toBe(true);
+    expect(onFeat('git push origin HEAD:refs/remotes/origin/x')).toBe(true);
+    expect(onFeat('git push origin HEAD:refs/notes/x')).toBe(true);
+  });
+
+  it('refuses a remote other than origin, since the protected branch is resolved from origin only', () => {
+    expect(onFeat('git push https://example.invalid/r.git feat/x')).toBe(true);
+    expect(onFeat('git push upstream feat/x')).toBe(true);
+    expect(onFeat('git push upstream')).toBe(true);
+  });
+
+  it('refuses a push under a preamble that redirects or reconfigures git', () => {
+    expect(onFeat('git --git-dir /a/primary/.git push origin HEAD')).toBe(true);
+    expect(onFeat('git --work-tree=/a/primary push origin HEAD')).toBe(true);
+    expect(onFeat('git --namespace=x push origin feat/x')).toBe(true);
+    expect(onFeat('git --config-env=remote.origin.push=V push origin')).toBe(true);
+    expect(onFeat('git --config-env remote.origin.push=V push origin')).toBe(true);
+    expect(onFeat('GIT_WORK_TREE=/a/primary git push origin feat/x')).toBe(true);
+    expect(onFeat("GIT_CONFIG_PARAMETERS=\"'remote.origin.push'='HEAD:main'\" git push origin feat/x")).toBe(true);
+    expect(onFeat('env GIT_DIR=/a/primary/.git git push origin HEAD')).toBe(true);
+    expect(onFeat('git -c push.default=matching push')).toBe(true);
+  });
+
+  it('refuses a command-line alias whatever verb it is spelled as', () => {
+    expect(onFeat("git -c ALIAS.x='push --mirror' x origin")).toBe(true);
+    expect(onFeat('git --config-env=alias.x=V x origin')).toBe(true);
+    expect(onFeat("git -c alias.ci='commit -a' ci")).toBe(true);
+    expect(onFeat('git -c user.name=x commit -m x')).toBe(false); // control: -c alone is not an alias
+    expect(onFeat('git -c core.pager=cat log')).toBe(false);
+  });
+
+  it('keeps every push the workflow actually uses allowed', () => {
+    for (const cmd of [
+      'git push',
+      'git push origin',
+      'git push -u origin feat/x',
+      'git push --set-upstream origin feat/x',
+      'git push origin HEAD',
+      'git push origin @',
+      'git push origin HEAD:refs/heads/feat/x',
+      'git push origin refs/heads/feat/x',
+      'git push origin feat/x:feat/y',
+      'git push origin tag v1.0.0',
+      'git push origin refs/tags/v1.0.0',
+      'git push origin :feat/old',
+      'git push origin --delete feat/old',
+      'git push --dry-run -v origin feat/x',
+      'git push -nq origin feat/x',
+      'git push -o ci.skip origin feat/x',
+      'git push --push-option ci.skip origin feat/x',
+      'git push --no-verify --follow-tags origin feat/x',
+      'git push --tags',
+      'git --no-pager push origin feat/x',
+      'git -C /repo push origin feat/x',
+      'FOO=1 git push origin feat/x',
+    ]) expect(onFeat(cmd), cmd).toBe(false);
+  });
+
+  it('keeps the precise main-push message ahead of the generic refusal', () => {
+    expect(decide('git push origin main', onBranch('feat/x')).reason).toMatch(/Direct pushes to main/);
+    expect(decide('git push --mirror origin', onBranch('feat/x')).reason).toMatch(/--mirror/);
+  });
+
+  it('reads a push-option VALUE as a value in both rules, so a remote-only push on main still blocks', () => {
+    expect(blocked('git push -o ci.skip origin', 'main')).toBe(true);
+    expect(blocked('git push --push-option ci.skip origin', 'main')).toBe(true);
+    expect(blocked('git push -o ci.skip origin feat/x', 'main')).toBe(false); // control: explicit non-main target
+  });
+
+  it('validates the name after the tag keyword like any other refspec', () => {
+    expect(onFeat('git push origin tag v1:HEAD')).toBe(true);
+    expect(onFeat("git push origin tag '*:refs/heads/*'")).toBe(true);
+    expect(onFeat('git push origin tag')).toBe(true);
+    expect(onFeat('git push origin tag v1.0.0')).toBe(false); // control
+  });
+
+  it('reads a detached --git-dir value as a value, not as the subcommand', () => {
+    expect(parseGit('git --git-dir /x/.git push origin HEAD'))
+      .toMatchObject({ sub: 'push', args: ['origin', 'HEAD'], globals: ['--git-dir', '/x/.git'] });
+    expect(parseGit('GIT_DIR=/x FOO=1 git push')).toMatchObject({ sub: 'push', env: ['GIT_DIR', 'FOO'] });
   });
 });
