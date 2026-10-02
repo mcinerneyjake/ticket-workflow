@@ -76,11 +76,16 @@ It ships three pieces:
   (`guard-review-target.mjs`) that refuses a `/code-review` with no explicit
   target when the session's own repository has no diff to review, because a
   wrong-repo review reads exactly like a clean one. And a `PreToolUse` guard
-  (`guard-subagent-gates.mjs`) that stops a **subagent** running `git commit`,
-  `git push`, `gh pr create` or `gh pr merge` — the actions that sit behind a
-  human approval gate, which a subagent has no channel to ask for. Reading and
-  posting findings (`git log`/`diff`, `gh pr view`/`diff`/`list`,
-  `gh pr comment`) are untouched. And a PAIR — `guard-worktree.mjs` with
+  (`guard-subagent-gates.mjs`) that stops a **subagent** merging a PR —
+  `gh pr merge`, any `gh api` call carrying a method or a parameter (the
+  implied POST of `-f`/`-F`/`--input` included, so a GraphQL *read* is
+  refused too), or a verb that can reach one (`workflow run`, `repo sync`,
+  `alias set`, …) — and from pushing, closing a PR, publishing a release, or
+  editing or deleting a repo. Merge is a human approval gate, which a
+  subagent has no channel to ask for. Commit, `gh pr create`/`edit`/`ready`,
+  parameterless `gh api` reads and `gh pr comment` are allowed. Push stays
+  blocked because `guard-bash` cannot yet judge every push shape for `main`.
+  And a PAIR — `guard-worktree.mjs` with
   `guard-worktree-precheck.mjs` — that, once a session has called
   `start_ticket`, refuses writes aimed at a repository's **primary** checkout,
   so two ticket sessions cannot share one working tree. The guard arms on
