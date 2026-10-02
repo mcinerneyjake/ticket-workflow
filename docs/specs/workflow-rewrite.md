@@ -64,8 +64,11 @@ because the skill runs it unconditionally; it was a gate only because it could b
 ### Skills
 
 - **Vendored** from `mattpocock/skills` at a pinned commit, each copy carrying the MIT copyright and
-  permission notice: `grilling`, `tdd`, `code-review`, `handoff`, `codebase-design`. These are
-  tracker-agnostic judgment; rewriting them would be imitation.
+  permission notice: `grilling`, `tdd`, `standards-and-spec-review`, `handoff`, `codebase-design`.
+  These are tracker-agnostic judgment; rewriting them would be imitation.
+  `standards-and-spec-review` is upstream's `code-review`, renamed so it cannot shadow Claude Code's
+  built-in `/code-review`, which consumer review gates run. `templates/skills/UPSTREAM.json` records
+  the rename.
 - **Our own**, because they bind to the board, the guards and the night run: `to-tickets`,
   `implement`, the night-run loop, `retro`.
 - **Size**: every `SKILL.md` ≤ 120 lines, audited; overflow goes to sibling reference files loaded
