@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import matter from 'gray-matter';
-import { STATUS_IDS, TYPES, PRIORITIES, BOARD_STATUSES, CREATE_STATUS_IDS, STATUS_STEP, isSource, isStatusId, type Ticket, type StatusId, type Priority, type DashboardSummary, type Provenance } from '../shared/constants.js';
+import { STATUS_IDS, TYPES, PRIORITIES, BOARD_STATUSES, CREATE_STATUS_IDS, STATUS_STEP, AUTONOMY, SPEC_REF_HINT, isAutonomy, isSource, isSpecRef, isStatusId, readAutonomy, type Autonomy, type Ticket, type StatusId, type Priority, type DashboardSummary, type Provenance } from '../shared/constants.js';
 import { ticketsDir } from '../paths.js';
 import { appendEvent } from './events.js';
 import { log } from '../logger.js';
@@ -44,7 +44,7 @@ export function errnoCode(err: unknown): string | null {
 // being silently dropped at the MCP boundary (tkt-cb982de01540).
 // appendBody is a transient instruction, not a Ticket field: it appends to the
 // existing body (non-destructive) and is never persisted. Mutually exclusive with body.
-export type TicketPatch = Partial<Pick<Ticket, 'title' | 'type' | 'priority' | 'status' | 'order' | 'body' | 'project' | 'blockers' | 'parent' | 'dueDate' | 'assignee'>> & { appendBody?: string }
+export type TicketPatch = Partial<Pick<Ticket, 'title' | 'type' | 'priority' | 'status' | 'order' | 'body' | 'project' | 'blockers' | 'parent' | 'dueDate' | 'assignee' | 'autonomy' | 'spec'>> & { appendBody?: string }
 
 // Every writable field at once, for `restore --full`. Typed Required<…> so a field added to
 // TicketPatch fails to COMPILE here until restore carries it, rather than being silently dropped
@@ -56,7 +56,7 @@ export function fullPatchOf(t: Ticket): FullTicketPatch {
   return {
     title: t.title, type: t.type, priority: t.priority, status: t.status, order: t.order,
     body: t.body, project: t.project, blockers: t.blockers, parent: t.parent,
-    dueDate: t.dueDate, assignee: t.assignee,
+    dueDate: t.dueDate, assignee: t.assignee, autonomy: t.autonomy, spec: t.spec,
   };
 }
 
@@ -74,6 +74,8 @@ interface RawFrontmatter {
   parent?: string | null
   dueDate?: string | null
   assignee?: string | null
+  autonomy?: unknown
+  spec?: unknown
   source?: string | null
   runId?: string | null
 }
@@ -91,6 +93,8 @@ interface SerializedFrontmatter {
   parent?: string
   dueDate?: string
   assignee?: string
+  autonomy?: string
+  spec?: string
   source?: string
   runId?: string
 }
@@ -147,6 +151,8 @@ function normalize(id: string, data: RawFrontmatter, body: string): ParsedTicket
     parent: typeof data.parent === 'string' && data.parent ? data.parent : null,
     dueDate: typeof data.dueDate === 'string' && data.dueDate ? data.dueDate : null,
     assignee: typeof data.assignee === 'string' && data.assignee ? data.assignee : null,
+    autonomy: readAutonomy(data.autonomy),
+    spec: typeof data.spec === 'string' && isSpecRef(data.spec) ? data.spec : null,
     source: typeof data.source === 'string' && isSource(data.source) ? data.source : null,
     runId: typeof data.runId === 'string' && data.runId ? data.runId : null,
   };
@@ -168,6 +174,9 @@ function serialize(ticket: Ticket): string {
   if (ticket.parent) data.parent = ticket.parent;
   if (ticket.dueDate) data.dueDate = ticket.dueDate;
   if (ticket.assignee) data.assignee = ticket.assignee;
+  // hitl is the read default, so omitting it keeps every pre-existing file byte-identical.
+  if (ticket.autonomy !== 'hitl') data.autonomy = ticket.autonomy;
+  if (ticket.spec) data.spec = ticket.spec;
   // Provenance keys are omitted for human/CLI writes (both null) → clean diffs.
   if (ticket.source) data.source = ticket.source;
   if (ticket.runId) data.runId = ticket.runId;
@@ -281,7 +290,27 @@ function validateWritableTypes(patch: TicketPatch) {
   if (patch.blockers != null &&
       (!Array.isArray(patch.blockers) || !patch.blockers.every((b) => typeof b === 'string')))
     throw new HttpError(400, 'blockers must be an array of strings');
+  // `!== undefined`, not `!= null`: a null autonomy must not slip past as "absent" and later read as hitl.
+  if (patch.autonomy !== undefined) assertAutonomy(patch.autonomy);
+  if (patch.spec !== undefined) assertSpecRef(patch.spec);
   assertNoNulBytes(patch);
+}
+
+// Shared with the protocol extractor (validation.ts) so the two write paths enforce one rule.
+export function assertAutonomy(value: unknown): asserts value is Autonomy {
+  if (typeof value !== 'string' || !isAutonomy(value))
+    throw new HttpError(400, `Invalid autonomy: ${JSON.stringify(value)} (allowed: ${AUTONOMY.join(', ')})`);
+}
+
+// afk admits unattended work, so a provenance-stamped (agent-authored) write may never grant it.
+function assertAfkGrantable(autonomy: Autonomy | undefined, provenance: Provenance | undefined): void {
+  if (provenance && autonomy === 'afk')
+    throw new HttpError(403, 'An agent-authored write cannot set autonomy to afk; a human sets it.');
+}
+
+export function assertSpecRef(value: unknown): asserts value is string | null {
+  if (value !== null && (typeof value !== 'string' || !isSpecRef(value)))
+    throw new HttpError(400, `Invalid spec: ${JSON.stringify(value)} (${SPEC_REF_HINT})`);
 }
 
 // A NUL makes the persisted .md classify as binary, so binary-skipping tools drop the ticket while
@@ -524,6 +553,7 @@ export async function createTicket(input: Partial<Ticket>, provenance?: Provenan
   validateWritableTypes(input);
   assertEnum(TYPES, input.type, 'type');
   assertEnum(PRIORITIES, input.priority, 'priority');
+  assertAfkGrantable(input.autonomy, provenance);
   // Create restricted to pre-work columns — reject qa/archived (parity with the MCP create schema).
   if (input.status != null && !CREATE_STATUS_IDS.includes(input.status))
     throw new HttpError(400, `Invalid status: ${input.status} (allowed for create: ${CREATE_STATUS_IDS.join(', ')})`);
@@ -550,6 +580,8 @@ export async function createTicket(input: Partial<Ticket>, provenance?: Provenan
     parent: input.parent || null,
     dueDate: input.dueDate || null,
     assignee: input.assignee || null,
+    autonomy: input.autonomy ?? 'hitl',
+    spec: input.spec ?? null,
     source: provenance?.source ?? null,
     runId: provenance?.runId || null,
   };
@@ -702,6 +734,7 @@ export function startTicket(id: string, options: { force?: boolean } = {}): Prom
 async function updateTicketLocked(id: string, patch: TicketPatch, provenance?: Provenance): Promise<Ticket> {
   validateWritableTypes(patch);
   validateEnums(patch);
+  assertAfkGrantable(patch.autonomy, provenance);
   assertDueDate(patch.dueDate);
   const { ticket: existing, statusRepaired, raw } = await readTicket(id, patch.status ?? undefined);
   const nextBody = mergeBody(existing.body, patch);
@@ -726,6 +759,8 @@ async function updateTicketLocked(id: string, patch: TicketPatch, provenance?: P
     parent: patch.parent !== undefined ? patch.parent : existing.parent,
     dueDate: patch.dueDate !== undefined ? patch.dueDate : existing.dueDate,
     assignee: patch.assignee !== undefined ? patch.assignee : existing.assignee,
+    autonomy: patch.autonomy ?? existing.autonomy,
+    spec: patch.spec !== undefined ? patch.spec : existing.spec,
     // Authorship set once at CREATE, never reassigned — an agent edit of a human
     // ticket can't claim it. Only runId is refreshed by an agent write (the
     // cost-attribution join); a human/HTTP write preserves the existing runId.

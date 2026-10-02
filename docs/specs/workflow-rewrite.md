@@ -54,10 +54,11 @@ because the skill runs it unconditionally; it was a gate only because it could b
 - **Specs** live in the repo that owns the interface being changed, as a spec file under
   `docs/specs/`. A cross-repo feature's spec goes to the repo whose interface it changes (usually this
   package). Git history replaces append-only body conventions: specs are edited normally.
-- **The board** holds a `spec` ticket that links to the file; slices are its children. A **local
-  probe** (not a CI audit check — CI has no board) fails when a spec ticket's link does not resolve on
-  the owning repo's `main`, and exits as "could not check" rather than clean when the board or the
-  repo is unreadable.
+- **The board** holds a spec ticket that links to the file; slices are its children. A spec ticket
+  is any ticket whose `spec` field is set, as `owner/repo:path/to/spec.md`; there is no `spec` type,
+  so the marker and the link cannot disagree. A **local probe** (not a CI audit check — CI has no
+  board) fails when a spec ticket's link does not resolve on the owning repo's `main`, and exits as
+  "could not check" rather than clean when the board or the repo is unreadable.
 - **Skills ship in this package.** `init` installs them into a consumer's `.claude/skills/`, pinned
   by the package tag; `audit` reports missing or drifted copies.
 
@@ -88,8 +89,9 @@ because the skill runs it unconditionally; it was a gate only because it could b
 - Each slice cuts a narrow, complete path through every layer and fits one fresh context window.
 - Each names its **test seams**; the human approves them with the slicing. No test is written at an
   unagreed seam.
-- Each carries a validated **HITL/AFK field**. A missing or invalid value reads as HITL: the
-  fail-closed direction, since AFK admits unattended work.
+- Each carries a validated **HITL/AFK field**, `autonomy: hitl | afk`. A write naming any other value
+  is rejected; a missing or invalid value already on disk reads as HITL: the fail-closed direction,
+  since AFK admits unattended work.
 
 ### Implementation
 
@@ -144,7 +146,7 @@ Two sub-agents in fresh contexts, run in parallel, findings never merged or rera
 
 | Surface | Change |
 |---|---|
-| Ticket schema | A HITL/AFK field, validated, defaulting to HITL; a way to mark a ticket as a spec and carry its link (type or field — decided at slicing) |
+| Ticket schema | `autonomy: hitl \| afk`, validated, defaulting to HITL; a nullable `spec: owner/repo:path` field that marks a spec ticket and carries its link |
 | `guard-ticket` | Admits a create carrying a spec-ticket parent |
 | `guard-worktree` | Stateless rule above |
 | `guard-subagent-gates` | Narrows to merge |
@@ -181,8 +183,6 @@ unaffected.
 
 ## Open questions
 
-- Spec ticket as a new `type` or as a field on an existing type; `guard-ticket`'s predicate depends
-  on it.
 - Whether a self-asserted spec parent is enough for `guard-ticket`, or a create must also prove the
   spec ticket is open and its link resolves.
 - Cases the stateless `guard-worktree` blocks today's workflow from: repos with no `origin` (the

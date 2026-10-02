@@ -1042,3 +1042,73 @@ describe('update_ticket backup-on-write round-trip (tkt-18d53c0c7cd8)', () => {
     expect(snap).not.toContain('REPLACED BODY');
   });
 });
+
+// ---------------------------------------------------------------------------
+
+describe('autonomy + spec round-trip through the MCP tools (tkt-9559b1f8dbab)', () => {
+  const SPEC = 'mcinerneyjake/ticket-workflow:docs/specs/workflow-rewrite.md';
+
+  it('create_ticket → update_ticket → get_ticket carries both fields to disk and back', async () => {
+    const created = asRecord(await handleToolCall('create_ticket', { title: 'Slice', autonomy: 'afk', spec: SPEC }));
+    expect(created.autonomy).toBe('afk');
+    expect(created.spec).toBe(SPEC);
+    const id = created.id;
+    if (typeof id !== 'string') throw new Error('expected an id');
+
+    const raw = await fs.readFile(path.join(dirs.tickets, `${id}.md`), 'utf8');
+    expect(raw).toMatch(/^autonomy: afk$/m);
+    expect(raw.split('\n')).toContain(`spec: '${SPEC}'`);
+
+    const updated = asRecord(await handleToolCall('update_ticket', { id, autonomy: 'hitl', spec: null }));
+    expect(updated.autonomy).toBe('hitl');
+    expect(updated.spec).toBeNull();
+
+    const fetched = asRecord(await handleToolCall('get_ticket', { id }));
+    expect(fetched.autonomy).toBe('hitl');
+    expect(fetched.spec).toBeNull();
+  });
+
+  it('rejects wrong-typed and out-of-enum values as a tool error without writing', async () => {
+    const t = await createTicket({ title: 'A' });
+    for (const autonomy of ['AFK', 'auto', null, 1, true, ['afk'], { afk: true }]) {
+      const res = await handleToolCall('update_ticket', { id: t.id, autonomy });
+      expect(res.isError, `autonomy ${JSON.stringify(autonomy)}`).toBe(true);
+    }
+    for (const spec of ['docs/x.md', 42, false, ['o/r:x.md'], { path: 'o/r:x.md' }, '--upload-pack/r:x.md']) {
+      const res = await handleToolCall('update_ticket', { id: t.id, spec });
+      expect(res.isError, `spec ${JSON.stringify(spec)}`).toBe(true);
+    }
+    for (const autonomy of ['AFK', null, 0]) {
+      const res = await handleToolCall('create_ticket', { title: 'B', autonomy });
+      expect(res.isError, `create autonomy ${JSON.stringify(autonomy)}`).toBe(true);
+    }
+    expect((await listTickets()).map((x) => x.title)).toEqual(['A']);
+    expect((await getTicket(t.id)).updated).toBe(t.updated);
+  });
+
+  it('names the offending value in the error, including a non-string one', async () => {
+    const t = await createTicket({ title: 'A' });
+    const res = await handleToolCall('update_ticket', { id: t.id, autonomy: ['afk'] });
+    expect(res.content[0].text).toContain('["afk"]');
+  });
+
+  it('refuses afk from the agent write path, which passes provenance', async () => {
+    const res = await handleToolCall('create_ticket', { title: 'Agent', autonomy: 'afk' }, { source: 'agent', runId: 'run-1' });
+    expect(res.isError).toBe(true);
+    expect(await listTickets()).toEqual([]);
+  });
+
+  it('accepts spec: null on create as no spec', async () => {
+    const created = asRecord(await handleToolCall('create_ticket', { title: 'C', spec: null }));
+    expect(created.spec).toBeNull();
+  });
+
+  it('advertises both fields on the create and update schemas', () => {
+    for (const name of ['create_ticket', 'update_ticket']) {
+      const tool = TOOLS.find((x) => x.name === name);
+      const props = tool?.inputSchema.properties;
+      expect(props && 'autonomy' in props, `${name}.autonomy`).toBe(true);
+      expect(props && 'spec' in props, `${name}.spec`).toBe(true);
+    }
+  });
+});

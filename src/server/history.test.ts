@@ -269,6 +269,18 @@ describe('restore --at', () => {
     expect(ticket.created).toBe(t.created);
   });
 
+  it('--full restores autonomy and spec (tkt-9559b1f8dbab)', async () => {
+    const t = await createTicket({ title: 'Slice', body: 'ORIGINAL', autonomy: 'afk', spec: 'o/r:docs/specs/x.md' });
+    await updateTicket(t.id, { body: 'NEXT' });
+    const [snap] = (await listHistory(t.id)).snapshots;
+    await updateTicket(t.id, { autonomy: 'hitl', spec: null });
+
+    await restoreFromSnapshot(t.id, snap.file, { full: true });
+    const ticket = await getTicket(t.id);
+    expect(ticket.autonomy).toBe('afk');
+    expect(ticket.spec).toBe('o/r:docs/specs/x.md');
+  });
+
   it('REFUSES a no-op restore without writing', async () => {
     const t = await createTicket({ title: 'Doc', body: 'SAME' });
     await updateTicket(t.id, { body: 'CHANGED' });

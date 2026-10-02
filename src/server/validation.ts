@@ -3,7 +3,7 @@ import {
   isStatusId, isTicketType, isPriority,
   type StatusId,
 } from '../shared/constants.js';
-import { HttpError, type TicketPatch } from './tickets.js';
+import { HttpError, assertAutonomy, assertSpecRef, type TicketPatch } from './tickets.js';
 
 // Protocol-neutral write validation — shared by the MCP handlers and a consumer's
 // HTTP intake controller so neither has to depend on the other's layer (tkt-156c5c00149b).
@@ -97,6 +97,16 @@ export function extractTicketFields(
   if (args.blockers !== undefined) {
     if (!isStringArray(args.blockers)) throw new HttpError(400, 'blockers must be an array of strings');
     out.blockers = args.blockers;
+  }
+  // Strict on write (a typo must not quietly become hitl); the read side is what fails closed.
+  const { autonomy, spec } = args;
+  if (autonomy !== undefined) {
+    assertAutonomy(autonomy);
+    out.autonomy = autonomy;
+  }
+  if (spec !== undefined) {
+    assertSpecRef(spec);
+    out.spec = spec;
   }
   return out;
 }
