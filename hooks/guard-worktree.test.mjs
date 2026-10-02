@@ -323,6 +323,13 @@ describe('regressions found by review', () => {
     ['--git-dir/--work-tree flags', () => `git --work-tree=${fx.primary} --git-dir=${fx.primary}/.git checkout -- .`, true],
     ['GIT_DIR/GIT_WORK_TREE env prefixes', () => `GIT_DIR=${fx.primary}/.git GIT_WORK_TREE=${fx.primary} git checkout -- .`, true],
     ['a retarget carrying a read-only verb', () => `git --git-dir=${fx.primary}/.git status`, false],
+    // A detached value used to parse as the verb, so these blocked only by accident (tkt-578863b616d2).
+    ['a detached retarget carrying a read-only verb', () => `git --git-dir ${fx.primary}/.git status`, false],
+    ['a retarget carrying fetch', () => `git --git-dir=${fx.primary}/.git fetch origin main:main`, true],
+    ['a detached retarget carrying fetch', () => `git --git-dir ${fx.primary}/.git fetch origin main:main`, true],
+    ['a detached retarget carrying remote', () => `git --git-dir ${fx.primary}/.git remote set-url origin x`, true],
+    ['a detached retarget carrying push', () => `git --git-dir ${fx.primary}/.git push origin --delete feat/other`, true],
+    ['a detached retarget carrying worktree', () => `git --work-tree ${fx.primary} worktree remove x`, true],
   ])('%s: blocked=%s', (_label, command, blocked) => {
     expect(verdict(running(command(), fx.linked)).blocked).toBe(blocked);
   });

@@ -168,8 +168,8 @@ export function decide(payload) {
   for (const segment of splitSegments(command)) {
     const git = parseGit(segment);
     if (git?.truncated) return { blocked: true, reason: describe(payload, 'run a git command whose subcommand an unterminated quote swallowed') };
-    // guard-bash misses --mirror/--all/wildcards/-c/--git-dir/other remotes (two review rounds), so a
-    // subagent push cannot yet be proven not to land on main.
+    // guard-bash still cannot judge a push whose destination comes from persisted config
+    // (tkt-28b9514f0418), so a subagent push cannot yet be proven not to land on main.
     if (git?.sub === 'push') return { blocked: true, reason: describe(payload, 'git push') };
 
     const gh = parseGh(segment);

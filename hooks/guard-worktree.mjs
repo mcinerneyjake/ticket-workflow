@@ -446,8 +446,10 @@ function judgePiece(name, tokens, envAssignments, dir, unknownDir, kindFor, tick
     const readOnly = readOnlyFromPrimary(sub, args);
 
     // The other directory-independent rule. These name a checkout the rest of this function cannot
-    // see, so the judged `dir` would describe a command that acts somewhere else entirely.
-    if (!readOnly && retargeted(tokens, envAssignments))
+    // see, so the judged `dir` would describe a command that acts somewhere else entirely. fetch, push,
+    // remote and worktree are read-only only for the checkout they run in; retargeted, they write
+    // the named one's refs, config or worktrees (tkt-578863b616d2).
+    if ((!readOnly || RETARGET_WRITERS.has(sub)) && retargeted(tokens, envAssignments))
       return block(
         `${TAG} Blocked: this command retargets git with --git-dir/--work-tree or GIT_DIR/GIT_WORK_TREE,\n` +
           'so which checkout it writes cannot be read from the command line it runs on.\n' +
@@ -781,6 +783,7 @@ const READ_ONLY = new Set([
   'status', 'diff', 'log', 'show', 'rev-parse', 'fetch', 'push', 'remote', 'ls-files', 'ls-remote',
   'blame', 'grep', 'merge-base', 'rev-list', 'check-ignore', 'describe',
 ]);
+const RETARGET_WRITERS = new Set(['fetch', 'push', 'remote', 'worktree']);
 const STASH_READS = new Set(['list', 'show']);
 const BRANCH_MUTATORS = new Set([
   '-d', '-D', '--delete', '-m', '-M', '--move', '-c', '-C', '--copy', '-f', '--force',
