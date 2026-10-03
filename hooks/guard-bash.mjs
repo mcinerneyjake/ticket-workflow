@@ -14,8 +14,9 @@
 //      push to main (explicit non-main targets, deletes, and --tags are fine).
 //      A `git push` naming anything it cannot resolve — another remote, a glob, an
 //      unknown flag, -c, --git-dir, a GIT_* prefix on that same command — is
-//      refused (tkt-578863b616d2). NOT covered: a destination taken from persisted
-//      config, an earlier `export GIT_*`, HOME/XDG_CONFIG_HOME, send-pack/subtree.
+//      refused (tkt-578863b616d2), and so is one persisted config could move or that
+//      anything but a literal cd runs before (tkt-28b9514f0418). NOT covered: an
+//      earlier `export GIT_*`, HOME/XDG_CONFIG_HOME, send-pack/subtree.
 //   5. A -c / --config-env alias.* → refused for every verb, since the verb is
 //      unknowable. An alias set through GIT_CONFIG_* or include.path is not.
 //
@@ -51,7 +52,7 @@
 import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { isMain } from './lib/is-main.mjs';
-import { hasRemote, protectedBranches } from './lib/default-branch.mjs';
+import { hasRemote, protectedBranches, readPushConfig } from './lib/default-branch.mjs';
 import { bareWord, cdTarget, commandWordIndex, dequote, endsInsideQuote, hiddenDirTarget, quotedTokens, resolveDir, splitSegments, subshellParens } from './lib/shell.mjs';
 
 // The VALUE of a token: the token with single/double quote characters removed wherever they sit —
@@ -246,8 +247,7 @@ function configKeys(globals) {
 }
 
 // A reason when this push names anything it cannot resolve to `origin` plus literal, unprotected
-// branches or tags — fail closed (tkt-578863b616d2). A push with NO refspec stays with pushesMain:
-// its destination comes from persisted config (push.default, remote.*.push), tkt-28b9514f0418.
+// branches or tags — fail closed (tkt-578863b616d2). Persisted config is persistedPushReason's.
 function unresolvedPushReason(args, { globals, env }, branch, protectedBranches) {
   const refuse = (what) => `This push ${what}, so where it lands cannot be checked against the never-push-to-${protectedBranches.join('/')} rule. Refusing rather than guessing — push one named branch to origin: git push -u origin <branch>. See CLAUDE.md → Branch, commit & PR workflow.`;
 
@@ -281,6 +281,64 @@ function unresolvedPushReason(args, { globals, env }, branch, protectedBranches)
     else if (dst.startsWith('refs/')) return refuse(`names ${spec}, which is not a branch or tag`);
     // Empty covers a matching push (`:`, `src:`) and HEAD on an unresolved branch alike.
     if (dst === '' || protectedBranches.includes(dst)) return refuse(`names ${spec}, which resolves to a protected branch or to none`);
+  }
+  return null;
+}
+
+const GIT_FALSE = new Set(['false', 'no', 'off', '0', '']);
+const SAFE_PUSH_DEFAULTS = new Set(['simple', 'current']);
+
+// Persisted config can move even an explicit `<src>` push: remote.origin.push and
+// push.default=upstream both do (tkt-28b9514f0418). The read predates the command, hence `prelude`.
+function persistedPushReason(args, branch, protectedBranches, readConfig, prelude) {
+  const refuse = (what) => `This push ${what}, so where it lands cannot be checked against the never-push-to-${protectedBranches.join('/')} rule. Refusing rather than guessing — remove that configuration (git config --unset …) and push one named branch to origin in its own command: git push -u origin <branch>. See CLAUDE.md → Branch, commit & PR workflow.`;
+  const [named, ...refspecs] = readPushArgs(args).positionals;
+  if (prelude) return refuse(`runs after ${prelude} in the same command, and the guard read the push configuration before the command ran — only a literal cd may come first`);
+
+  const cfg = readConfig ? readConfig() : null;
+  if (cfg === null) return refuse("runs where this guard could not read the repository's push configuration");
+  // Last entry wins, as in git. A key-only entry reads as '' so it can never pass as `origin`/`simple`.
+  const last = (key) => {
+    const e = cfg.findLast((x) => x.key === key);
+    return e === undefined ? undefined : (e.value ?? '');
+  };
+  // --abbrev-ref prints `heads/<name>` when a tag shares the name; either spelling may be the key.
+  const names = branch?.startsWith('heads/') ? [branch, branch.slice('heads/'.length)] : [branch];
+  for (const b of names) {
+    const remote = named ?? last(`branch.${b}.pushremote`) ?? last('remote.pushdefault') ?? last(`branch.${b}.remote`) ?? 'origin';
+    if (remote !== 'origin') return refuse(`names no remote and resolves to ${remote || '(an empty remote)'} through config, and the protected branch is only known for origin`);
+  }
+
+  // Protected branches are resolved from what origin fetches, so a different push target is unknown.
+  const elsewhere = cfg.find((x) => x.key === 'remote.origin.pushurl' || x.key.endsWith('.pushinsteadof'));
+  if (elsewhere) return refuse(`runs while ${elsewhere.key} sends origin's pushes to another URL`);
+  const mapping = cfg.find((x) => x.key === 'remote.origin.push');
+  if (mapping) return refuse(`runs while remote.origin.push is set (${mapping.value ?? ''}), which retargets even an explicitly named branch`);
+  const mirror = cfg.findLast((x) => x.key === 'remote.origin.mirror');
+  if (mirror && !GIT_FALSE.has((mirror.value ?? 'true').toLowerCase())) return refuse('runs while remote.origin.mirror is set, which pushes every ref');
+  const mode = last('push.default');
+  // Measured: matching/nothing apply only when no refspec is named; upstream moves an explicit <src>.
+  const inert = refspecs.length > 0 && (mode === 'matching' || mode === 'nothing');
+  if (mode !== undefined && !SAFE_PUSH_DEFAULTS.has(mode) && !inert) return refuse(`runs under push.default=${mode}, which can send a branch somewhere other than its own name`);
+  return null;
+}
+
+// A bare `switch -c <name>` / `checkout -b <name>` branches from HEAD: no file and no push config moves.
+const branchesFromHead = (g) =>
+  g !== null && g.globals.length === 0 && g.env.length === 0 && g.args.length === 2 && !g.args[1].startsWith('-') &&
+  ((g.sub === 'switch' && g.args[0] === '-c') || (g.sub === 'checkout' && g.args[0] === '-b'));
+
+// What runs before the last push, if anything but a literal cd or another push (tkt-28b9514f0418).
+// An allowlist of "harmless" verbs leaked every review round (log --output, checkout of an included
+// file, `$G config`), so nothing else may precede it. After the last push nothing can move it.
+function pushPrelude(segments) {
+  const parsed = segments.map(parseGit);
+  const last = parsed.findLastIndex((g) => g?.sub === 'push');
+  for (let i = 0; i <= last; i++) {
+    const text = segments[i].trim();
+    if (/[$`|&<>(){}\\]/.test(text.replace(/\s2>&1$/, ''))) return `\`${text}\`, whose substitution, pipe, redirect or grouping`;
+    if (parsed[i]?.sub === 'push' || branchesFromHead(parsed[i])) continue;
+    if (typeof cdTarget(text, '/') !== 'string') return `\`${text}\``;
   }
   return null;
 }
@@ -354,7 +412,8 @@ export function destructiveGitReason(sub, args) {
 // `getRepo(dir) -> { hasRemote, protectedBranch }` is injectable like `getBranch`, and defaults to
 // the pre-2.1 behaviour (every repo has a remote, `main` is protected) so a caller that does not
 // supply it gets today's semantics rather than a silently relaxed guard. main() injects the real one.
-const DEFAULT_REPO = () => ({ hasRemote: true, protectedBranches: ['main'] });
+// A shape without `pushConfig()` refuses every push; only this default asserts none is set.
+const DEFAULT_REPO = () => ({ hasRemote: true, protectedBranches: ['main'], pushConfig: () => [] });
 
 const UNRESOLVABLE_MOVE =
   'A `cd` in this command moves somewhere this guard cannot name — a variable, a bare `cd`, `cd -` (OLDPWD), a `~user` path, an unterminated quote, a `popd`, or a move hidden behind a pipeline or compound statement — so the commit/push after it cannot be checked against the never-commit-to-main rule. Refusing rather than guessing: a move it cannot follow would otherwise be judged against the session repo, which is a feature branch while a ticket is being worked — i.e. allowed. Re-run it as a plain `cd <dir> && git …` chain naming the directory literally. A path containing spaces is fine if you quote it: `cd "/a/my repo"` is read correctly.';
@@ -381,6 +440,7 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
     if (!branches.has(d)) branches.set(d, getBranch(d));
     return branches.get(d);
   };
+  const prelude = pushPrelude(segments);
   const repos = new Map(); // dir -> repo shape; memoized, so one pair of execs per repo
   const repoFor = (d) => {
     if (!repos.has(d)) repos.set(d, getRepo(d));
@@ -416,7 +476,7 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
         // buy a commit an exemption. An absolute `-C` still names its repo, so it is unaffected.
         if (unknownDir && gitDir === null && (sub === 'commit' || sub === 'push'))
           return { blocked: true, reason: UNRESOLVABLE_MOVE };
-        const verdict = ruleFor(sub, args, branchFor(gitDir), () => repoFor(gitDir), { globals, env });
+        const verdict = ruleFor(sub, args, branchFor(gitDir), () => repoFor(gitDir), { globals, env, prelude });
         if (verdict) return { blocked: true, reason: verdict };
         // Only switch/checkout needs the repo shape here; computing it for every segment would put
         // the git subprocesses back on `git status`/`log`/`diff`, which is what the thunk avoids.
@@ -448,7 +508,7 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
 // `branch` is the branch of the repo THIS command acts on, not the hook's.
 // `getRepo()` is a THUNK returning { hasRemote, protectedBranches } — called only by the rules that
 // need it, so `git status`/`log`/`diff` never pay for the git subprocesses it costs.
-function ruleFor(sub, args, branch, getRepo, preamble = { globals: [], env: [] }) {
+function ruleFor(sub, args, branch, getRepo, preamble = { globals: [], env: [], prelude: null }) {
   // Checked before anything reads `sub`: under a command-line alias the verb is a name this guard
   // has never seen, so no rule below would fire for it, whatever it expands to.
   if (configKeys(preamble.globals).some((k) => k.startsWith('alias.')))
@@ -471,7 +531,8 @@ function ruleFor(sub, args, branch, getRepo, preamble = { globals: [], env: [] }
   // a local-only repo — that combination is precisely the false block this exempts.
   if (sub !== 'commit' && sub !== 'push') return null;
 
-  const { hasRemote, protectedBranches } = getRepo();
+  const repo = getRepo();
+  const { hasRemote, protectedBranches } = repo;
 
   // The COMMIT rule is gated on a remote: "land it on a branch and open a PR" is meaningless in a
   // repo with nowhere to push, where committing on the default branch is the normal thing to do.
@@ -491,6 +552,8 @@ function ruleFor(sub, args, branch, getRepo, preamble = { globals: [], env: [] }
   if (protectedBranches !== null && sub === 'push') {
     const unresolved = unresolvedPushReason(args, preamble, branch, protectedBranches);
     if (unresolved) return unresolved;
+    const persisted = persistedPushReason(args, branch, protectedBranches, repo.pushConfig, preamble.prelude);
+    if (persisted) return persisted;
   }
 
   // An unresolved branch is NOT a safe branch. Every failure that breaks `git rev-parse` — a bogus
@@ -553,7 +616,8 @@ export function main() {
   // that path's shape, which fails closed (unresolvable → refuse) rather than open.
   const getRepo = (dir) => {
     const d = dir ?? startDir;
-    return { hasRemote: hasRemote(d), protectedBranches: protectedBranches(d) };
+    let cfg;
+    return { hasRemote: hasRemote(d), protectedBranches: protectedBranches(d), pushConfig: () => (cfg ??= readPushConfig(d)) };
   };
   const { blocked, reason } = decide(payload?.tool_input?.command, getBranch, startDir, getRepo);
   if (blocked) {
