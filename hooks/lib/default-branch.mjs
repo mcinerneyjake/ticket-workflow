@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 /** Run git, returning trimmed stdout or an error string — never throwing. */
 export function tryGit(args, cwd) {
@@ -91,4 +91,28 @@ export function hasRemote(cwd, git = tryGit) {
   if (err !== undefined) return true;
   if (typeof out !== 'string') return true;
   return out.length > 0;
+}
+
+// Every persisted key that can move where a push lands. Matched against git's canonical key, whose
+// section and variable names are lowercased.
+const PUSH_CONFIG_KEYS = '^(push\\.default|remote\\.pushdefault|remote\\..+\\.(push|pushurl|mirror)|branch\\..+\\.(pushremote|remote)|url\\..+\\.pushinsteadof)$';
+
+/** `git config -z --get-regexp` output → `{ key, value }[]`; `value` is null for a key-only boolean. */
+export function parsePushConfig(out) {
+  return out.split('\0').filter(Boolean).map((rec) => {
+    const nl = rec.indexOf('\n');
+    return nl < 0 ? { key: rec, value: null } : { key: rec.slice(0, nl), value: rec.slice(nl + 1) };
+  });
+}
+
+const runGitConfig = (cwd) =>
+  spawnSync('git', ['config', '-z', '--get-regexp', PUSH_CONFIG_KEYS], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+/** Effective push config for `cwd`, or null (refuse): only exit 1 with no output means "none set". */
+export function readPushConfig(cwd, run = runGitConfig) {
+  const r = run(cwd);
+  if (r.error || typeof r.stdout !== 'string') return null;
+  if (r.status === 0) return parsePushConfig(r.stdout);
+  if (r.status === 1 && r.stdout === '') return [];
+  return null;
 }

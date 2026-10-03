@@ -1,12 +1,12 @@
 import { describe, it, expect, vi, afterAll } from 'vitest';
 import { execSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, openSync, closeSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, openSync, closeSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseGit, cdTarget, decide } from './guard-bash.mjs';
 import { splitSegments } from './lib/shell.mjs';
-import { protectedBranches } from './lib/default-branch.mjs';
+import { parsePushConfig, protectedBranches, readPushConfig } from './lib/default-branch.mjs';
 
 // Git's repo context is exported into hook environments and inherited by `npm test` — absolute in a
 // worktree, so it would silently redirect the temp-repo commands below at the REAL repo, and this
@@ -964,7 +964,7 @@ describe('decide — no false positives on quoted / heredoc data', () => {
 // resolving the real default branch tightens it for repos not on `main`. Shipped alone, the
 // fail-closed half of the second lands hardest exactly where the first is trying to stop blocking.
 describe('main-branch rules: remote-gated, default-branch-aware', () => {
-  const repo = (over = {}) => () => ({ hasRemote: true, protectedBranches: ['main'], ...over });
+  const repo = (over = {}) => () => ({ hasRemote: true, protectedBranches: ['main'], pushConfig: () => [], ...over });
   const verdict = (cmd, branch, over) => decide(cmd, onBranch(branch), undefined, repo(over));
 
   it('allows a commit on main in a repo with NO remote', () => {
@@ -1017,7 +1017,7 @@ describe('main-branch rules: remote-gated, default-branch-aware', () => {
 
 // Review findings on the first cut of the above — each was a live bypass with 201 tests green.
 describe('protected-branch resolution: the cases that shipped broken', () => {
-  const repo = (over = {}) => () => ({ hasRemote: true, protectedBranches: ['main'], ...over });
+  const repo = (over = {}) => () => ({ hasRemote: true, protectedBranches: ['main'], pushConfig: () => [], ...over });
   const verdict = (cmd, branch, over) => decide(cmd, onBranch(branch), undefined, repo(over));
 
   it('blocks a BARE push on a protected branch that is not named main', () => {
@@ -1581,5 +1581,234 @@ describe('decide — a push it cannot resolve fails closed (tkt-578863b616d2)', 
     expect(parseGit('git --git-dir /x/.git push origin HEAD'))
       .toMatchObject({ sub: 'push', args: ['origin', 'HEAD'], globals: ['--git-dir', '/x/.git'] });
     expect(parseGit('GIT_DIR=/x FOO=1 git push')).toMatchObject({ sub: 'push', env: ['GIT_DIR', 'FOO'] });
+  });
+});
+
+describe('decide — a destination taken from persisted config (tkt-28b9514f0418)', () => {
+  const kv = (key, value = null) => ({ key, value });
+  const withConfig = (cmd, entries, branch = 'feat/x') =>
+    decide(cmd, onBranch(branch), null, () => ({ hasRemote: true, protectedBranches: ['main'], pushConfig: () => entries }));
+  const blockedWith = (cmd, entries, branch) => withConfig(cmd, entries, branch).blocked;
+  const PUSHES = [
+    'git push -u origin feat/x',
+    'git push origin feat/x',
+    'git push origin feat/x:feat/x',
+    'git push origin HEAD',
+    'git push origin',
+    'git push',
+    'git push --tags',
+  ];
+
+  it('refuses every push while remote.origin.push is set, since a bare <src> follows the mapping', () => {
+    const cfg = [kv('remote.origin.push', 'refs/heads/feat/x:refs/heads/main')];
+    for (const cmd of PUSHES) expect(blockedWith(cmd, cfg), cmd).toBe(true);
+    for (const cmd of PUSHES) expect(blockedWith(cmd, []), `control: ${cmd}`).toBe(false);
+    expect(withConfig('git push -u origin feat/x', cfg).reason).toMatch(/remote\.origin\.push/);
+  });
+
+  it('refuses a push.default that can move the push: upstream always, matching/nothing without a refspec', () => {
+    for (const mode of ['upstream', 'tracking', 'Upstream', '']) {
+      expect(blockedWith('git push -u origin feat/x', [kv('push.default', mode)]), mode).toBe(true);
+      expect(blockedWith('git push', [kv('push.default', mode)]), mode).toBe(true);
+    }
+    // Measured: matching/nothing leave an explicit-refspec push alone; matching moves main without one.
+    for (const mode of ['matching', 'nothing']) {
+      expect(blockedWith('git push -u origin feat/x', [kv('push.default', mode)]), mode).toBe(false);
+      expect(blockedWith('git push origin', [kv('push.default', mode)]), mode).toBe(true);
+      expect(blockedWith('git push --tags', [kv('push.default', mode)]), mode).toBe(true);
+    }
+    for (const mode of ['simple', 'current'])
+      expect(blockedWith('git push', [kv('push.default', mode)]), mode).toBe(false);
+  });
+
+  it('refuses while origin pushes somewhere other than it fetches from (review finding)', () => {
+    expect(blockedWith('git push origin feat/x', [kv('remote.origin.pushurl', 'git@host:other/repo.git')])).toBe(true);
+    expect(blockedWith('git push origin feat/x', [kv('url.git@host:other/.pushinsteadof', 'https://host/')])).toBe(true);
+    expect(blockedWith('git push origin feat/x', [kv('remote.upstream.pushurl', 'git@host:x.git')])).toBe(false);
+  });
+
+  it('reads the last push.default value, as git does', () => {
+    expect(blockedWith('git push', [kv('push.default', 'upstream'), kv('push.default', 'simple')])).toBe(false);
+    expect(blockedWith('git push', [kv('push.default', 'simple'), kv('push.default', 'upstream')])).toBe(true);
+  });
+
+  it('refuses every push while remote.origin.mirror is true, in any boolean spelling', () => {
+    for (const value of [null, 'true', 'yes', 'on', '1', 'TRUE'])
+      expect(blockedWith('git push origin feat/x', [kv('remote.origin.mirror', value)]), String(value)).toBe(true);
+    for (const value of ['false', 'no', 'off', '0', '', 'FALSE'])
+      expect(blockedWith('git push origin feat/x', [kv('remote.origin.mirror', value)]), value).toBe(false);
+  });
+
+  it('ignores push config on a remote the push does not use', () => {
+    const cfg = [kv('remote.upstream.push', 'refs/heads/feat/x:refs/heads/main'), kv('remote.upstream.mirror')];
+    expect(blockedWith('git push -u origin feat/x', cfg)).toBe(false);
+    expect(blockedWith('git push', cfg)).toBe(false);
+  });
+
+  it('resolves a remote-less push through pushRemote, pushDefault, then branch.remote', () => {
+    expect(blockedWith('git push', [kv('branch.feat/x.pushremote', 'upstream')])).toBe(true);
+    expect(blockedWith('git push', [kv('remote.pushdefault', 'upstream')])).toBe(true);
+    expect(blockedWith('git push', [kv('branch.feat/x.remote', 'upstream')])).toBe(true);
+    expect(blockedWith('git push', [kv('remote.pushdefault', 'upstream'), kv('branch.feat/x.pushremote', 'origin')])).toBe(false);
+    expect(blockedWith('git push', [kv('branch.feat/x.remote', 'origin'), kv('remote.pushdefault', 'upstream')])).toBe(true);
+    expect(blockedWith('git push', [kv('branch.feat/x.remote', 'origin')])).toBe(false);
+    expect(blockedWith('git push', [kv('branch.other.remote', 'upstream')])).toBe(false);
+    // A key-only entry has no value at all, so it must never read as a match for `origin`.
+    expect(blockedWith('git push', [kv('remote.pushdefault')])).toBe(true);
+    expect(blockedWith('git push', [kv('branch.feat/x.pushremote')])).toBe(true);
+    // A named remote overrides all three.
+    expect(blockedWith('git push -u origin feat/x', [kv('branch.feat/x.pushremote', 'upstream')])).toBe(false);
+  });
+
+  it('refuses a push when the config cannot be read — "could not check" is not "nothing set"', () => {
+    expect(blockedWith('git push -u origin feat/x', null)).toBe(true);
+    expect(withConfig('git push -u origin feat/x', null).reason).toMatch(/could not read/i);
+    expect(blockedWith('git status', null)).toBe(false);
+    expect(blockedWith('git commit -m x', null)).toBe(false);
+  });
+
+  it('lets only a literal cd run before a push, since the config read predates the command (review findings)', () => {
+    for (const cmd of [
+      'git config remote.origin.push refs/heads/feat/x:refs/heads/main && git push -u origin feat/x',
+      'git config push.default upstream; git push',
+      'git remote rename evil origin && git push origin feat/x',
+      'cd /a/other && git config remote.origin.push x:main; cd /a/repo && git push origin feat/x',
+      'for i in 1 2; do git push -u origin feat/x; git config remote.origin.push x:main; done',
+      'true | git config remote.origin.push x:main; git push -u origin feat/x',
+      'X=$(git config remote.origin.push x:main) && git push origin feat/x',
+      "sh -c 'git config remote.origin.push x:main' && git push -u origin feat/x",
+      'git fetch --set-upstream upstream main && git push',
+      "git rebase -x 'git config remote.origin.push x:main' HEAD && git push -u origin feat/x",
+      'git worktree add -b feat/y ../w upstream/main && git push origin feat/x',
+      'G=git; $G config remote.origin.push x:main; git push origin feat/x',
+      '\\git config remote.origin.push x:main && git push origin feat/x',
+      "git log -1 --format='x' --output=.git/config && git push origin feat/x",
+      'git checkout evil -- shared.gitconfig && git push origin feat/x',
+      'git checkout main && git push origin HEAD',
+      'git branch -M main && git push origin HEAD',
+      'git switch -c feat/y upstream/main && git push',
+      'git checkout -b feat/y --track upstream/main && git push',
+      'git switch feat/y && git push origin HEAD',
+      'git branch -u upstream/main && git push',
+      'git add a.ts && git commit -m x && git push -u origin feat/x',
+      'git tag v1.0.0 && git push origin v1.0.0',
+      'git push -u origin feat/x | tail -3',
+      'git push origin feat/x > out.txt',
+      'git push origin "$(git config remote.origin.push x:main; echo feat/x)"',
+      // Judged up to the LAST push: a write between two pushes moves the second.
+      'git push origin feat/x && git config remote.origin.push x:main && git push origin feat/y',
+    ]) expect(blockedWith(cmd, []), cmd).toBe(true);
+    for (const cmd of [
+      'git push -u origin feat/x',
+      'cd /a/repo && git push -u origin feat/x',
+      'cd /a/w; git push origin feat/x',
+      'cd /src/git && git push origin feat/git',
+      'git push -u origin feat/x 2>&1',
+      'git switch -c feat/y && git push -u origin feat/y',
+      'git checkout -b feat/y && git push -u origin feat/y',
+      'git push -u origin feat/x && git push origin --delete feat/old',
+      // Nothing after the last push can move it.
+      'git push -u origin feat/x && gh pr create --title x --body "$(cat body.md)"',
+      'git push -u origin feat/x && git config branch.feat/x.description x',
+      'git status && git log -1',
+    ]) expect(blockedWith(cmd, []), `control: ${cmd}`).toBe(false);
+  });
+
+  it('looks a branch up under both spellings --abbrev-ref can print (review finding)', () => {
+    // A tag sharing the branch's name makes --abbrev-ref print `heads/<name>`.
+    expect(blockedWith('git push', [kv('branch.feat/x.pushremote', 'upstream')], 'heads/feat/x')).toBe(true);
+    expect(blockedWith('git push', [kv('branch.feat/x.remote', 'origin')], 'heads/feat/x')).toBe(false);
+  });
+
+  it('refuses when the repo shape carries no config reader; only DEFAULT_REPO means none set (review finding)', () => {
+    expect(decide('git push origin feat/x', onBranch('feat/x'), null, () => ({ hasRemote: true, protectedBranches: ['main'] })).blocked).toBe(true);
+    expect(decide('git push origin feat/x', onBranch('feat/x')).blocked).toBe(false);
+  });
+
+  it('reads the config of the repo the push acts on', () => {
+    const bad = [kv('remote.origin.push', 'refs/heads/feat/x:refs/heads/main')];
+    const getRepo = (dir) => ({ hasRemote: true, protectedBranches: ['main'], pushConfig: () => (dir === '/r1' ? bad : []) });
+    const run = (cmd) => decide(cmd, onBranch('feat/x'), '/r2', getRepo).blocked;
+    expect(run('git -C /r1 push origin feat/x')).toBe(true);
+    expect(run('cd /r1 && git push origin feat/x')).toBe(true);
+    expect(run('git push origin feat/x')).toBe(false);
+    expect(run('git -C /r2 push origin feat/x')).toBe(false);
+  });
+});
+
+describe('parsePushConfig / readPushConfig (tkt-28b9514f0418)', () => {
+  it('parses git config -z records, keeping a key-only boolean distinct from an empty value', () => {
+    expect(parsePushConfig('push.default\nupstream\0remote.origin.mirror\0remote.x.mirror\n\0')).toEqual([
+      { key: 'push.default', value: 'upstream' },
+      { key: 'remote.origin.mirror', value: null },
+      { key: 'remote.x.mirror', value: '' },
+    ]);
+    expect(parsePushConfig('remote.origin.push\na\nb\0')).toEqual([{ key: 'remote.origin.push', value: 'a\nb' }]);
+    expect(parsePushConfig('')).toEqual([]);
+  });
+
+  it('reads exit 1 with no output as "nothing set", and every other failure as null', () => {
+    const run = (r) => () => r;
+    expect(readPushConfig('/x', run({ status: 0, stdout: 'push.default\nsimple\0' }))).toEqual([{ key: 'push.default', value: 'simple' }]);
+    expect(readPushConfig('/x', run({ status: 1, stdout: '' }))).toEqual([]);
+    expect(readPushConfig('/x', run({ status: 128, stdout: '' }))).toBeNull();
+    expect(readPushConfig('/x', run({ status: 1, stdout: 'push.default\nupstream\0' }))).toBeNull();
+    expect(readPushConfig('/x', run({ status: null, stdout: '', error: new Error('ENOENT') }))).toBeNull();
+  });
+});
+
+describe('the real hook — persisted push config (tkt-28b9514f0418)', () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'guard-pushcfg-'));
+  afterAll(() => rmSync(tmp, { recursive: true, force: true }));
+  // Global and system config pinned away, so a machine's own push.default cannot decide the control.
+  const env = { ...hermeticEnv(), GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' };
+  const run = (c) => execSync(c, { cwd: tmp, stdio: 'ignore', env });
+  run('git init -q -b main');
+  run('git remote add origin https://example.invalid/r.git');
+  run('git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init');
+  run('git switch -q -c feat/x');
+  const hook = fileURLToPath(new URL('./guard-bash.mjs', import.meta.url));
+  const runHook = (command) =>
+    spawnSync('node', [hook], { input: JSON.stringify({ cwd: tmp, tool_input: { command } }), encoding: 'utf8', env }).status;
+
+  it('blocks the workflow push once remote.origin.push retargets it, and allows it without (control)', () => {
+    expect(runHook('git push -u origin feat/x')).toBe(0);
+    run('git config remote.origin.push refs/heads/feat/x:refs/heads/main');
+    expect(runHook('git push -u origin feat/x')).toBe(2);
+    run('git config --unset remote.origin.push');
+    run('git config push.default upstream');
+    expect(runHook('git push -u origin feat/x')).toBe(2);
+    run('git config --unset push.default');
+    expect(runHook('git push -u origin feat/x')).toBe(0);
+  });
+
+  it('reads config the way git does: includes, worktree scope, global, and refuses a corrupt file', () => {
+    writeFileSync(join(tmp, 'inc.cfg'), '[push]\n\tdefault = upstream\n');
+    run(`git config include.path ${join(tmp, 'inc.cfg')}`);
+    expect(runHook('git push -u origin feat/x')).toBe(2);
+    run('git config --unset include.path');
+    run('git config extensions.worktreeConfig true');
+    run('git config --worktree remote.origin.mirror true');
+    expect(runHook('git push -u origin feat/x')).toBe(2);
+    run('git config --worktree --unset remote.origin.mirror');
+    run('git config remote.origin.pushurl https://example.invalid/other.git');
+    expect(runHook('git push -u origin feat/x')).toBe(2);
+    run('git config --unset remote.origin.pushurl');
+    run('git config url.https://example.invalid/other/.pushInsteadOf https://example.invalid/');
+    expect(runHook('git push -u origin feat/x')).toBe(2);
+    run('git config --remove-section url.https://example.invalid/other/');
+    const globalCfg = join(tmp, 'global.cfg');
+    writeFileSync(globalCfg, '[remote "origin"]\n\tpush = refs/heads/feat/x:refs/heads/main\n');
+    const input = JSON.stringify({ cwd: tmp, tool_input: { command: 'git push -u origin feat/x' } });
+    expect(spawnSync('node', [hook], { input, encoding: 'utf8', env: { ...env, GIT_CONFIG_GLOBAL: globalCfg } }).status).toBe(2);
+    expect(runHook('git push -u origin feat/x')).toBe(0); // control: same repo, global pinned away
+    const cfgPath = join(tmp, '.git', 'config');
+    const good = readFileSync(cfgPath, 'utf8');
+    writeFileSync(cfgPath, `${good}[bad\n`);
+    // The reason, not just the status: a corrupt config also breaks branch resolution, which exits 2 too.
+    const corrupt = spawnSync('node', [hook], { input, encoding: 'utf8', env });
+    expect(corrupt.status).toBe(2);
+    expect(corrupt.stderr).toMatch(/push configuration/);
+    writeFileSync(cfgPath, good);
   });
 });

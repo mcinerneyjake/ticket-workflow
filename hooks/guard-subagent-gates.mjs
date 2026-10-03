@@ -168,8 +168,8 @@ export function decide(payload) {
   for (const segment of splitSegments(command)) {
     const git = parseGit(segment);
     if (git?.truncated) return { blocked: true, reason: describe(payload, 'run a git command whose subcommand an unterminated quote swallowed') };
-    // guard-bash still cannot judge a push whose destination comes from persisted config
-    // (tkt-28b9514f0418), so a subagent push cannot yet be proven not to land on main.
+    // Still refused: guard-bash now judges persisted push config (tkt-28b9514f0418), but a git
+    // command hidden in a function body is still unjudged (tkt-acabd536c289); tkt-b4ccb49f3ac2 decides.
     if (git?.sub === 'push') return { blocked: true, reason: describe(payload, 'git push') };
 
     const gh = parseGh(segment);
