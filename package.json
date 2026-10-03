@@ -60,18 +60,18 @@
     "prepare": "node scripts/installHooks.mjs && npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.31.0",
     "gray-matter": "^4.0.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^24.13.3",
-    "@vitest/coverage-v8": "^4.1.11",
-    "eslint": "^10.9.1",
-    "globals": "^17.11.0",
+    "@types/node": "^24.19.0",
+    "@vitest/coverage-v8": "^5.0.3",
+    "eslint": "^10.11.0",
+    "globals": "^17.12.0",
     "husky": "^9.1.7",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.68.0",
-    "vitest": "^4.1.9"
+    "typescript-eslint": "^8.71.0",
+    "vitest": "^5.0.3"
   }
 }
