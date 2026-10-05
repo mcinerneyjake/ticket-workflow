@@ -124,6 +124,19 @@ function skillManifest(templatesDir: string): ManifestEntry[] {
   return entries;
 }
 
+const WORKFLOW_SKILLS_SOURCE = 'workflow-skills';
+
+// Our own skills (tkt-0dbbd0bc6151): written here, under the package's own license, so no vendored LICENSE.
+export const WORKFLOW_SKILLS: Readonly<Record<string, ReadonlyArray<string>>> = {
+  implement: ['SKILL.md'],
+};
+
+function workflowSkillManifest(): ManifestEntry[] {
+  return Object.entries(WORKFLOW_SKILLS).flatMap(([name, files]) =>
+    files.map((file) => ({ source: `${WORKFLOW_SKILLS_SOURCE}/${name}/${file}`, targetPath: `${SKILLS_DIR}/${name}/${file}`, tier: 'core' as const })),
+  );
+}
+
 /** One place for tier subsumption, shared by audit's check set and init's scaffold set — two
  *  hand-copied predicates drift the moment a third tier appears. */
 export function tierIncludes(repoTier: GuardrailTier, itemTier: GuardrailTier): boolean {
@@ -156,7 +169,7 @@ function readTemplate(templatesDir: string, source: string): string {
 }
 
 export function guardrailTemplates(templatesDir: string = DEFAULT_TEMPLATES_DIR, tier?: GuardrailTier): GuardrailTemplate[] {
-  const manifest = [...MANIFEST, ...skillManifest(templatesDir)];
+  const manifest = [...MANIFEST, ...skillManifest(templatesDir), ...workflowSkillManifest()];
   const selected = tier === undefined ? manifest : manifest.filter((m) => tierIncludes(tier, m.tier));
   const byTarget = resolveManifest(selected);
   const shadowed = selected.filter((m) => byTarget.get(m.targetPath) !== m);

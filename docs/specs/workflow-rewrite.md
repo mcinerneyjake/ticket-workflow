@@ -106,9 +106,13 @@ because the skill runs it unconditionally; it was a gate only because it could b
 
 Two sub-agents in fresh contexts, run in parallel, findings never merged or reranked:
 
-- **Standards**: the Fowler smell baseline as labelled heuristics, the review-phase tenets, and a
-  **mutation check** — flip the diff's authorizing line, confirm the suite goes red, revert.
+- **Standards**: the Fowler smell baseline as labelled heuristics, the review-phase tenets, and the
+  diff's **authorizing line**, named but never edited.
 - **Spec adherence**: every agreed seam has a test; the diff does what its slice and spec say.
+
+After the findings are fixed, the main thread runs the **mutation check** on that line: flip it,
+confirm the suite goes red, revert. Not the reviewer, because both reviewers share one working tree
+and a flip would show the other a mutated diff (`tkt-0dbbd0bc6151`).
 
 ### Guards
 

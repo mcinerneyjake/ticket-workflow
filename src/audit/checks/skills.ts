@@ -16,25 +16,24 @@ export const skillsCurrent: AuditCheck = {
   advisory: true,
   run(ctx: AuditContext): AuditResult {
     // Never empty: skillManifest throws on an empty set, which the audit's crash wrapper reports BLOCKED.
-    const vendored = guardrailTemplates(undefined, 'core').filter((t) => t.targetPath.startsWith(`${SKILLS_DIR}/`));
+    const shipped = guardrailTemplates(undefined, 'core').filter((t) => t.targetPath.startsWith(`${SKILLS_DIR}/`));
     const missing: string[] = [];
     const drifted: string[] = [];
-    for (const t of vendored) {
+    const restore: string[] = [];
+    for (const t of shipped) {
       const file = ctx.read(t.targetPath);
       if (file.kind === 'error') return makeResult(this, 'blocked', `${t.targetPath} could not be read: ${file.message}`);
       if (file.kind === 'missing') missing.push(t.targetPath);
       else if (file.contents !== t.contents) drifted.push(t.targetPath);
+      else continue;
+      restore.push(`${t.targetPath} ← templates/${t.source}`);
     }
-    if (missing.length > 0 || drifted.length > 0) {
+    if (restore.length > 0) {
       const parts = [missing.length > 0 ? `missing: ${missing.join(', ')}` : '', drifted.length > 0 ? `drifted: ${drifted.join(', ')}` : ''].filter(Boolean);
       // Not `init --force`: on an existing repo it also overwrites CLAUDE.md, settings and CI.
-      return makeResult(
-        this,
-        'fail',
-        `${parts.join('; ')} — restore from this release's ticket-workflow/templates/skills/: <name>/* to ${SKILLS_DIR}/<name>/, and its top-level LICENSE into every ${SKILLS_DIR}/<name>/`,
-      );
+      return makeResult(this, 'fail', `${parts.join('; ')} — restore from this release's ticket-workflow package: ${restore.join(', ')}`);
     }
-    return makeResult(this, 'pass', `${vendored.length} vendored skill files match this release`);
+    return makeResult(this, 'pass', `${shipped.length} shipped skill files match this release`);
   },
 };
 
