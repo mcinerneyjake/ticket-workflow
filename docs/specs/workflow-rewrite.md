@@ -78,9 +78,12 @@ because the skill runs it unconditionally; it was a gate only because it could b
 ### Ticket authorship
 
 - **Planned work**: the session that grilled the human slices the spec and creates the tickets.
-  `guard-ticket` narrows to admit a Claude create only when it carries a spec-ticket parent. The spec
-  ticket itself is filed through local intake. A `parent` is self-asserted, so this narrows the tool
-  rather than proving a grill happened — see Open questions.
+  `guard-ticket` narrows to admit a Claude create only when its `parent` is an **open** spec ticket:
+  non-null `spec`, status neither `done` nor `archived`, read through the package's `getTicket`.
+  Anything it cannot read or judge blocks. It does not check that the spec link resolves; the
+  spec-link probe owns that, and a network call in a PreToolUse hook would turn an offline machine
+  into blocked creates. The spec ticket itself is filed through local intake. A `parent` is
+  self-asserted, so this narrows the tool rather than proving a grill happened.
 - **Ad-hoc reports** ("X is broken") stay with the local intake agent: classification is what a
   local model does well.
 
@@ -147,7 +150,7 @@ Two sub-agents in fresh contexts, run in parallel, findings never merged or rera
 | Surface | Change |
 |---|---|
 | Ticket schema | `autonomy: hitl \| afk`, validated, defaulting to HITL; a nullable `spec: owner/repo:path` field that marks a spec ticket and carries its link |
-| `guard-ticket` | Admits a create carrying a spec-ticket parent |
+| `guard-ticket` | Admits a create whose parent is an open spec ticket |
 | `guard-worktree` | Stateless rule above |
 | `guard-subagent-gates` | Narrows to merge |
 | `audit` | Repo `CLAUDE.md` line cap, skill line cap, glossary cap, skills present and current |
@@ -183,8 +186,10 @@ unaffected.
 
 ## Open questions
 
-- Whether a self-asserted spec parent is enough for `guard-ticket`, or a create must also prove the
-  spec ticket is open and its link resolves.
+- A spec parent is self-asserted and promotable: `update_ticket` can set `spec` on any open ticket,
+  so one call turns any ticket into a parent that admits creates. `guard-ticket` also judges the
+  parent from its own process and board resolution, not the MCP server's, so check and write can
+  disagree. Whether the check moves server-side, and who may set `spec`, is undecided.
 - Cases the stateless `guard-worktree` blocks today's workflow from: repos with no `origin` (the
   exception cannot apply), unticketed meta and docs sessions working in a primary, and `npm ci` in a
   primary after a pin bump so its MCP server loads the new build.

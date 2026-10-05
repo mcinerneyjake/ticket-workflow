@@ -42,7 +42,12 @@ It ships three pieces:
   `events/` under the other repo's ticket id, where nothing joins to it;
   and an opt-in `PreToolUse` guard (`guard-ticket.mjs`) that blocks
   `create_ticket` so new tickets are authored by a metered local-LLM intake
-  agent instead of by the model driving the session; and an opt-in `PreToolUse`
+  agent instead of by the model driving the session — except a create whose
+  `parent` is an open spec ticket (non-null `spec`, not `done`/`archived`),
+  which is planned slicing work. It reads that parent from the board its own
+  environment resolves (`BOARD_DIR_OVERRIDE`, else `CLAUDE_PROJECT_DIR`), so on
+  a central board the hook's wiring must export `BOARD_DIR_OVERRIDE` or the
+  exception never admits outside the board's repo; and an opt-in `PreToolUse`
   guard (`guard-board-writes.mjs`) that refuses an `Edit`/`Write`/`NotebookEdit`
   aimed at a board's own ticket or event file, so board data is written through
   `update_ticket` rather than edited as text. It blocks on either of two
