@@ -7,6 +7,9 @@
 // carries a real usage record. The agent therefore never calls create_ticket
 // itself — this hook blocks it and points at that path instead.
 //
+// ONE EXCEPTION (tkt-5a450d4a3ee8): a create whose self-asserted `parent` is an OPEN spec ticket, read
+// from the board THIS process resolves (src/paths.ts), is admitted; anything it cannot judge blocks.
+//
 // The concrete command lives in TICKET_WORKFLOW_CREATE_REASON, set by the
 // consumer, never here: this guard is wired at USER scope, so it fires in every
 // repo on the machine while any specific command exists in one of them
@@ -94,14 +97,75 @@ export function decide(payload, env = process.env) {
   return { blocked: false };
 }
 
-export function main() {
+// MUST match shared/constants.ts BRANCH_TICKET_ID_RE (parity test). Stricter than the service's own
+// id check on purpose: a case variant reads the same file on a case-insensitive disk.
+export const TICKET_ID = /^tkt-[0-9a-f]{12}$/;
+const CLOSED_STATUSES = new Set(['done', 'archived']);
+// A hung read (stalled mount, FIFO, evicted cloud file) must block before the harness's hook timeout,
+// which would otherwise end the hook without a verdict.
+const READ_DEADLINE_MS = 5_000;
+
+/** Why `parent` does or does not admit a create. Never throws: an error reading the parent is a refusal. */
+export async function specParentVerdict(parent, getTicket, deadlineMs = READ_DEADLINE_MS) {
+  if (typeof parent !== 'string' || !TICKET_ID.test(parent)) return { admit: false, why: `parent ${JSON.stringify(parent)} is not a current-format ticket id (tkt-<12 hex>)` };
+  let ticket;
+  let timer;
+  try {
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no answer within ${deadlineMs}ms`)), deadlineMs);
+    });
+    ticket = await Promise.race([getTicket(parent), deadline]);
+  } catch (err) {
+    return { admit: false, why: `parent ${parent} could not be read (${err?.message ?? String(err)})` };
+  } finally {
+    clearTimeout(timer);
+  }
+  if (ticket?.spec == null) return { admit: false, why: `parent ${parent} is not a spec ticket (no valid spec field)` };
+  if (typeof ticket.status !== 'string' || CLOSED_STATUSES.has(ticket.status)) return { admit: false, why: `parent ${parent} is a closed spec ticket (status ${ticket.status})` };
+  return { admit: true, why: `parent ${parent} is an open spec ticket` };
+}
+
+// Lazy, so a create with no parent never loads the service layer. A missing build is a throw → block.
+// The service logs parse errors with a snippet of the file; on exit 2 stderr reaches the model, so mute it.
+async function loadGetTicket() {
+  const logger = await import(new URL('../dist/logger.js', import.meta.url).href);
+  if (typeof logger.setLogger !== 'function') throw new TypeError('dist/logger.js exports no setLogger');
+  const silent = () => {};
+  logger.setLogger({ info: silent, warn: silent, error: silent });
+  const tickets = await import(new URL('../dist/server/tickets.js', import.meta.url).href);
+  if (typeof tickets.getTicket !== 'function') throw new TypeError('dist/server/tickets.js exports no getTicket');
+  return tickets.getTicket;
+}
+
+/** decide() plus the spec-parent exception. The only path to an admitted create. */
+export async function judge(payload, env = process.env, load = loadGetTicket) {
+  const base = decide(payload, env);
+  if (!base.blocked || typeof payload?.tool_name !== 'string') return base;
+  const parent = payload.tool_input?.parent;
+  // No parent → the unchanged message: advertising the exception to every ad-hoc create invites a
+  // session to attach any open spec ticket just to skip intake.
+  if (parent === undefined || parent === null) return base;
+  let verdict;
+  try {
+    // A spec ticket is filed through intake; admitting one here would let it parent further creates.
+    verdict = payload.tool_input?.spec != null
+      ? { admit: false, why: 'a create carrying `spec` is a spec ticket, which is filed through intake' }
+      : await specParentVerdict(parent, await load());
+  } catch (err) {
+    verdict = { admit: false, why: `the board service could not be loaded (${err?.message ?? String(err)})` };
+  }
+  if (verdict.admit) return { blocked: false };
+  return { blocked: true, reason: `${base.reason}\nSpec-parent exception not met: ${verdict.why}.` };
+}
+
+export async function main() {
   let payload;
   try {
     payload = JSON.parse(readFileSync(0, 'utf8'));
   } catch {
     payload = {}; // unparseable → decide() fails closed (matcher already scoped us to create_ticket)
   }
-  const { blocked, reason } = decide(payload);
+  const { blocked, reason } = await judge(payload);
   if (blocked) {
     process.stderr.write(`[guard-ticket] Blocked: ${reason}\n`);
     process.exit(2);
@@ -110,6 +174,12 @@ export function main() {
 }
 
 // Run the I/O wiring only when invoked directly as the hook (not when imported by the test).
+// An unhandled rejection exits 1, which the hook protocol reads as ALLOW.
 if (isMain(import.meta.url)) {
-  main();
+  try {
+    await main();
+  } catch (err) {
+    process.stderr.write(`[guard-ticket] Blocked: the guard failed (${err?.message ?? String(err)}).\n`);
+    process.exit(2);
+  }
 }
