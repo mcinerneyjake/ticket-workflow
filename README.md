@@ -80,11 +80,13 @@ It ships three pieces:
   `gh pr merge`, any `gh api` call carrying a method or a parameter (the
   implied POST of `-f`/`-F`/`--input` included, so a GraphQL *read* is
   refused too), or a verb that can reach one (`workflow run`, `repo sync`,
-  `alias set`, …) — and from pushing, closing a PR, publishing a release, or
+  `alias set`, …) — and from closing a PR, publishing a release, or
   editing or deleting a repo. Merge is a human approval gate, which a
   subagent has no channel to ask for. Commit, `gh pr create`/`edit`/`ready`,
-  parameterless `gh api` reads and `gh pr comment` are allowed. Push stays
-  blocked because `guard-bash` cannot yet judge every push shape for `main`.
+  parameterless `gh api` reads and `gh pr comment` are allowed. Push is
+  judged by `guard-bash`, which lets a subagent (a payload carrying
+  `agent_id`) push only its current branch: no tag, no delete, no other
+  branch, and no `push.followTags`/`push.recurseSubmodules` config.
   And a PAIR — `guard-worktree.mjs` with
   `guard-worktree-precheck.mjs` — that, once a session has called
   `start_ticket`, refuses writes aimed at a repository's **primary** checkout,

@@ -16,7 +16,9 @@
 //      unknown flag, -c, --git-dir, a GIT_* prefix on that same command — is
 //      refused (tkt-578863b616d2), and so is one persisted config could move or that
 //      anything but a literal cd runs before (tkt-28b9514f0418). NOT covered: an
-//      earlier `export GIT_*`, HOME/XDG_CONFIG_HOME, send-pack/subtree.
+//      earlier `export GIT_*`, HOME/XDG_CONFIG_HOME, send-pack/subtree. A SUBAGENT
+//      (payload `agent_id`) may push only its current branch: no tag, delete or
+//      other branch (tkt-b4ccb49f3ac2) — guard-subagent-gates leaves push to this rule.
 //   5. A -c / --config-env alias.* → refused for every verb, since the verb is
 //      unknowable. An alias set through GIT_CONFIG_* or include.path is not.
 //
@@ -323,6 +325,50 @@ function persistedPushReason(args, branch, protectedBranches, readConfig, prelud
   return null;
 }
 
+// A subagent may update only its own branch: a tag is a release, a deleted head branch closes its PR
+// (tkt-b4ccb49f3ac2). Owns its protected check — pushesMain reads a trailing `2>&1` as a refspec.
+function subagentPushReason(args, branch, protectedBranches, readConfig) {
+  const refuse = (what) => `A subagent may push only its current branch, and this push ${what}. A tag is a release and deleting a branch closes its PR, so both need a human. Push with git push -u origin <current-branch>, or return to the main thread.`;
+  // `heads/<b>` means a tag shares the name, and `HEAD` means detached: neither is one plain branch.
+  if (!branch || branch === 'HEAD' || branch.startsWith('heads/') || protectedBranches.includes(branch))
+    return refuse(`runs on ${branch ?? 'an unknown branch'}, which is protected or not one plain branch name`);
+  const own = branch;
+
+  const { positionals, flags } = readPushArgs(args);
+  // Short letters before an `o` only: `o` takes the rest of the cluster as its value.
+  const extra = flags.find((f) => ['--delete', '--tags', '--follow-tags', '--prune'].includes(f) || (/^-[^-]/.test(f) && f.slice(1).split('o')[0].includes('d')));
+  if (extra) return refuse(`passes ${extra}, which writes or deletes refs other than that branch`);
+
+  // parseGit leaves a trailing `2>&1` in the args; pushPrelude admits no other redirect on a push.
+  const refspecs = positionals.slice(1).filter((p, i, all) => !(p === '2>&1' && i === all.length - 1));
+  for (const spec of refspecs) {
+    const colon = spec.indexOf(':');
+    const src = colon < 0 ? spec : spec.slice(0, colon);
+    let dst = colon < 0 ? spec : spec.slice(colon + 1);
+    // git prefixes a short dst with the SOURCE's namespace, so a tag source makes refs/tags/<dst>.
+    if (colon > 0 && !dst.startsWith('refs/heads/') && !['HEAD', '@', own, `refs/heads/${own}`].includes(src))
+      return refuse(`names ${spec}, whose source may be a tag; spell the destination refs/heads/${own}`);
+    if (colon < 0 && (dst === 'HEAD' || dst === '@')) dst = own;
+    if (dst.startsWith('refs/heads/')) dst = dst.slice('refs/heads/'.length);
+    if (colon === 0 || dst !== own) return refuse(`names ${spec}, which is not the current branch ${own}`);
+  }
+
+  const cfg = readConfig ? readConfig() : null;
+  if (cfg === null) return refuse("runs where this guard could not read the repository's push configuration");
+  const value = (key) => {
+    const e = cfg.findLast((x) => x.key === key);
+    return e === undefined ? undefined : (e.value ?? 'true').toLowerCase();
+  };
+  const follow = value('push.followtags');
+  if (follow !== undefined && !GIT_FALSE.has(follow)) return refuse('runs under push.followTags, which pushes tags too');
+  const submodules = value('submodule.recurse');
+  // git-config: with push.recurseSubmodules unset, a true submodule.recurse means on-demand.
+  const recurse = value('push.recursesubmodules') ?? (submodules !== undefined && !GIT_FALSE.has(submodules) ? 'on-demand' : undefined);
+  if (recurse !== undefined && recurse !== 'check' && !GIT_FALSE.has(recurse))
+    return refuse(`runs under push.recurseSubmodules=${recurse}, which pushes submodule branches too`);
+  return null;
+}
+
 // A bare `switch -c <name>` / `checkout -b <name>` branches from HEAD: no file and no push config moves.
 const branchesFromHead = (g) =>
   g !== null && g.globals.length === 0 && g.env.length === 0 && g.args.length === 2 && !g.args[1].startsWith('-') &&
@@ -421,7 +467,7 @@ const UNRESOLVABLE_MOVE =
 const TRUNCATED_QUOTE =
   'An unterminated quote in this command swallowed the git subcommand, so it cannot be checked against the never-commit-to-main rule. Refusing rather than guessing: the subcommand could be `commit` or `push`, and a shell would reject the command anyway. Close the quote and retry.';
 
-export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
+export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO, { subagent = false } = {}) {
   if (typeof command !== 'string' || !command.trim()) return { blocked: false };
 
   // Quote/substitution-aware split so each git invocation is checked
@@ -476,7 +522,7 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
         // buy a commit an exemption. An absolute `-C` still names its repo, so it is unaffected.
         if (unknownDir && gitDir === null && (sub === 'commit' || sub === 'push'))
           return { blocked: true, reason: UNRESOLVABLE_MOVE };
-        const verdict = ruleFor(sub, args, branchFor(gitDir), () => repoFor(gitDir), { globals, env, prelude });
+        const verdict = ruleFor(sub, args, branchFor(gitDir), () => repoFor(gitDir), { globals, env, prelude, subagent });
         if (verdict) return { blocked: true, reason: verdict };
         // Only switch/checkout needs the repo shape here; computing it for every segment would put
         // the git subprocesses back on `git status`/`log`/`diff`, which is what the thunk avoids.
@@ -508,7 +554,7 @@ export function decide(command, getBranch, startDir, getRepo = DEFAULT_REPO) {
 // `branch` is the branch of the repo THIS command acts on, not the hook's.
 // `getRepo()` is a THUNK returning { hasRemote, protectedBranches } — called only by the rules that
 // need it, so `git status`/`log`/`diff` never pay for the git subprocesses it costs.
-function ruleFor(sub, args, branch, getRepo, preamble = { globals: [], env: [], prelude: null }) {
+function ruleFor(sub, args, branch, getRepo, preamble = { globals: [], env: [], prelude: null, subagent: false }) {
   // Checked before anything reads `sub`: under a command-line alias the verb is a name this guard
   // has never seen, so no rule below would fire for it, whatever it expands to.
   if (configKeys(preamble.globals).some((k) => k.startsWith('alias.')))
@@ -554,6 +600,10 @@ function ruleFor(sub, args, branch, getRepo, preamble = { globals: [], env: [], 
     if (unresolved) return unresolved;
     const persisted = persistedPushReason(args, branch, protectedBranches, repo.pushConfig, preamble.prelude);
     if (persisted) return persisted;
+    if (preamble.subagent) {
+      const own = subagentPushReason(args, branch, protectedBranches, repo.pushConfig);
+      if (own) return own;
+    }
   }
 
   // An unresolved branch is NOT a safe branch. Every failure that breaks `git rev-parse` — a bogus
@@ -619,7 +669,10 @@ export function main() {
     let cfg;
     return { hasRemote: hasRemote(d), protectedBranches: protectedBranches(d), pushConfig: () => (cfg ??= readPushConfig(d)) };
   };
-  const { blocked, reason } = decide(payload?.tool_input?.command, getBranch, startDir, getRepo);
+  // Same reading as guard-subagent-gates: `agent_id` is present only inside a subagent, and any
+  // non-null value — readable or not — restricts.
+  const subagent = payload?.agent_id !== undefined && payload?.agent_id !== null;
+  const { blocked, reason } = decide(payload?.tool_input?.command, getBranch, startDir, getRepo, { subagent });
   if (blocked) {
     process.stderr.write(`[guard-bash] Blocked: ${reason}\n`);
     process.exit(2);
