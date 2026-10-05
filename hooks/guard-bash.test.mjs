@@ -1736,6 +1736,93 @@ describe('decide — a destination taken from persisted config (tkt-28b9514f0418
   });
 });
 
+// guard-subagent-gates no longer refuses push; a subagent may only update its own branch, because a
+// tag is a release and a deleted head branch closes its PR — both gates a subagent cannot ask for.
+describe('a subagent may push only its current branch (tkt-b4ccb49f3ac2)', () => {
+  const kv = (key, value = null) => ({ key, value });
+  const verdict = (cmd, opts = {}, { branch = 'feat/x', cfg = [] } = {}) =>
+    decide(cmd, onBranch(branch), '/r', () => ({ hasRemote: true, protectedBranches: ['main'], pushConfig: () => cfg }), opts).blocked;
+  const sub = (cmd, state) => verdict(cmd, { subagent: true }, state);
+  const human = (cmd, state) => verdict(cmd, {}, state);
+
+  it.each([
+    'git push -u origin feat/x',
+    'cd /r && git push -u origin feat/x',
+    'git push -u origin feat/x 2>&1',
+    'git push origin HEAD',
+    'git push -u origin HEAD:feat/x',
+    'git push origin refs/heads/feat/x',
+    'git push origin feat/x:refs/heads/feat/x',
+    'git push origin',
+    'git push',
+    'git push -u origin feat/x && gh pr create --title x --body y',
+  ])('allows `%s`', (cmd) => {
+    expect(sub(cmd)).toBe(false);
+  });
+
+  it.each([
+    'git push origin v0.32.0',
+    'git push origin tag v0.32.0',
+    'git push origin refs/tags/v0.32.0',
+    'git push --tags',
+    'git push origin --tags',
+    'git push --follow-tags origin feat/x',
+    'git push origin --delete feat/old',
+    'git push -d origin feat/old',
+    'git push -ud origin feat/x',
+    'git push origin :feat/old',
+    'git push origin feat/other',
+    'git push origin feat/x:feat/other',
+    'git push origin HEAD:refs/heads/feat/other',
+    'git push origin feat/x feat/other',
+    'git push --prune origin feat/x',
+  ])('refuses `%s` from a subagent, and allows it on the main thread (control)', (cmd) => {
+    expect(sub(cmd), 'subagent').toBe(true);
+    expect(human(cmd), 'main thread').toBe(false);
+  });
+
+  it('refuses persisted config that makes a branch push write more refs', () => {
+    const push = 'git push -u origin feat/x';
+    expect(sub(push, { cfg: [kv('push.followtags', 'true')] })).toBe(true);
+    expect(sub(push, { cfg: [kv('push.followtags')] })).toBe(true);
+    expect(sub(push, { cfg: [kv('push.recursesubmodules', 'on-demand')] })).toBe(true);
+    expect(sub(push, { cfg: [kv('push.followtags', 'false'), kv('push.recursesubmodules', 'check')] })).toBe(false);
+    expect(human(push, { cfg: [kv('push.followtags', 'true')] })).toBe(false);
+  });
+
+  it.each([
+    ['main', 'git push origin 2>&1'],
+    ['main', 'git push -u origin main 2>&1'],
+    ['heads/main', 'git push'],
+    ['heads/main', 'git push origin HEAD'],
+    ['heads/foo', 'git push origin HEAD:foo'],
+    ['heads/feat/x', 'git push origin feat/x'],
+    ['HEAD', 'git push origin X:refs/heads/HEAD'],
+  ])('refuses on branch %s, which is protected or not one plain name: `%s` (review findings)', (branch, cmd) => {
+    expect(sub(cmd, { branch })).toBe(true);
+  });
+
+  it('refuses a short destination whose source may be a tag, which git DWIMs into refs/tags/ (review finding)', () => {
+    expect(sub('git push origin v1.0:feat/x')).toBe(true);
+    expect(sub('git push origin v1.0:refs/heads/feat/x')).toBe(false);
+    expect(sub('git push origin feat/x:feat/x')).toBe(false);
+    expect(sub('git push origin @:feat/x')).toBe(false);
+  });
+
+  it('reads submodule.recurse as push.recurseSubmodules=on-demand when the latter is unset (review finding)', () => {
+    const push = 'git push -u origin feat/x';
+    expect(sub(push, { cfg: [kv('submodule.recurse', 'true')] })).toBe(true);
+    expect(sub(push, { cfg: [kv('submodule.recurse')] })).toBe(true);
+    expect(sub(push, { cfg: [kv('submodule.recurse', 'true'), kv('push.recursesubmodules', 'check')] })).toBe(false);
+    expect(sub(push, { cfg: [kv('submodule.recurse', 'false')] })).toBe(false);
+  });
+
+  it('still refuses what guard-bash refuses for everyone', () => {
+    for (const cmd of ['git push origin main', 'git push --mirror origin', 'git push -f origin feat/x', 'git -C "/a/b push origin x'])
+      expect(sub(cmd), cmd).toBe(true);
+  });
+});
+
 describe('parsePushConfig / readPushConfig (tkt-28b9514f0418)', () => {
   it('parses git config -z records, keeping a key-only boolean distinct from an empty value', () => {
     expect(parsePushConfig('push.default\nupstream\0remote.origin.mirror\0remote.x.mirror\n\0')).toEqual([
@@ -1780,6 +1867,21 @@ describe('the real hook — persisted push config (tkt-28b9514f0418)', () => {
     expect(runHook('git push -u origin feat/x')).toBe(2);
     run('git config --unset push.default');
     expect(runHook('git push -u origin feat/x')).toBe(0);
+  });
+
+  it('judges a subagent payload by its agent_id: a tag push exits 2, the same push without it exits 0 (tkt-b4ccb49f3ac2)', () => {
+    const hookStatus = (command, extra = {}) =>
+      spawnSync('node', [hook], { input: JSON.stringify({ cwd: tmp, tool_input: { command }, ...extra }), encoding: 'utf8', env }).status;
+    expect(hookStatus('git push origin v0.32.0', { agent_id: 'agent_01' })).toBe(2);
+    expect(hookStatus('git push origin v0.32.0')).toBe(0);
+    expect(hookStatus('git push -u origin feat/x', { agent_id: 'agent_01' })).toBe(0);
+    run('git config push.followTags true');
+    expect(hookStatus('git push -u origin feat/x', { agent_id: 'agent_01' })).toBe(2);
+    run('git config --unset push.followTags');
+    run('git config submodule.recurse true');
+    expect(hookStatus('git push -u origin feat/x', { agent_id: 'agent_01' })).toBe(2);
+    run('git config --unset submodule.recurse');
+    expect(hookStatus('git push -u origin feat/x', { agent_id: 'agent_01' })).toBe(0);
   });
 
   it('reads config the way git does: includes, worktree scope, global, and refuses a corrupt file', () => {

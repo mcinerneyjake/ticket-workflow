@@ -93,9 +93,9 @@ export function hasRemote(cwd, git = tryGit) {
   return out.length > 0;
 }
 
-// Every persisted key that can move where a push lands. Matched against git's canonical key, whose
-// section and variable names are lowercased.
-const PUSH_CONFIG_KEYS = '^(push\\.default|remote\\.pushdefault|remote\\..+\\.(push|pushurl|mirror)|branch\\..+\\.(pushremote|remote)|url\\..+\\.pushinsteadof)$';
+// Every persisted key that can move where a push lands, or add refs to it. Matched against git's
+// canonical key, whose section and variable names are lowercased.
+const PUSH_CONFIG_KEYS = '^(push\\.(default|followtags|recursesubmodules)|submodule\\.recurse|remote\\.pushdefault|remote\\..+\\.(push|pushurl|mirror)|branch\\..+\\.(pushremote|remote)|url\\..+\\.pushinsteadof)$';
 
 /** `git config -z --get-regexp` output → `{ key, value }[]`; `value` is null for a key-only boolean. */
 export function parsePushConfig(out) {

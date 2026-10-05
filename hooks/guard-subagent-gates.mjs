@@ -8,7 +8,7 @@
 // a CI run listed against `main`.
 //
 // THE RULE: merge is the one human gate left (docs/specs/workflow-rewrite.md), so commit and PR-open are
-// allowed. Push stays blocked until guard-bash can judge every push shape for main (tkt-e8b257fc8cc4).
+// allowed. Push is guard-bash's: it lets a subagent push only its current branch (tkt-b4ccb49f3ac2).
 //
 // WHY NOT `agent_type` — the obvious design is "block writes when the agent is a review agent", and
 // it is the wrong one. The review agents' `agent_type` values are undocumented and observable only by
@@ -30,7 +30,7 @@
 import { readFileSync } from 'node:fs';
 import { isMain } from './lib/is-main.mjs';
 import { bareWord, commandWordIndex, dequote, endsInsideQuote, quotedTokens } from './lib/shell.mjs';
-import { splitSegments, parseGit } from './guard-bash.mjs';
+import { splitSegments } from './guard-bash.mjs';
 
 // `gh <group> <verb>` pairs a subagent may not run. PR-open verbs (create/edit/ready), read verbs and
 // the REPORTING verbs (`pr comment`, `issue comment`) are absent on purpose. `alias`, `workflow run`,
@@ -165,13 +165,8 @@ export function decide(payload) {
     return { blocked: true, reason: 'this subagent issued a Bash call with no readable command, so it could not be checked against the gate rule' };
   }
 
+  // `git push` is guard-bash's: its subagent rule allows only the current branch (tkt-b4ccb49f3ac2).
   for (const segment of splitSegments(command)) {
-    const git = parseGit(segment);
-    if (git?.truncated) return { blocked: true, reason: describe(payload, 'run a git command whose subcommand an unterminated quote swallowed') };
-    // Still refused: guard-bash now judges persisted push config (tkt-28b9514f0418), but a git
-    // command hidden in a function body is still unjudged (tkt-acabd536c289); tkt-b4ccb49f3ac2 decides.
-    if (git?.sub === 'push') return { blocked: true, reason: describe(payload, 'git push') };
-
     const gh = parseGh(segment);
     if (gh?.truncated) return { blocked: true, reason: describe(payload, 'run a gh command whose group or verb an unterminated quote swallowed') };
     // Either reading's gate blocks. quotedTokens misreads `\'` and `$'…'` (tkt-5ad1c320bc0a), fusing
@@ -190,9 +185,9 @@ function describe(payload, action) {
   const type = typeof payload?.agent_type === 'string' && payload.agent_type ? payload.agent_type : 'unknown';
   return (
     `a subagent (agent_type: ${type}) tried to ${action}. Merge is a human approval gate, and ` +
-    'pushing, closing, releasing, deleting or writing through `gh api` could cross it; a subagent ' +
-    'has no way to obtain that approval. Return to the main thread and let it ask. Commit, ' +
-    'gh pr create/edit/ready, parameterless gh api reads, and gh pr comment are unaffected.'
+    'closing, releasing, deleting or writing through `gh api` could cross it; a subagent ' +
+    'has no way to obtain that approval. Return to the main thread and let it ask. Commit, pushing ' +
+    'the current branch, gh pr create/edit/ready, parameterless gh api reads, and gh pr comment are unaffected.'
   );
 }
 

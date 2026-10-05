@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { decide, parseGh } from './guard-subagent-gates.mjs';
+import { decide as bashDecide } from './guard-bash.mjs';
 
 const HOOK = fileURLToPath(new URL('./guard-subagent-gates.mjs', import.meta.url));
 
@@ -61,31 +62,49 @@ describe('commit and PR-open are no longer gates', () => {
   });
 });
 
-// guard-bash cannot judge every push shape for main: two review rounds on tkt-e8b257fc8cc4 measured
-// --mirror, --all, wildcards, -c/GIT_CONFIG, --git-dir/GIT_DIR, other remotes and tags all passing it.
-// Push therefore stays gated in every shape, the plain one included.
-describe('a subagent push is refused in every shape', () => {
+// Push is guard-bash's (tkt-b4ccb49f3ac2). Both hooks fire on every Bash call, so assert their union.
+describe('a subagent push is judged by guard-bash, through both hooks', () => {
+  const remotePushConfig = [{ key: 'remote.origin.push', value: 'refs/heads/fix/x:refs/heads/main' }];
+  const bothBlock = (command, cfg = []) =>
+    decide(payload(command)).blocked ||
+    bashDecide(command, () => 'fix/x', '/r', () => ({ hasRemote: true, protectedBranches: ['main'], pushConfig: () => cfg }), { subagent: true }).blocked;
+
   it.each([
     'git push -u origin fix/x',
     'git push origin HEAD',
+    'cd /r && git push -u origin fix/x',
+  ])('allows `%s`, and this hook alone allows it too', (command) => {
+    expect(decide(payload(command)).blocked).toBe(false);
+    expect(bothBlock(command)).toBe(false);
+  });
+
+  it.each([
     'git push --mirror origin',
     'git push --all origin',
     'git -c remote.origin.push=HEAD:refs/heads/main push origin',
     'GIT_DIR=../primary/.git git push origin HEAD',
     'git --git-dir=/r/primary/.git push origin HEAD',
     'git push upstream master',
+    'git push origin main',
+    'git push -f origin fix/x',
     'git push origin v0.30.0',
-    'git -C /other/repo push',
+    'git push --tags',
+    'git push origin --delete fix/old',
+    'git push origin fix/x:fix/other',
     'time git push --all',
+    'git -C "/a/b push origin x',
+    // guard-bash reads push config before the command runs, so only a literal cd may precede a push.
     'npm test && git commit -m x && git push -u origin fix/x',
-  ])('blocks `%s`', (command) => {
-    const d = decide(payload(command));
-    expect(d.blocked).toBe(true);
-    expect(d.reason).toContain('git push');
+  ])('refuses `%s`', (command) => {
+    expect(bothBlock(command)).toBe(true);
   });
 
-  it('still refuses a git subcommand an unterminated quote swallowed', () => {
-    expect(decide(payload('git -C "/a/b push origin x')).blocked).toBe(true);
+  it('refuses the plain push once persisted config retargets it', () => {
+    expect(bothBlock('git push -u origin fix/x', remotePushConfig)).toBe(true);
+  });
+
+  it('exits 0 end to end for a subagent push', () => {
+    expect(run(JSON.stringify(payload('git push -u origin fix/x'))).code).toBe(0);
   });
 });
 
@@ -330,7 +349,6 @@ describe('the leading run before gh', () => {
     ['coproc', 'coproc gh pr merge 40'],
     ['keyword fused to (', 'true; then(gh pr merge 40); fi'],
     ['case arm', 'case x in *) gh pr merge 40;; esac'],
-    ['path-spelled git push', '/usr/bin/git push origin main'],
   ])('KNOWN GAP (%s): %s', (_label, command) => {
     expect(decide(payload(command)).blocked).toBe(false);
   });
