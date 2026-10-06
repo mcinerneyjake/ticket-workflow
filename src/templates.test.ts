@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { guardrailTemplates, resolveManifest } from './templates.js';
+import { guardrailTemplates, resolveManifest, WORKFLOW_SKILLS } from './templates.js';
 import { lineCount, SKILL_LINE_CAP } from './audit/checks/skills.js';
 
 const REAL_TEMPLATES_DIR = fileURLToPath(new URL('../templates/', import.meta.url));
@@ -387,7 +387,8 @@ describe('vendored skills (tkt-e759d07ef1c5)', () => {
   const upstream: { commit: string; skills: Record<string, { files: string[] }>; patches: { file: string; find: string }[] } = JSON.parse(
     readFileSync(path.join(SKILLS_SRC, 'UPSTREAM.json'), 'utf8'),
   );
-  const skillTemplates = (): ReturnType<typeof guardrailTemplates> => guardrailTemplates().filter((t) => t.targetPath.startsWith('.claude/skills/'));
+  const skillTemplates = (): ReturnType<typeof guardrailTemplates> =>
+    guardrailTemplates().filter((t) => t.targetPath.startsWith('.claude/skills/') && t.targetPath.split('/')[2] in upstream.skills);
 
   it('pins ONE full commit SHA, never a branch or tag', () => {
     expect(upstream.commit).toMatch(/^[0-9a-f]{40}$/);
@@ -399,7 +400,6 @@ describe('vendored skills (tkt-e759d07ef1c5)', () => {
     const shipped = skillTemplates();
     expect(shipped.map((t) => t.targetPath).sort()).toEqual(expected.sort());
     expect(shipped.every((t) => t.tier === 'core' && !t.executable)).toBe(true);
-    expect(guardrailTemplates(undefined, 'core').filter((t) => t.targetPath.startsWith('.claude/skills/')).length).toBe(expected.length);
   });
 
   it('ships no stray file under templates/skills/ beyond the listed set', () => {
@@ -483,5 +483,66 @@ describe('vendored skills (tkt-e759d07ef1c5)', () => {
       const skillMd = readFileSync(path.join(SKILLS_SRC, name, 'SKILL.md'), 'utf8');
       expect(skillMd.match(/^name: (.+)$/m)?.[1], name).toBe(name);
     }
+  });
+});
+
+describe('workflow skills (tkt-0dbbd0bc6151)', () => {
+  const WORKFLOW_SRC = path.join(REAL_TEMPLATES_DIR, 'workflow-skills');
+  const upstream: { skills: Record<string, unknown> } = JSON.parse(readFileSync(path.join(REAL_TEMPLATES_DIR, 'skills', 'UPSTREAM.json'), 'utf8'));
+  const upstreamNames = Object.keys(upstream.skills);
+  const names = Object.keys(WORKFLOW_SKILLS);
+  const skillOf = (t: { targetPath: string }): string => t.targetPath.split('/')[2] ?? '';
+  const shipped = (): ReturnType<typeof guardrailTemplates> => guardrailTemplates(undefined, 'core').filter((t) => t.targetPath.startsWith('.claude/skills/'));
+
+  it('installs implement at core tier with exactly its listed files and no LICENSE', () => {
+    expect(names).toContain('implement');
+    const expected = names.flatMap((name) => (WORKFLOW_SKILLS[name] ?? []).map((f) => `.claude/skills/${name}/${f}`)).sort();
+    const own = shipped().filter((t) => names.includes(skillOf(t)));
+    expect(own.map((t) => t.targetPath).sort()).toEqual(expected);
+    expect(own.every((t) => t.tier === 'core' && !t.executable)).toBe(true);
+    expect(own.filter((t) => t.targetPath.endsWith('/LICENSE'))).toEqual([]);
+  });
+
+  it('every shipped skill is either vendored or a workflow skill', () => {
+    const known = new Set([...upstreamNames, ...names]);
+    expect(shipped().length).toBeGreaterThan(0);
+    for (const t of shipped()) expect(known, t.targetPath).toContain(skillOf(t));
+  });
+
+  it('never reuses a vendored skill name', () => {
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) expect(upstreamNames, name).not.toContain(name);
+  });
+
+  it('ships no stray file under templates/workflow-skills/ beyond the listed set', () => {
+    const onDisk = readdirSync(WORKFLOW_SRC, { recursive: true, withFileTypes: true })
+      .filter((d) => d.isFile())
+      .map((d) => path.relative(WORKFLOW_SRC, path.join(d.parentPath, d.name)))
+      .sort();
+    const listed = names.flatMap((name) => (WORKFLOW_SKILLS[name] ?? []).map((f) => path.join(name, f))).sort();
+    expect(onDisk).toEqual(listed);
+  });
+
+  it('each SKILL.md is within the cap, named for its directory, and links only files it ships', () => {
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) {
+      const files = WORKFLOW_SKILLS[name] ?? [];
+      expect(files, name).toContain('SKILL.md');
+      const skillMd = readFileSync(path.join(WORKFLOW_SRC, name, 'SKILL.md'), 'utf8');
+      expect(lineCount(skillMd), name).toBeLessThanOrEqual(SKILL_LINE_CAP);
+      expect(skillMd.match(/^name: (.+)$/m)?.[1], name).toBe(name);
+      const linked = [...skillMd.matchAll(/\]\(([^)#\s]+)\)/g)].map((m) => m[1]).filter((href) => !/^[a-z]+:/.test(href));
+      expect(linked.sort(), name).toEqual(files.filter((f) => f !== 'SKILL.md').sort());
+    }
+  });
+
+  it('every skill a workflow skill names ships in the set', () => {
+    const shippedNames = new Set([...upstreamNames, ...names]);
+    const named = names.flatMap((name) =>
+      [...readFileSync(path.join(WORKFLOW_SRC, name, 'SKILL.md'), 'utf8').matchAll(/`([a-z][a-z0-9-]*)` skill\b/g)].map((m) => m[1]),
+    );
+    // Control: implement hands off to tdd and the review skill, so an empty match means a broken pattern.
+    expect(named).toEqual(expect.arrayContaining(['tdd', 'standards-and-spec-review']));
+    for (const n of named) expect(shippedNames, n).toContain(n);
   });
 });

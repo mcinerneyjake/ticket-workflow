@@ -386,6 +386,20 @@ describe('vendored skills round trip: init → audit current → mutate → audi
     expect(runOneCheck(dir, 'skills-current')?.status).toBe('pass');
   });
 
+  it('installs the implement workflow skill, which the audit reads as current and then as drifted (tkt-0dbbd0bc6151)', () => {
+    const dir = tempDir();
+    const result = runInit(dir, { tier: 'core' });
+    const implement = path.join(dir, '.claude', 'skills', 'implement', 'SKILL.md');
+    expect(result.wrote).toContain('.claude/skills/implement/SKILL.md');
+    expect(existsSync(path.join(dir, '.claude', 'skills', 'implement', 'LICENSE'))).toBe(false);
+    expect(result.report.results.find((r) => r.id === 'skills-current')?.status).toBe('pass');
+
+    writeFileSync(implement, `${readFileSync(implement, 'utf8')}\nlocal edit\n`);
+    const drift = runOneCheck(dir, 'skills-current');
+    expect(drift?.status).toBe('fail');
+    expect(drift?.detail).toContain('drifted: .claude/skills/implement/SKILL.md');
+  });
+
   it('refuses to scaffold over a consumer skill already at a vendored path without --force', () => {
     const dir = tempDir();
     mkdirSync(path.join(dir, '.claude', 'skills', 'tdd'), { recursive: true });

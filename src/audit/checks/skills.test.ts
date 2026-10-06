@@ -77,6 +77,22 @@ describe('skills-current', () => {
     expect(check(dir, 'skills-current').status).toBe('blocked');
   });
 
+  it('points a drifted workflow skill at its own source, never at the vendored LICENSE', () => {
+    const dir = repoWithSkills();
+    appendFileSync(path.join(dir, SKILLS_DIR, 'implement', 'SKILL.md'), 'local tweak\n');
+    const r = check(dir, 'skills-current');
+    expect(r.status).toBe('fail');
+    expect(r.detail).toContain(`drifted: ${SKILLS_DIR}/implement/SKILL.md`);
+    expect(r.detail).toContain(`${SKILLS_DIR}/implement/SKILL.md ← templates/workflow-skills/implement/SKILL.md`);
+    expect(r.detail).not.toContain('LICENSE');
+  });
+
+  it('points a drifted vendored LICENSE at the one shared notice it was copied from', () => {
+    const dir = repoWithSkills();
+    writeFileSync(path.join(dir, SKILLS_DIR, 'grilling', 'LICENSE'), 'MIT\n');
+    expect(check(dir, 'skills-current').detail).toContain(`${SKILLS_DIR}/grilling/LICENSE ← templates/skills/LICENSE`);
+  });
+
   it("ignores a consumer's own skills beside the vendored ones", () => {
     const dir = repoWithSkills();
     ownSkill(dir, 'house-style', 10);
