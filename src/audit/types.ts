@@ -38,6 +38,15 @@ export interface AuditResult {
    * tmpdir-cleanup argument made again: every consumer predates the vendored skills, so gating would
    * redden every consumer's required gate the day the release lands (tkt-e759d07ef1c5).
    *
+   * claude-md-line-cap is the same blast-radius argument: consumers' CLAUDE.md files predate the
+   * 60-line cap. `advisory` is one global flag with no per-repo switch, so flipping it reddens every
+   * consumer still over the cap; promotion is tkt-d4e14461f86a.
+   *
+   * glossary-line-cap is NOT that argument — no consumer has a GLOSSARY.md yet, and absent passes.
+   * It is advisory because its 120-line cap is unmeasured: grilling grows the file during the pilot,
+   * and a global gating flag would redden a consumer on content growth before any real glossary has
+   * tested the number (tkt-e77caee3f958). Promotion rides with the other caps in tkt-d4e14461f86a.
+   *
    * Everything else that cannot be determined still fails the gate — "can't check" is not
    * conformance.
    */

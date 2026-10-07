@@ -56,9 +56,16 @@ because the skill runs it unconditionally; it was a gate only because it could b
   package). Git history replaces append-only body conventions: specs are edited normally.
 - **The board** holds a spec ticket that links to the file; slices are its children. A spec ticket
   is any ticket whose `spec` field is set, as `owner/repo:path/to/spec.md`; there is no `spec` type,
-  so the marker and the link cannot disagree. A **local probe** (not a CI audit check — CI has no
-  board) fails when a spec ticket's link does not resolve on the owning repo's `main`, and exits as
-  "could not check" rather than clean when the board or the repo is unreadable.
+  so the marker and the link cannot disagree. A **local probe**, `ticket-workflow specs` (not a CI
+  audit check — CI has no board), fails when an open spec ticket's link does not resolve on the
+  owning repo's default branch, and exits as "could not check" rather than clean when the board, the
+  repo or a ticket's `spec` value is unreadable.
+- **A finished spec is deleted, never archived.** When its spec ticket is `done`, the file is removed
+  from the default branch and indexed in that repo's `docs/specs/README.md` by a permalink
+  (`https://github.com/<owner>/<repo>/blob/<sha>/<path>`) to the last commit that held it. There is no
+  archive folder: an in-tree archive is still read as current. The probe checks both halves — the file
+  is gone, and the permalink resolves — but never writes the index. An `archived` spec ticket is
+  retired, not finished, and owes no index entry.
 - **Skills ship in this package.** `init` installs them into a consumer's `.claude/skills/`, pinned
   by the package tag; `audit` reports missing or drifted copies.
 
@@ -158,7 +165,7 @@ and a flip would show the other a mutated diff (`tkt-0dbbd0bc6151`).
 | `guard-worktree` | Stateless rule above |
 | `guard-subagent-gates` | Narrows to merge |
 | `audit` | Repo `CLAUDE.md` line cap, skill line cap, glossary cap, skills present and current |
-| `doctor` / probes | Global `CLAUDE.md` cap; spec link resolves on `main` |
+| `doctor` / probes | Global `CLAUDE.md` cap; `specs`: open spec links resolve, finished specs deleted and indexed |
 | `init` | Installs the skills and a `GLOSSARY.md` stub |
 | Night run | Parallel frontier loop over AFK slices, capped by test slots |
 

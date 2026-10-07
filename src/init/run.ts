@@ -1,6 +1,6 @@
 import { chmodSync, lstatSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { guardrailTemplates, type GuardrailTier } from '../templates.js';
+import { GLOSSARY_FILE, glossaryStub, guardrailTemplates, type GuardrailTier } from '../templates.js';
 import { runAudit, auditExitCode, type AuditReport } from '../audit/run.js';
 import { CONFIG_FILE } from '../audit/config.js';
 import { readRepoFile, type Exec, defaultExec } from '../audit/types.js';
@@ -9,7 +9,7 @@ export interface InitResult {
   readonly targetDir: string;
   readonly tier: GuardrailTier;
   readonly wrote: readonly string[];
-  /** Existed already and was deliberately left alone (package.json is never overwritten). */
+  /** Existed already and was deliberately left alone (package.json and GLOSSARY.md are never overwritten). */
   readonly preserved: readonly string[];
   readonly report: AuditReport;
   /** 2 on any gating FAIL; 1 on a gating BLOCKED outside the known fresh-scaffold set (a crashed
@@ -141,11 +141,12 @@ export function runInit(
   const replaceable = states.filter((s) => s.state === 'replaceable').map((s) => s.rel);
   if (replaceable.length > 0 && opts.force !== true) {
     throw new Error(
-      `refusing to overwrite existing file(s): ${replaceable.join(', ')} — re-run with --force to overwrite them (package.json is never overwritten)`,
+      `refusing to overwrite existing file(s): ${replaceable.join(', ')} — re-run with --force to overwrite them (package.json and ${GLOSSARY_FILE} are never overwritten)`,
     );
   }
 
   const version = selfVersion();
+  const glossary = glossaryStub();
   const wrote: string[] = [];
   const preserved: string[] = [];
   for (const t of templates) {
@@ -164,6 +165,16 @@ export function runInit(
   rmSync(configTarget, { force: true });
   writeFileSync(configTarget, `${JSON.stringify({ tier, exempt: {} }, null, 2)}\n`);
   wrote.push(CONFIG_FILE);
+
+  // `wx` is the whole guard: one exclusive create, so no check-then-write race, and O_EXCL fails on
+  // any existing entry (file, directory, live or dangling symlink) without following it.
+  try {
+    writeFileSync(path.join(targetDir, GLOSSARY_FILE), glossary, { flag: 'wx' });
+    wrote.push(GLOSSARY_FILE);
+  } catch (err) {
+    if (!(err instanceof Error && 'code' in err && err.code === 'EEXIST')) throw err;
+    preserved.push(GLOSSARY_FILE);
+  }
 
   if (tier === 'node') {
     if (readRepoFile(targetDir, 'package.json').kind === 'missing') {

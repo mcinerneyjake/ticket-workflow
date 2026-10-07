@@ -143,8 +143,9 @@ describe('guardrailTemplates', () => {
     for (const t of templates) {
       expect(packed, `templates/${t.source} missing from npm pack`).toContain(`templates/${t.source}`);
     }
-    // Read at runtime but never a manifest source, so the loop above cannot see it.
+    // Read at runtime but never manifest sources, so the loop above cannot see them.
     expect(packed).toContain('templates/skills/UPSTREAM.json');
+    expect(packed).toContain('templates/core/GLOSSARY.md');
   });
 
   it('this repo executes its intended-identical guardrail files byte-for-byte from the templates', () => {

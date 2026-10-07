@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { claudeMd } from './checks/claudeMd.js';
+import { claudeMd, claudeMdLineCap } from './checks/claudeMd.js';
 import { gitignore } from './checks/gitignore.js';
 import { ciGateJob, ciBranchNameJob } from './checks/workflowJobs.js';
 import { dependabot } from './checks/dependabot.js';
@@ -21,6 +21,7 @@ import { pinParity } from './checks/pinParity.js';
 import { pinFreshness } from './checks/pinFreshness.js';
 import { pinResolved } from './checks/pinResolved.js';
 import { skillsCurrent, skillLineCap } from './checks/skills.js';
+import { glossaryLineCap } from './checks/glossary.js';
 import { loadRepoConfig, CONFIG_FILE } from './config.js';
 import { tierIncludes } from '../templates.js';
 import { defaultExec, makeResult, readRepoFile, type AuditCheck, type AuditContext, type AuditResult, type Exec } from './types.js';
@@ -28,6 +29,8 @@ import { defaultExec, makeResult, readRepoFile, type AuditCheck, type AuditConte
 /** The registry IS the standard: core applies to every repo, node adds on top. */
 export const AUDIT_CHECKS: readonly AuditCheck[] = [
   claudeMd,
+  claudeMdLineCap,
+  glossaryLineCap,
   gitignore,
   ciGateJob,
   ciBranchNameJob,
