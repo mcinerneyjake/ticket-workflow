@@ -129,6 +129,7 @@ const WORKFLOW_SKILLS_SOURCE = 'workflow-skills';
 // Our own skills (tkt-0dbbd0bc6151): written here, under the package's own license, so no vendored LICENSE.
 export const WORKFLOW_SKILLS: Readonly<Record<string, ReadonlyArray<string>>> = {
   implement: ['SKILL.md'],
+  'to-tickets': ['SKILL.md'],
 };
 
 function workflowSkillManifest(): ManifestEntry[] {

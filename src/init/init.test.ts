@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { glossaryStub, guardrailTemplates } from '../templates.js';
+import { glossaryStub, guardrailTemplates, WORKFLOW_SKILLS } from '../templates.js';
 import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS, GITIGNORE_ENV_NOT_READY, LAUNCHER_ENV_NOT_READY, PIN_PARITY_FRESH_SHAPES } from './run.js';
 import { parseInitArgs, cmdInit } from '../cli/index.js';
 import { runOneCheck } from '../audit/run.js';
@@ -437,18 +437,22 @@ describe('vendored skills round trip: init → audit current → mutate → audi
     expect(runOneCheck(dir, 'skills-current')?.status).toBe('pass');
   });
 
-  it('installs the implement workflow skill, which the audit reads as current and then as drifted (tkt-0dbbd0bc6151)', () => {
+  it('covers every workflow skill below', () => {
+    expect(Object.keys(WORKFLOW_SKILLS)).toEqual(expect.arrayContaining(['implement', 'to-tickets']));
+  });
+
+  it.each(Object.keys(WORKFLOW_SKILLS))('installs the %s workflow skill, which the audit reads as current and then as drifted (tkt-0dbbd0bc6151, tkt-231d0dd6e04b)', (name) => {
     const dir = tempDir();
     const result = runInit(dir, { tier: 'core' });
-    const implement = path.join(dir, '.claude', 'skills', 'implement', 'SKILL.md');
-    expect(result.wrote).toContain('.claude/skills/implement/SKILL.md');
-    expect(existsSync(path.join(dir, '.claude', 'skills', 'implement', 'LICENSE'))).toBe(false);
+    const skillMd = path.join(dir, '.claude', 'skills', name, 'SKILL.md');
+    expect(result.wrote).toContain(`.claude/skills/${name}/SKILL.md`);
+    expect(existsSync(path.join(dir, '.claude', 'skills', name, 'LICENSE'))).toBe(false);
     expect(result.report.results.find((r) => r.id === 'skills-current')?.status).toBe('pass');
 
-    writeFileSync(implement, `${readFileSync(implement, 'utf8')}\nlocal edit\n`);
+    writeFileSync(skillMd, `${readFileSync(skillMd, 'utf8')}\nlocal edit\n`);
     const drift = runOneCheck(dir, 'skills-current');
     expect(drift?.status).toBe('fail');
-    expect(drift?.detail).toContain('drifted: .claude/skills/implement/SKILL.md');
+    expect(drift?.detail).toContain(`drifted: .claude/skills/${name}/SKILL.md`);
   });
 
   it('refuses to scaffold over a consumer skill already at a vendored path without --force', () => {
