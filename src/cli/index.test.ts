@@ -1,10 +1,10 @@
 import type { Ticket } from '../shared/constants.js';
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain, parseWorktreeArgs, cmdWorktree, parseRestoreArgs, cmdHistory} from './index.js';
+import { parseStatus, statusUsage, cmdList, cmdShow, cmdDoctor, parseDoctorFlags, parseAuditArgs, cmdAudit, cmdVerify, parseVerifyArgs, main, isMain, parseWorktreeArgs, cmdWorktree, parseRestoreArgs, cmdHistory, cmdSpecs} from './index.js';
 import { createTicket, deleteTicket, updateTicket, HttpError } from '../server/tickets.js';
 import { appendEvent, getTicketEvents } from '../server/events.js';
 import { STATUS_IDS } from '../shared/constants.js';
@@ -641,5 +641,99 @@ describe('cmdHistory output', () => {
     expect(out).toContain('live');
     expect(out).toContain('--at');
     expect(out).not.toContain('DELETED');
+  });
+});
+
+describe('cmdSpecs', () => {
+  const emptyListing = { specTickets: [], malformedSpec: [], unreadable: [], ticketFiles: 3 };
+  const noGh = () => { throw new Error('gh must not be called'); };
+  const BOARD_VARS = ['TICKETS_DIR_OVERRIDE', 'BOARD_DIR_OVERRIDE', 'CLAUDE_PROJECT_DIR'] as const;
+  let saved: Record<string, string | undefined> = {};
+
+  // Every case states its own board env: the suite's temp-dir setup exports TICKETS_DIR_OVERRIDE.
+  beforeEach(() => {
+    saved = Object.fromEntries(BOARD_VARS.map((k) => [k, process.env[k]]));
+    for (const k of BOARD_VARS) delete process.env[k];
+    process.env.BOARD_DIR_OVERRIDE = '/declared/board';
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const k of BOARD_VARS) {
+      const v = saved[k];
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+
+  it('refuses a board that only the cwd fallback names, without reading it', async () => {
+    delete process.env.BOARD_DIR_OVERRIDE;
+    const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const list = vi.fn(async () => emptyListing);
+    expect(await cmdSpecs([], { list, exec: noGh })).toBe(2);
+    expect(list).not.toHaveBeenCalled();
+    expect(String(err.mock.calls[0]?.[0])).toContain('no board declared');
+  });
+
+  it('accepts CLAUDE_PROJECT_DIR or TICKETS_DIR_OVERRIDE as a declared board', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    delete process.env.BOARD_DIR_OVERRIDE;
+    process.env.CLAUDE_PROJECT_DIR = '/proj';
+    expect(await cmdSpecs([], { list: async () => emptyListing, exec: noGh })).toBe(0);
+    delete process.env.CLAUDE_PROJECT_DIR;
+    process.env.TICKETS_DIR_OVERRIDE = '/t';
+    expect(await cmdSpecs([], { list: async () => emptyListing, exec: noGh })).toBe(0);
+  });
+
+  it('refuses --board while TICKETS_DIR_OVERRIDE would silently outrank it', async () => {
+    process.env.TICKETS_DIR_OVERRIDE = '/elsewhere/tickets';
+    const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const list = vi.fn(async () => emptyListing);
+    expect(await cmdSpecs(['--board', '/central'], { list, exec: noGh })).toBe(2);
+    expect(list).not.toHaveBeenCalled();
+    expect(String(err.mock.calls[0]?.[0])).toContain('conflicts with TICKETS_DIR_OVERRIDE');
+  });
+
+  it.each([[['--json']], [['--board']], [['--board', '']], [['--board', '--x']], [['extra']], [['--board', '/b', 'x']]])(
+    'refuses %j as a usage error (exit 2) without reading the board',
+    async (args) => {
+      vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      const list = vi.fn(async () => emptyListing);
+      expect(await cmdSpecs(args, { list, exec: noGh })).toBe(2);
+      expect(list).not.toHaveBeenCalled();
+    },
+  );
+
+  it('exits 2 when the board cannot be read', async () => {
+    const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    expect(await cmdSpecs([], { list: async () => { throw new Error('EACCES'); }, exec: noGh })).toBe(2);
+    expect(String(err.mock.calls[0]?.[0])).toContain('could not read the board');
+  });
+
+  it('exits 0 on a board with tickets and no spec tickets, and 2 on an empty board', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    expect(await cmdSpecs([], { list: async () => emptyListing, exec: noGh })).toBe(0);
+    expect(await cmdSpecs([], { list: async () => ({ ...emptyListing, ticketFiles: 0 }), exec: noGh })).toBe(2);
+  });
+
+  it('carries a finding through to exit 1', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const t: Ticket = {
+      id: 'tkt-1', title: 't', type: 'task', priority: 'medium', status: 'todo', order: 0, created: '', updated: '', body: '',
+      project: null, blockers: [], parent: null, dueDate: null, assignee: null, autonomy: 'hitl', spec: 'acme/w:docs/x.md', source: null, runId: null,
+    };
+    const spec = { ...emptyListing, specTickets: [t] };
+    const exec = (_c: string, args: readonly string[]) =>
+      args[1] === 'repos/acme/w'
+        ? { kind: 'ran' as const, ok: true, status: 0, stdout: 'main', stderr: '' }
+        : { kind: 'ran' as const, ok: false, status: 1, stdout: '', stderr: 'gh: Not Found (HTTP 404)' };
+    expect(await cmdSpecs([], { list: async () => spec, exec })).toBe(1);
+  });
+
+  it('points the board at --board before reading it, even with no board otherwise declared', async () => {
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    delete process.env.BOARD_DIR_OVERRIDE;
+    let seen: string | undefined;
+    expect(await cmdSpecs(['--board', '/some/board'], { list: async () => { seen = process.env.BOARD_DIR_OVERRIDE; return emptyListing; }, exec: noGh })).toBe(0);
+    expect(seen).toBe('/some/board');
   });
 });
