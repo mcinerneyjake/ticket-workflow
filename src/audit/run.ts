@@ -21,6 +21,7 @@ import { pinParity } from './checks/pinParity.js';
 import { pinFreshness } from './checks/pinFreshness.js';
 import { pinResolved } from './checks/pinResolved.js';
 import { skillsCurrent, skillLineCap } from './checks/skills.js';
+import { glossaryLineCap } from './checks/glossary.js';
 import { loadRepoConfig, CONFIG_FILE } from './config.js';
 import { tierIncludes } from '../templates.js';
 import { defaultExec, makeResult, readRepoFile, type AuditCheck, type AuditContext, type AuditResult, type Exec } from './types.js';
@@ -29,6 +30,7 @@ import { defaultExec, makeResult, readRepoFile, type AuditCheck, type AuditConte
 export const AUDIT_CHECKS: readonly AuditCheck[] = [
   claudeMd,
   claudeMdLineCap,
+  glossaryLineCap,
   gitignore,
   ciGateJob,
   ciBranchNameJob,

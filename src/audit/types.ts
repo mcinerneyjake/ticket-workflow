@@ -42,6 +42,11 @@ export interface AuditResult {
    * 60-line cap. `advisory` is one global flag with no per-repo switch, so flipping it reddens every
    * consumer still over the cap; promotion is tkt-d4e14461f86a.
    *
+   * glossary-line-cap is NOT that argument — no consumer has a GLOSSARY.md yet, and absent passes.
+   * It is advisory because its 120-line cap is unmeasured: grilling grows the file during the pilot,
+   * and a global gating flag would redden a consumer on content growth before any real glossary has
+   * tested the number (tkt-e77caee3f958). Promotion rides with the other caps in tkt-d4e14461f86a.
+   *
    * Everything else that cannot be determined still fails the gate — "can't check" is not
    * conformance.
    */

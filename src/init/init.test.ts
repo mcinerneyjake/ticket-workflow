@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { guardrailTemplates } from '../templates.js';
+import { glossaryStub, guardrailTemplates } from '../templates.js';
 import { runInit, EXPECTED_FRESH_BLOCKED, GATE_SCRIPTS, GITIGNORE_ENV_NOT_READY, LAUNCHER_ENV_NOT_READY, PIN_PARITY_FRESH_SHAPES } from './run.js';
 import { parseInitArgs, cmdInit } from '../cli/index.js';
 import { runOneCheck } from '../audit/run.js';
@@ -169,6 +169,57 @@ describe('init refuses to overwrite', () => {
     const dir = tempDir();
     runInit(dir);
     expect(() => runInit(dir)).toThrow(/refusing to overwrite/);
+  });
+});
+
+describe('init GLOSSARY.md stub', () => {
+  it.each(['node', 'core'] as const)('%s tier seeds the stub into a repo without one, and it passes glossary-line-cap', (tier) => {
+    const dir = tempDir();
+    const result = runInit(dir, { tier });
+    expect(readFileSync(path.join(dir, 'GLOSSARY.md'), 'utf8')).toBe(glossaryStub());
+    expect(result.wrote).toContain('GLOSSARY.md');
+    expect(result.preserved).not.toContain('GLOSSARY.md');
+    expect(result.report.results.find((r) => r.id === 'glossary-line-cap')?.status).toBe('pass');
+  });
+
+  it.each([false, true])('an existing GLOSSARY.md is preserved byte-for-byte and does not block init (force=%s)', (force) => {
+    const dir = tempDir();
+    const original = '# Glossary\n\n**Lot** — one auction listing.\n';
+    writeFileSync(path.join(dir, 'GLOSSARY.md'), original);
+    const result = runInit(dir, { force });
+    expect(readFileSync(path.join(dir, 'GLOSSARY.md'), 'utf8')).toBe(original);
+    expect(result.preserved).toContain('GLOSSARY.md');
+    expect(result.wrote).not.toContain('GLOSSARY.md');
+  });
+
+  it('a DANGLING symlink at GLOSSARY.md is preserved, never written through', () => {
+    const dir = tempDir();
+    const outside = path.join(tempDir(), 'stolen.md');
+    symlinkSync(outside, path.join(dir, 'GLOSSARY.md'));
+    const result = runInit(dir);
+    expect(existsSync(outside)).toBe(false);
+    expect(lstatSync(path.join(dir, 'GLOSSARY.md')).isSymbolicLink()).toBe(true);
+    expect(result.preserved).toContain('GLOSSARY.md');
+  });
+
+  it('a LIVE symlink at GLOSSARY.md is preserved, and the linked file is untouched even with --force', () => {
+    const dir = tempDir();
+    const elsewhere = path.join(tempDir(), 'terms.md');
+    writeFileSync(elsewhere, 'shared terms\n');
+    symlinkSync(elsewhere, path.join(dir, 'GLOSSARY.md'));
+    const result = runInit(dir, { force: true });
+    expect(readFileSync(elsewhere, 'utf8')).toBe('shared terms\n');
+    expect(lstatSync(path.join(dir, 'GLOSSARY.md')).isSymbolicLink()).toBe(true);
+    expect(result.preserved).toContain('GLOSSARY.md');
+  });
+
+  it('a DIRECTORY at GLOSSARY.md is preserved, not a conflict — init never writes there', () => {
+    const dir = tempDir();
+    mkdirSync(path.join(dir, 'GLOSSARY.md'));
+    const result = runInit(dir);
+    expect(lstatSync(path.join(dir, 'GLOSSARY.md')).isDirectory()).toBe(true);
+    expect(result.preserved).toContain('GLOSSARY.md');
+    expect(existsSync(path.join(dir, 'CLAUDE.md'))).toBe(true);
   });
 });
 
