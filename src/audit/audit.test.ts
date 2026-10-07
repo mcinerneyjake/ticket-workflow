@@ -94,6 +94,15 @@ describe('audit: the conforming fixture (built from the real templates)', () => 
     expect(report.tierDeclared).toBe(true);
   });
 
+  it('a CLAUDE.md over the line cap is reported but still exits 0, because the cap is advisory', () => {
+    const dir = makeConformingRepo();
+    writeFileSync(path.join(dir, 'CLAUDE.md'), `${readFileSync(path.join(dir, 'CLAUDE.md'), 'utf8')}${'filler\n'.repeat(60)}`);
+    const report = runAudit(dir, execWithEslint);
+    expect(report.results.find((r) => r.id === 'claude-md-line-cap')?.status).toBe('fail');
+    expect(report.results.find((r) => r.id === 'claude-md')?.status).toBe('pass');
+    expect(auditExitCode(report)).toBe(0);
+  });
+
   it('hook-arming NEVER passes — the report always discloses it', () => {
     const dir = makeConformingRepo();
     const out = formatAudit(runAudit(dir, execWithEslint));
