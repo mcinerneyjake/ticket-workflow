@@ -168,6 +168,13 @@ function readTemplate(templatesDir: string, source: string): string {
   return contents;
 }
 
+export const GLOSSARY_FILE = 'GLOSSARY.md';
+
+// Not a MANIFEST entry: grilling grows the file, so init seeds it once and never overwrites it.
+export function glossaryStub(templatesDir: string = DEFAULT_TEMPLATES_DIR): string {
+  return readTemplate(templatesDir, 'core/GLOSSARY.md');
+}
+
 export function guardrailTemplates(templatesDir: string = DEFAULT_TEMPLATES_DIR, tier?: GuardrailTier): GuardrailTemplate[] {
   const manifest = [...MANIFEST, ...skillManifest(templatesDir), ...workflowSkillManifest()];
   const selected = tier === undefined ? manifest : manifest.filter((m) => tierIncludes(tier, m.tier));
