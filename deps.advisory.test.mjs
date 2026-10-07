@@ -70,15 +70,24 @@ export function atLeast(version, floor) {
 // GHSA-2883-xcg3-v3hh — maxTotalMergeKeys does not bound CPU for empty merge sources; supersedes
 // GHSA-5p4m-2wfm-xmqj, whose 3.15.1 floor it raises. Transitive via gray-matter, the frontmatter
 // parser the whole ticket engine reads through, so it is on the hot path (tkt-d3ca2a78c557).
-// hono is unreachable today — the MCP server instantiates only StdioServerTransport — but it is a
-// runtime dep every consumer inherits by tag, so the floor stands rather than being re-argued the
-// day a transport changes. 4.13.5 also answers GHSA-g6gw-c38x-mqfc and GHSA-crvj-82cr-hjcx.
+// hono is unreachable today — the MCP server instantiates only StdioServerTransport — but the floor
+// stands rather than being re-argued the day a transport changes. 4.13.5 also answers
+// GHSA-g6gw-c38x-mqfc and GHSA-crvj-82cr-hjcx.
+// These floors bind THIS lockfile only: npm never reads a dependency's lockfile, so a consumer moves
+// only when its own lock does, or when package.json's range excludes the vulnerable version.
 const ADVISORIES = [
   { name: 'js-yaml', floor: '3.15.2', ghsa: 'GHSA-2883-xcg3-v3hh' },
   { name: 'hono', floor: '4.13.5', ghsa: 'GHSA-gqvv-2mrq-wpjv' },
   // Dev-only (eslint → minimatch). Floored at the high advisories CI's `npm audit` blocks on (this one
   // and GHSA-6j4f-fj2g-mc7p), not moderate GHSA-q2hr-2g5m-vwhr's 5.0.12, which must not block (tkt-2f890a52505e).
-  { name: 'brace-expansion', floor: '5.0.11', ghsa: 'GHSA-qhr7-859c-m2p7' },
+  { name: 'brace-expansion', floor: '5.0.11', ghsa: 'GHSA-qhr7-859c-m2p7', devOnly: true },
+  // Runtime via the SDK → express, unreachable like hono: the stdio-only server runs no express app (tkt-5ba15b8c4904).
+  { name: 'proxy-addr', floor: '2.0.8', ghsa: 'GHSA-jqcg-44mw-7w3h' },
+  // The flaw is in the SDK's OAuth client, which this stdio-only server never builds. A DIRECT dep, so
+  // package.json's range is raised to ^1.31.0 too: that is the one change here that reaches consumers.
+  { name: '@modelcontextprotocol/sdk', floor: '1.31.0', ghsa: 'GHSA-6qxp-vccf-f47h' },
+  // Floored because CI's audit blocks on high, dev or not.
+  { name: 'source-map-js', floor: '1.2.2', ghsa: 'GHSA-68fv-2mgg-jv7q', devOnly: true },
 ];
 
 describe('security advisories answered in the lockfile', () => {
@@ -91,6 +100,18 @@ describe('security advisories answered in the lockfile', () => {
     for (const v of found) {
       expect(atLeast(v, floor), `${name}@${v} is below the patched ${floor}`).toBe(true);
     }
+  });
+
+  // A "dev-only" triage label goes stale silently the day a runtime dep pulls the package in.
+  it.each(ADVISORIES.filter((a) => a.devOnly))('$name is still dev-only in the lockfile', ({ name }) => {
+    const entries = Object.entries(lock.packages).filter(([p]) => p.endsWith(`node_modules/${name}`));
+    expect(entries.length).toBeGreaterThan(0);
+    for (const [p, v] of entries) expect(v.dev, `${p} is no longer dev-only`).toBe(true);
+  });
+
+  it('pins the direct SDK range above the vulnerable versions, so consumers move too', () => {
+    const pkg = JSON.parse(readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf8'));
+    expect(pkg.dependencies['@modelcontextprotocol/sdk']).toBe('^1.31.0');
   });
 
   it('compares versions numerically, and refuses a version it cannot read', () => {
