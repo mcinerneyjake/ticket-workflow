@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { guardrailTemplates, resolveManifest, WORKFLOW_SKILLS } from './templates.js';
 import { lineCount, SKILL_LINE_CAP } from './audit/checks/skills.js';
+import { AUTONOMY } from './shared/constants.js';
 
 const REAL_TEMPLATES_DIR = fileURLToPath(new URL('../templates/', import.meta.url));
 const PKG_ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -494,8 +495,8 @@ describe('workflow skills (tkt-0dbbd0bc6151)', () => {
   const skillOf = (t: { targetPath: string }): string => t.targetPath.split('/')[2] ?? '';
   const shipped = (): ReturnType<typeof guardrailTemplates> => guardrailTemplates(undefined, 'core').filter((t) => t.targetPath.startsWith('.claude/skills/'));
 
-  it('installs implement at core tier with exactly its listed files and no LICENSE', () => {
-    expect(names).toContain('implement');
+  it('installs implement and to-tickets at core tier with exactly their listed files and no LICENSE', () => {
+    expect(names).toEqual(expect.arrayContaining(['implement', 'to-tickets']));
     const expected = names.flatMap((name) => (WORKFLOW_SKILLS[name] ?? []).map((f) => `.claude/skills/${name}/${f}`)).sort();
     const own = shipped().filter((t) => names.includes(skillOf(t)));
     expect(own.map((t) => t.targetPath).sort()).toEqual(expected);
@@ -544,5 +545,43 @@ describe('workflow skills (tkt-0dbbd0bc6151)', () => {
     // Control: implement hands off to tdd and the review skill, so an empty match means a broken pattern.
     expect(named).toEqual(expect.arrayContaining(['tdd', 'standards-and-spec-review']));
     for (const n of named) expect(shippedNames, n).toContain(n);
+  });
+
+  it('no workflow skill can trigger itself', () => {
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) {
+      expect(readFileSync(path.join(WORKFLOW_SRC, name, 'SKILL.md'), 'utf8'), name).toMatch(/^disable-model-invocation: true$/m);
+    }
+  });
+
+  describe('to-tickets ↔ implement contract (tkt-231d0dd6e04b)', () => {
+    const read = (name: string): string => readFileSync(path.join(WORKFLOW_SRC, name, 'SKILL.md'), 'utf8');
+    const headingsIn = (text: string): string[] => [...new Set([...text.matchAll(/`(## [^`]+)`/g)].map((m) => m[1] ?? ''))].sort();
+    const mustCarry = (skillMd: string): string[] => {
+      const lines = skillMd.split('\n').filter((l) => l.includes('must carry'));
+      expect(lines).toHaveLength(1);
+      return headingsIn(lines[0] ?? '');
+    };
+
+    it('to-tickets requires exactly the headings implement stops without', () => {
+      const needed = mustCarry(read('implement'));
+      // Control: implement requires both, so a shorter list means the extraction broke.
+      expect(needed).toEqual(['## Done when', '## Seams']);
+      expect(mustCarry(read('to-tickets'))).toEqual(needed);
+    });
+
+    it('to-tickets passes those headings in the create step, where the body is written', () => {
+      const create = read('to-tickets').split(/^## 4\./m)[1]?.split(/^## 5\./m)[0] ?? '';
+      expect(create.length).toBeGreaterThan(0);
+      expect(headingsIn(create)).toEqual(expect.arrayContaining(mustCarry(read('implement'))));
+    });
+
+    it("names exactly the package's autonomy values", () => {
+      const lines = read('to-tickets').split('\n').filter((l) => l.includes('`autonomy` is one of'));
+      expect(lines).toHaveLength(1);
+      const tail = (lines[0] ?? '').split('`autonomy` is one of')[1] ?? '';
+      const named = [...(tail.split(/[.;]/)[0] ?? '').matchAll(/`([a-z]+)`/g)].map((m) => m[1]);
+      expect(named).toEqual([...AUTONOMY]);
+    });
   });
 });
