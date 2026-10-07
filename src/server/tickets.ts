@@ -392,12 +392,43 @@ export interface BoardListing {
   unreadable: UnreadableTicketFile[]
 }
 
+// A `spec` key present on disk that normalize() read as null — empty included, since serialize never
+// writes one. Reading only Ticket.spec would call these "not a spec ticket", i.e. clean (tkt-4b64e64fe997).
+export interface MalformedSpec {
+  id: string
+  status: StatusId | null
+}
+
+export interface SpecBoardListing {
+  specTickets: Ticket[]
+  malformedSpec: MalformedSpec[]
+  unreadable: UnreadableTicketFile[]
+  ticketFiles: number
+}
+
 
 // --- Public API ------------------------------------------------------------
 
 export async function listBoard(): Promise<BoardListing> {
   const { tickets, unreadable } = await readBoard();
   return { tickets, unreadable };
+}
+
+// Stat, not readBoard's ensureDir: a read-only probe must not mkdir a mistyped board into existence.
+export async function listSpecBoard(): Promise<SpecBoardListing> {
+  try {
+    await fs.stat(getTicketsDir());
+  } catch (err) {
+    if (isENOENT(err)) throw new HttpError(404, `no tickets directory at ${getTicketsDir()}`);
+    throw err;
+  }
+  const { tickets, unreadable, malformedSpec } = await readBoard();
+  return {
+    specTickets: tickets.filter((t) => t.spec !== null),
+    malformedSpec,
+    unreadable,
+    ticketFiles: tickets.length + unreadable.length,
+  };
 }
 
 // Every file that parses, invalid status included. Integrity checks (cycle guard, delete edges,
@@ -407,12 +438,13 @@ async function listLinks(): Promise<ParsedTicket[]> {
   return [...tickets, ...invalidStatus];
 }
 
-async function readBoard(): Promise<BoardListing & { invalidStatus: ParsedTicket[] }> {
+async function readBoard(): Promise<BoardListing & { invalidStatus: ParsedTicket[]; malformedSpec: MalformedSpec[] }> {
   await ensureDir();
   const files = await fs.readdir(getTicketsDir());
   const tickets: Ticket[] = [];
   const invalidStatus: ParsedTicket[] = [];
   const unreadable: UnreadableTicketFile[] = [];
+  const malformedSpec: MalformedSpec[] = [];
   for (const file of files) {
     if (!file.endsWith('.md')) continue;
     let raw: string;
@@ -429,6 +461,7 @@ async function readBoard(): Promise<BoardListing & { invalidStatus: ParsedTicket
     try {
       const { data, content } = matter(raw, NO_CACHE); // NO_CACHE → consistent throw on bad YAML
       const parsed = normalize(file.slice(0, -3), data, content);
+      if (Object.hasOwn(data, 'spec') && parsed.spec === null) malformedSpec.push({ id: parsed.id, status: parsed.status });
       if (parsed.status === null) {
         log.warn(`[tickets] skipping ticket file ${file}: invalid status ${String(data.status)}`);
         invalidStatus.push(parsed);
@@ -444,7 +477,7 @@ async function readBoard(): Promise<BoardListing & { invalidStatus: ParsedTicket
       unreadable.push({ file, reason: 'unparseable frontmatter' });
     }
   }
-  return { tickets: tickets.sort((a, b) => a.order - b.order), unreadable, invalidStatus };
+  return { tickets: tickets.sort((a, b) => a.order - b.order), unreadable, invalidStatus, malformedSpec };
 }
 
 export async function listTickets(): Promise<Ticket[]> {

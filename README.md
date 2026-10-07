@@ -767,6 +767,35 @@ order, on a branch, before the PR. It cannot establish that the code is correct,
 meaningful, that a bug repro was written first, or that the reasoning was sound. Never sell it as
 more than that.
 
+## `specs` — checking spec tickets against their spec files
+
+```bash
+npx ticket-workflow specs                    # the board BOARD_DIR_OVERRIDE / CLAUDE_PROJECT_DIR names
+npx ticket-workflow specs --board <dir>      # an explicit board root
+```
+
+A spec ticket is any ticket whose `spec` field is set (`owner/repo:path/to/spec.md`). For each one,
+`specs` asks GitHub (through `gh api`) about the owning repo's **default branch**. An open spec's file
+must exist there as a regular file. A `done` spec's file must be gone, and the repo's
+`docs/specs/README.md` must index it by a `https://github.com/<owner>/<repo>/blob/<sha>/<path>`
+permalink, with a full 40-character sha, whose commit still holds the file. An `archived` spec ticket
+is listed as `retired` and not checked, because archiving accepts any prior status. It reads the
+board and the index and writes neither.
+
+It refuses to guess the board: with no `BOARD_DIR_OVERRIDE`, `CLAUDE_PROJECT_DIR` or `--board`, it
+exits `2` rather than read whatever `tickets/` sits in the cwd, and `--board` alongside
+`TICKETS_DIR_OVERRIDE` (which would silently outrank it) is refused the same way.
+
+| exit | meaning |
+|---|---|
+| `0` | every spec ticket checked, nothing wrong (`nothing to check` when the board has none) |
+| `1` | findings, every spec ticket checked |
+| `2` | something could not be checked: no declared board, a missing `tickets/` directory, a malformed or empty `spec` value, an unreadable ticket file, a board with no ticket files, `gh` missing or failing, a repo it cannot see, a non-file at the spec path, or an index too large to read inline. Findings still print. |
+
+**A 404 on the repo is not a finding.** GitHub answers 404 for a private repo you cannot see, exactly
+as for one that does not exist, so that case is `2`. Only a 404 on a path inside a repo it *can* see
+counts as missing.
+
 ## `test-run` — one machine, K test runs at a time, each in its own TMPDIR
 
 Several agent sessions committing at once each run a full vitest suite through the husky gate, and

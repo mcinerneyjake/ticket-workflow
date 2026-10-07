@@ -67,7 +67,7 @@ export function readAutonomy(val: unknown): Autonomy {
   return typeof val === 'string' && isAutonomy(val) ? val : 'hitl';
 }
 
-// `owner/repo:path/to/spec.md` — resolvable on the owning repo's main with no machine-local map.
+// `owner/repo:path/to/spec.md` — resolvable on the owning repo's default branch with no machine-local map.
 // Every segment starts alphanumeric or `_`: no `.`/`..` traversal, and no `-` a git/gh argv would read as a flag.
 const SPEC_SEGMENT = '[A-Za-z0-9_][A-Za-z0-9._-]*';
 const SPEC_REF_RE = new RegExp(`^[A-Za-z0-9][A-Za-z0-9-]*/${SPEC_SEGMENT}:(?:${SPEC_SEGMENT}/)*${SPEC_SEGMENT}\\.md$`);

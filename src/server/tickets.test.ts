@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { listTickets, listBoard, listProjects, getTicket, createTicket, updateTicket, startTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, lastCheckpoint, HttpError } from './tickets.js';
+import { listTickets, listBoard, listSpecBoard, listProjects, getTicket, createTicket, updateTicket, startTicket, deleteTicket, archiveStaleTickets, searchTickets, summarize, summarizeBoard, lastCheckpoint, HttpError } from './tickets.js';
 import { readEvents } from './events.js';
 import { setupTempTicketDirs } from '../test-support/tempTicketDirs.js';
 import { setLogger } from '../logger.js';
@@ -1749,5 +1749,68 @@ describe('autonomy + spec fields (tkt-9559b1f8dbab)', () => {
     const t = await createTicket({ title: 'A' });
     const again = await updateTicket(t.id, { autonomy: 'hitl' });
     expect(again.updated).toBe(t.updated);
+  });
+});
+
+// tkt-4b64e64fe997: normalize() reads a malformed spec as null, so only the raw key can tell a
+// malformed link from "not a spec ticket". listSpecBoard is that raw view.
+describe('listSpecBoard', () => {
+  const SPEC = "'owner/repo:docs/specs/x.md'";
+
+  it('lists spec tickets, excludes plain ones, and counts every ticket file', async () => {
+    await writeRaw('tkt-000000000001', makeRaw('Spec', 1, { spec: SPEC }));
+    await writeRaw('tkt-000000000002', makeRaw('Plain', 2));
+    const board = await listSpecBoard();
+    expect(board.specTickets.map((t) => [t.id, t.spec])).toEqual([['tkt-000000000001', 'owner/repo:docs/specs/x.md']]);
+    expect(board.malformedSpec).toEqual([]);
+    expect(board.ticketFiles).toBe(2);
+  });
+
+  it.each([
+    ['a non-ref string', 'not-a-ref'],
+    ['a traversal path', "'owner/repo:../x.md'"],
+    ['a non-markdown path', "'owner/repo:x.txt'"],
+    ['a number', '42'],
+    ['a list', '[a, b]'],
+    ['an empty string', "''"],
+    // serialize never writes an empty key, so one on disk is a hand edit that meant something.
+    ['an explicit null', 'null'],
+    ['a bare key', ''],
+  ])('reports a malformed spec (%s) instead of dropping it', async (_label, value) => {
+    await writeRaw('tkt-000000000001', makeRaw('Bad spec', 1, { spec: value }));
+    const board = await listSpecBoard();
+    expect(board.specTickets).toEqual([]);
+    expect(board.malformedSpec).toEqual([{ id: 'tkt-000000000001', status: 'backlog' }]);
+  });
+
+  it('keeps a malformed spec visible on a ticket whose status is also invalid', async () => {
+    await writeRaw('tkt-000000000001', makeRaw('Both bad', 1, { status: 'bogus', spec: 'nope' }));
+    const board = await listSpecBoard();
+    expect(board.malformedSpec).toEqual([{ id: 'tkt-000000000001', status: null }]);
+    expect(board.unreadable.map((u) => u.file)).toEqual(['tkt-000000000001.md']);
+    expect(board.ticketFiles).toBe(1);
+  });
+
+  it('counts an unparseable file as a ticket file and reports it unreadable', async () => {
+    await writeRaw('tkt-000000000001', '---\ntitle: [unclosed\n---\n');
+    const board = await listSpecBoard();
+    expect(board.ticketFiles).toBe(1);
+    expect(board.unreadable).toHaveLength(1);
+  });
+
+  it('refuses a missing tickets directory without creating it', async () => {
+    const missing = path.join(dirs.tickets, 'no-such-board');
+    const saved = process.env.TICKETS_DIR_OVERRIDE;
+    process.env.TICKETS_DIR_OVERRIDE = missing;
+    try {
+      await expect(listSpecBoard()).rejects.toMatchObject({ status: 404 });
+      await expect(fs.stat(missing)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      process.env.TICKETS_DIR_OVERRIDE = saved;
+    }
+  });
+
+  it('reads an empty board as zero ticket files', async () => {
+    expect(await listSpecBoard()).toEqual({ specTickets: [], malformedSpec: [], unreadable: [], ticketFiles: 0 });
   });
 });

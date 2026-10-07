@@ -2,7 +2,7 @@
 import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { clearStaleSlots, DEFAULT_TTL_MS, formatSlot, listSlots, pidLiveness, TestRunRefusal, testSlotsStateDir } from '../test-run/slots.js';
-import { listTickets, getTicket, DELETE_RECORD_FILE, type StrippedEdge } from '../server/tickets.js';
+import { listTickets, getTicket, getTicketsDir, listSpecBoard, DELETE_RECORD_FILE, type SpecBoardListing, type StrippedEdge } from '../server/tickets.js';
 import { listHistory, restoreFromSnapshot, undeleteFromHistory } from '../server/history.js';
 import { getTicketEvents } from '../server/events.js';
 import { isStatusId, STATUS_IDS, type StepState, type TicketEvent } from '../shared/constants.js';
@@ -17,6 +17,9 @@ import { provisionFailed, provisionWorktree } from '../worktree/provision.js';
 import { sweep } from '../vacuous/probe.js';
 import { checkRoot, vacuousExitCode, EXIT as VACUOUS_EXIT } from '../vacuous/ratchet.js';
 import { cmdTestContention } from './contention.js';
+import { checkSpecs, formatSpecReport, specsExitCode, SPECS_EXIT } from '../specs/probe.js';
+import { defaultExec, type Exec } from '../audit/types.js';
+import { resolveBoardRoot } from '../paths.js';
 import { applyGateBoard, currentBranch, GATE_EXIT, readScripts, resolveRecording, runGate, spawnScript } from '../gate/run.js';
 
 // Lightweight per-repo board viewer. Resolves the board from the cwd/
@@ -520,6 +523,40 @@ export async function cmdWorktree(
   console.log(`  git worktree remove ${result.path}`);
 }
 
+/** `specs [--board <dir>]`: every spec ticket's link checked against its owning repo. Exit 0 / 1 findings / 2 not checked. */
+export async function cmdSpecs(
+  args: readonly string[],
+  deps: { list: () => Promise<SpecBoardListing>; exec: Exec } = { list: listSpecBoard, exec: defaultExec },
+): Promise<number> {
+  const usage = 'usage: ticket-workflow specs [--board <dir>]';
+  if (args.length === 2 && args[0] === '--board' && args[1] !== '' && !args[1].startsWith('-')) {
+    // TICKETS_DIR_OVERRIDE outranks the board root in paths.ts, so --board would be silently ignored.
+    if (process.env.TICKETS_DIR_OVERRIDE) {
+      console.error(`specs: --board conflicts with TICKETS_DIR_OVERRIDE=${process.env.TICKETS_DIR_OVERRIDE}; unset one`);
+      return SPECS_EXIT.NOT_CHECKED;
+    }
+    process.env.BOARD_DIR_OVERRIDE = args[1];
+  } else if (args.length > 0) {
+    console.error(usage);
+    return SPECS_EXIT.NOT_CHECKED;
+  }
+  // A cwd fallback can land on a stale per-repo board whose zero spec tickets read as clean.
+  if (!process.env.TICKETS_DIR_OVERRIDE && resolveBoardRoot().source === 'cwd') {
+    console.error('specs: no board declared (BOARD_DIR_OVERRIDE, CLAUDE_PROJECT_DIR or --board); refusing to guess from the cwd');
+    return SPECS_EXIT.NOT_CHECKED;
+  }
+  let board: SpecBoardListing;
+  try {
+    board = await deps.list();
+  } catch (err) {
+    console.error(`specs: could not read the board at ${getTicketsDir()}: ${err instanceof Error ? err.message : String(err)}`);
+    return SPECS_EXIT.NOT_CHECKED;
+  }
+  const report = checkSpecs(board, deps.exec);
+  console.log(formatSpecReport(report, getTicketsDir(), board.specTickets.length));
+  return specsExitCode(report);
+}
+
 export async function cmdGate(args: readonly string[], cwd: string = process.cwd()): Promise<number> {
   if (args.length > 0) {
     console.error(`usage: ticket-workflow gate — takes no arguments (got ${args.join(' ')})`);
@@ -585,12 +622,15 @@ export async function main(): Promise<void> {
     case 'gate':
       process.exitCode = await cmdGate(rest);
       break;
+    case 'specs':
+      process.exitCode = await cmdSpecs(rest);
+      break;
     default:
       console.log(
         'usage: ticket-workflow <list [--status <status>] | show <id> | doctor [--strict] [--no-mcp] | ' +
           'audit <path> [--json] | init [<path>] [--tier <core|node>] [--force] | verify [<id>] [--all] [--project <name>] [--json] | ' +
           'vacuous <path> [--check] | test-slots [status|clear-stale] [--json] | test-contention [--runs <N>] [--control] | ' +
-          'history <id> | restore <id> (--at <snapshot> [--full] | --undelete) | gate | ' +
+          'history <id> | restore <id> (--at <snapshot> [--full] | --undelete) | gate | specs [--board <dir>] | ' +
           'worktree <ticket-id> [--branch <name>] [--base <ref>] [--name <dir>] [--repo <path>]>',
       );
       process.exitCode = cmd === undefined ? 0 : 1;
