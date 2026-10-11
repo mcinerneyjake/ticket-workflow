@@ -306,6 +306,91 @@ describe('releaseTestRun — the release dimension', () => {
     chmodSync(h.stateDir, 0o700);
   });
 
+  it.skipIf(isRoot)('still removes the run tmpdir when the slot cannot be released', async () => {
+    const h = harness();
+    const outcome = await holdTestRun(h.opts);
+    if (outcome.kind !== 'held') throw new Error(`expected held, got ${outcome.kind}`);
+    chmodSync(h.stateDir, 0o500);
+    await expect(releaseTestRun(h.registry)).rejects.toThrow();
+    chmodSync(h.stateDir, 0o700);
+    // A live pid's run dir is spared by the sibling sweep until the TTL, so a watch re-run would not reclaim it.
+    expect(existsSync(outcome.tmpDir)).toBe(false);
+    expect(h.exitCodes).toEqual([1]);
+  });
+
+  it.skipIf(isRoot)('still attempts the tmpdir removal, and warns, when the release and the removal both fail', async () => {
+    const h = harness();
+    const outcome = await holdTestRun(h.opts);
+    if (outcome.kind !== 'held') throw new Error(`expected held, got ${outcome.kind}`);
+    const runRoot = path.dirname(outcome.tmpDir);
+    writeFileSync(path.join(outcome.tmpDir, 'leftover'), 'x');
+    chmodSync(h.stateDir, 0o500);
+    chmodSync(outcome.tmpDir, 0o500);
+    try {
+      await expect(releaseTestRun(h.registry)).rejects.toThrow(/slot-0/);
+    } finally {
+      chmodSync(outcome.tmpDir, 0o700);
+      chmodSync(h.stateDir, 0o700);
+    }
+    expect(h.log.some((l) => l.includes('WARNING') && l.includes(`could not remove ${outcome.tmpDir}`))).toBe(true);
+    expect(h.exitCodes).toEqual([1]);
+    expect(readdirSync(runRoot)).toContain(path.basename(outcome.tmpDir));
+  });
+
+  it.skipIf(isRoot)('keeps the release error when the tmpdir warning’s own log throws too', async () => {
+    const h = harness();
+    const seen: string[] = [];
+    const outcome = await holdTestRun({
+      ...h.opts,
+      log: (l) => {
+        seen.push(l);
+        if (l.includes('could not remove')) throw new Error('log blew up');
+      },
+    });
+    if (outcome.kind !== 'held') throw new Error(`expected held, got ${outcome.kind}`);
+    writeFileSync(path.join(outcome.tmpDir, 'leftover'), 'x');
+    chmodSync(h.stateDir, 0o500);
+    chmodSync(outcome.tmpDir, 0o500);
+    try {
+      await expect(releaseTestRun(h.registry)).rejects.toThrow(/slot-0/);
+    } finally {
+      chmodSync(outcome.tmpDir, 0o700);
+      chmodSync(h.stateDir, 0o700);
+    }
+    expect(seen.some((l) => l.includes(`could not remove ${outcome.tmpDir}`))).toBe(true); // the throwing branch ran
+    expect(h.exitCodes).toEqual([1]);
+  });
+
+  it('still removes the run tmpdir when the mid-run warning’s own log throws', async () => {
+    const h = harness();
+    const outcome = await holdTestRun({
+      ...h.opts,
+      log: (l) => {
+        if (l.includes('removed mid-run')) throw new Error('log blew up');
+      },
+    });
+    if (outcome.kind !== 'held') throw new Error(`expected held, got ${outcome.kind}`);
+    unlinkSync(path.join(h.stateDir, 'slot-0'));
+    await releaseTestRun(h.registry).catch(() => undefined);
+    expect(existsSync(outcome.tmpDir)).toBe(false);
+  });
+
+  it('still removes the run tmpdir when the remover throws and its warning’s log throws too', async () => {
+    const h = harness();
+    const outcome = await holdTestRun({
+      ...h.opts,
+      registerExit: () => () => {
+        throw new Error('remover blew up');
+      },
+      log: (l) => {
+        if (l.includes('could not unregister')) throw new Error('log blew up');
+      },
+    });
+    if (outcome.kind !== 'held') throw new Error(`expected held, got ${outcome.kind}`);
+    await releaseTestRun(h.registry).catch(() => undefined);
+    expect(existsSync(outcome.tmpDir)).toBe(false);
+  });
+
   it.skipIf(isRoot)('re-acquires after a failed release instead of blocking on its own orphaned slot', async () => {
     const h = harness({ slots: 1 });
     await holdTestRun(h.opts);
@@ -528,6 +613,7 @@ describe('an acquire that fails after claiming gives the slot back', () => {
     expect(h.exitCodes.every((c) => c === 1)).toBe(true);
     expect(h.env.TMPDIR).toBe('/outer/tmp');
     expect(h.log.some((l) => l.includes('could not release slot 0 after a failed acquire'))).toBe(true);
+    expect(readdirSync(path.join(h.tmpRoot, 'demo-test'))).toEqual([]);
   });
 
   it('keeps the original error when the cleanup warning’s own log throws too', async () => {
